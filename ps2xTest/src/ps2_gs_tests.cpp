@@ -1885,7 +1885,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
                 (1ull << 4);
@@ -2590,7 +2591,7 @@ void register_ps2_gs_tests()
             }
         });
 
-        tc.Run("GS T4 CSM1 lookup matches Veronica ClutCopy layout", [](TestCase &t)
+        tc.Run("GS T4 CSM1 CLUT cache survives source VRAM reuse", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
@@ -2612,7 +2613,10 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (2ull << 61); // CLD=2: load and remember CBP0
+            constexpr uint64_t kTex0LoadIfCbp0Changed =
+                (kTex0 & ~(7ull << 61)) | (4ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |  // TME
@@ -2624,8 +2628,7 @@ void register_ps2_gs_tests()
             const uint32_t texByteOff = texNibbleAddr >> 1;
             vram[texByteOff] = static_cast<uint8_t>((vram[texByteOff] & 0xF0u) | 0x08u);
 
-            // Veronica uploads CSM1 CLUT rows with a 64-pixel GS stride, so logical entry 8
-            // resolves to row 1, column 0 after the CSM1 swizzle.
+            // CSM1 stores logical entry 8 at row 1, column 0 after the CLUT swizzle.
             const uint32_t wrongClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 8u, 0u);
             const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 0u, 1u);
             std::memcpy(vram.data() + wrongClutOff, &kWrongColor, sizeof(kWrongColor));
@@ -2638,6 +2641,13 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
             gs.writeRegister(GS_REG_TEX0_1, kTex0);
+
+            // TEX0 loads the palette into the GS CLUT temporary buffer. The
+            // source VRAM can subsequently be reused without changing the
+            // palette seen by this draw.
+            std::memcpy(vram.data() + expectedClutOff, &kWrongColor, sizeof(kWrongColor));
+            gs.writeRegister(GS_REG_TEX0_1, kTex0LoadIfCbp0Changed);
+
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -2648,7 +2658,7 @@ void register_ps2_gs_tests()
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
-                     "T4 CSM1 lookup should follow Veronica's swizzled CLUT row layout for logical index 8");
+                     "T4 CSM1 lookup should keep the cached palette after its source VRAM is reused");
         });
 
         tc.Run("GS T8 CT32-uploaded CSM1 CLUT follows swizzled palette layout", [](TestCase &t)
@@ -2673,7 +2683,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |  // TME
@@ -2756,7 +2767,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (17ull << 56);
+                (17ull << 56) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
@@ -2817,7 +2829,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT16) << 51) |
-                (16ull << 56);
+                (16ull << 56) |
+                (1ull << 61);
             constexpr uint64_t kTexa = (0x80ull << 32);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
@@ -2829,10 +2842,14 @@ void register_ps2_gs_tests()
 
             writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 1u);
 
-            // CSA=16 selects the upper half of a CT16 CLUT. CSM1 swaps bits
-            // 3 and 4 but must preserve address bit 8.
+            // CSA selects the destination in the temporary buffer, not a
+            // different source coordinate. Seed the lower half first, then
+            // replace the same source palette before loading CSA=16.
             gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kWrongGreen);
-            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 16u, kExpectedRed);
+            const uint64_t kTex0Lower = kTex0 & ~(0x1Full << 56);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0Lower);
+            gs.WriteVram(GS_PSM_CT16, kClutCbp, 1u, 1u, 0u, kExpectedRed);
+            gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -2951,12 +2968,14 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kWrongClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kTex2 =
                 (static_cast<uint64_t>(GS_PSM_T8) << 20) |
                 (static_cast<uint64_t>(kExpectedClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kPrim =
                 static_cast<uint64_t>(GS_PRIM_SPRITE) |
                 (1ull << 4) |
@@ -3016,7 +3035,8 @@ void register_ps2_gs_tests()
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbp) << 37) |
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
-                (1ull << 55);
+                (1ull << 55) |
+                (1ull << 61);
             constexpr uint64_t kTexClut =
                 (1ull << 0) |
                 (3ull << 6) |
@@ -3032,7 +3052,7 @@ void register_ps2_gs_tests()
             vram[texOff] = 0u;
 
             const uint32_t wrongClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 0u, 0u);
-            const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 3u, 2u);
+            const uint32_t expectedClutOff = GSPSMCT32::addrPSMCT32(kClutCbp, 1u, 48u, 2u);
             std::memcpy(vram.data() + wrongClutOff, &kWrongColor, sizeof(kWrongColor));
             std::memcpy(vram.data() + expectedClutOff, &kExpectedColor, sizeof(kExpectedColor));
 
@@ -3042,8 +3062,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
             gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
             gs.writeRegister(GS_REG_ALPHA_1, 0ull);
-            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_TEXCLUT, kTexClut);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
@@ -3349,7 +3369,8 @@ void register_ps2_gs_tests()
                     (1ull << 34) |
                     (1ull << 35) |
                     (static_cast<uint64_t>(kClutCbp) << 37) |
-                    (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                    (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                    (1ull << 61);
                 constexpr uint64_t kPrim =
                     static_cast<uint64_t>(GS_PRIM_TRIANGLE) |
                     (1ull << 4) |
@@ -4369,7 +4390,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbpA) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -4399,7 +4421,8 @@ void register_ps2_gs_tests()
                 (1ull << 34) |
                 (1ull << 35) |
                 (static_cast<uint64_t>(kClutCbpB) << 37) |
-                (static_cast<uint64_t>(GS_PSM_CT32) << 51);
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (1ull << 61);
 
             gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
             gs.writeRegister(GS_REG_UV, 0ull);

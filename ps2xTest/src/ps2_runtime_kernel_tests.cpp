@@ -896,7 +896,7 @@ void register_ps2_runtime_kernel_tests()
 
             env.runtime.guestFree(grown);
             const uint32_t reused = env.runtime.guestMalloc(0x80u, 16u);
-            t.Equals(reused, heapBase, "guestFree should make the head block reusable");
+            t.Equals(reused, heapBase + 0x10u, "guestFree should make the head block reusable");
         });
 
         tc.Run("memalign stubs allocate aligned guest memory", [](TestCase &t)

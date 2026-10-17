@@ -8,8 +8,11 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <optional>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -281,41 +284,14 @@ namespace
         return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u);
     }
 
-    // TODO: clut cache
-    uint32_t resolveClutIndex(uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm)
+    bool isFourBitIndexedPsm(uint8_t psm)
     {
-        uint32_t clutIndex = static_cast<uint32_t>(index);
+        return psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+    }
 
-        // CSM2 addresses the source directly through TEXCLUT. CSA is required
-        // to be zero there, so it must not offset the source coordinates.
-        if (csm != 0u)
-            return (sourcePsm == GS_PSM_T4 ||
-                    sourcePsm == GS_PSM_T4HH ||
-                    sourcePsm == GS_PSM_T4HL)
-                       ? (clutIndex & 0x0Fu)
-                       : clutIndex;
-
-        const bool is16BitClut = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
-        const uint32_t csaMask = is16BitClut ? 0x1Fu : 0x0Fu;
-        const uint32_t clutIndexMask = is16BitClut ? 0x1FFu : 0x0FFu;
-        const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
-
-        switch (sourcePsm)
-        {
-        case GS_PSM_T4:
-        case GS_PSM_T4HH:
-        case GS_PSM_T4HL:
-            clutIndex = clutBase + (clutIndex & 0x0Fu);
-            break;
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-            clutIndex = clutBase + clutIndex;
-            break;
-        default:
-            return clutIndex;
-        }
-
-        return swizzleClutIndexCSM1(clutIndex & clutIndexMask);
+    bool isEightBitIndexedPsm(uint8_t psm)
+    {
+        return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
     }
 
     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
@@ -555,6 +531,8 @@ void GSCpuBackend::Reset()
 
 void GSCpuBackend::ResetUnlocked()
 {
+    m_clut.fill(0u);
+    m_clutCbp.fill(0u);
     m_transfer = {};
     m_transfer.direction = 3u;
     m_transferState = {};
@@ -563,12 +541,140 @@ void GSCpuBackend::ResetUnlocked()
     m_localToHostReadPos = 0u;
 }
 
+namespace
+{
+    struct GsPerf
+    {
+        using Clock = std::chrono::steady_clock;
+        static bool enabled()
+        {
+            static const bool on = []() { const char *v = std::getenv("ATV2_PERF"); return v && v[0] && v[0] != '0'; }();
+            return on;
+        }
+        Clock::duration lockWait{}, draw{}, upload{};
+        uint64_t draws = 0, uploads = 0, pixels = 0;
+        Clock::time_point windowStart = Clock::now();
+        void maybeReport()
+        {
+            const auto now = Clock::now();
+            if (now - windowStart < std::chrono::seconds(2))
+                return;
+            auto ms = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
+            std::cerr << "[ATV2:PERF] gs draws=" << draws << " drawMs=" << ms(draw)
+                      << " pixels=" << pixels
+                      << " uploads=" << uploads << " uploadMs=" << ms(upload)
+                      << " lockWaitMs=" << ms(lockWait) << std::endl;
+            *this = GsPerf{};
+            windowStart = now;
+        }
+    };
+    GsPerf g_gsPerf;
+}
+
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
+    if (GsPerf::enabled())
+    {
+        const auto t0 = GsPerf::Clock::now();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto t1 = GsPerf::Clock::now();
+        if (m_vram && batch.vertexCount != 0u)
+            DrawPrimitive(batch);
+        g_gsPerf.lockWait += t1 - t0;
+        g_gsPerf.draw += GsPerf::Clock::now() - t1;
+        ++g_gsPerf.draws;
+        g_gsPerf.maybeReport();
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
     DrawPrimitive(batch);
+}
+
+void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+        return;
+
+    switch (tex0.cld)
+    {
+    case 0u:
+    case 6u:
+    case 7u:
+        return;
+    case 1u:
+        break;
+    case 2u:
+        m_clutCbp[0] = tex0.cbp;
+        break;
+    case 3u:
+        m_clutCbp[1] = tex0.cbp;
+        break;
+    case 4u:
+        if (m_clutCbp[0] == tex0.cbp)
+            return;
+        m_clutCbp[0] = tex0.cbp;
+        break;
+    case 5u:
+        if (m_clutCbp[1] == tex0.cbp)
+            return;
+        m_clutCbp[1] = tex0.cbp;
+        break;
+    default:
+        return;
+    }
+
+    LoadClutUnlocked(tex0, texclut);
+}
+
+void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+    const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+    const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+    if (!sixteenBit && !thirtyTwoBit)
+        return;
+
+    const uint32_t entryCount = fourBit ? 16u : 256u;
+    const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+    const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
+
+    const bool loadCsm1Suffix = tex0.csm == 0u && thirtyTwoBit && !fourBit;
+    const uint32_t firstEntry = loadCsm1Suffix ? destinationBase : 0u;
+
+    for (uint32_t entry = firstEntry; entry < entryCount; ++entry)
+    {
+        uint32_t sourceX = 0u;
+        uint32_t sourceY = 0u;
+        uint32_t sourceWidth = 1u;
+
+        if (tex0.csm == 0u)
+        {
+            const uint32_t sourceIndex = swizzleClutIndexCSM1(entry);
+            sourceX = sourceIndex & 0x0Fu;
+            sourceY = sourceIndex >> 4u;
+        }
+        else
+        {
+            sourceWidth = texclut.cbw != 0u ? static_cast<uint32_t>(texclut.cbw) : 1u;
+            sourceX = (static_cast<uint32_t>(texclut.cou) << 4u) + entry;
+            sourceY = static_cast<uint32_t>(texclut.cov);
+        }
+
+        const uint32_t raw = ReadVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+        const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
+        if (sixteenBit)
+        {
+            m_clut[destination] = static_cast<uint16_t>(raw);
+        }
+        else
+        {
+            m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
+            m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
+        }
+    }
 }
 
 void GSCpuBackend::Flush()
@@ -639,6 +745,45 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+
+    static const bool s_texLog = std::getenv("ATV2_GS_TEXLOG") != nullptr;
+    if (s_texLog)
+    {
+        static std::vector<uint64_t> s_seen;
+        const auto &t = ctx.tex0;
+        const uint64_t key = (static_cast<uint64_t>(state.prim.tme) << 63) ^
+                             (static_cast<uint64_t>(t.tbp0) << 40) ^ (static_cast<uint64_t>(t.psm) << 34) ^
+                             (static_cast<uint64_t>(t.cbp) << 18) ^ (static_cast<uint64_t>(t.cpsm) << 14) ^
+                             (static_cast<uint64_t>(t.csa) << 9) ^ (static_cast<uint64_t>(t.tbw) << 3) ^
+                             (static_cast<uint64_t>(state.prim.abe) << 2) ^ (ctx.alpha * 0x9E3779B97F4A7C15ull) ^
+                             (static_cast<uint64_t>(ctx.frame.fbp) << 20) ^ static_cast<uint64_t>(state.prim.type);
+        if (s_seen.size() < 256u && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end())
+        {
+            s_seen.push_back(key);
+            const GSVertex &v0 = batch.vertices[0];
+            std::fprintf(stderr,
+                         "[gs:tex] type=%u tme=%u abe=%u fst=%u fbp=%u fbw=%u fpsm=0x%x | tbp0=0x%x tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u"
+                         " cbp=0x%x cpsm=0x%x csm=%u csa=%u cld=%u | texclut=%u/%u/%u texa=%u/%u/%u alpha=0x%llx test=0x%llx"
+                         " | v0 xy=(%.1f,%.1f) rgba=(%u,%u,%u,%u) uv=(%u,%u) st=(%.3f,%.3f,q%.3f)\n",
+                         static_cast<uint32_t>(state.prim.type), state.prim.tme, state.prim.abe, state.prim.fst,
+                         ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm,
+                         t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm, t.csa, t.cld,
+                         state.texclut.cbw, state.texclut.cou, state.texclut.cov,
+                         state.texa.ta0, state.texa.aem ? 1u : 0u, state.texa.ta1,
+                         static_cast<unsigned long long>(ctx.alpha), static_cast<unsigned long long>(ctx.test),
+                         v0.x, v0.y, v0.r, v0.g, v0.b, v0.a, v0.u, v0.v, v0.s, v0.t, v0.q);
+            if (state.prim.tme && isEightBitIndexedPsm(t.psm))
+            {
+                std::fprintf(stderr, "[gs:tex]   clut:");
+                for (uint32_t i = 0; i < 256u; i += 17u)
+                    std::fprintf(stderr, " %08x", static_cast<uint32_t>(m_clut[i]) | (static_cast<uint32_t>(m_clut[i + 256u]) << 16u));
+                std::fprintf(stderr, "\n[gs:tex]   texels:");
+                for (uint32_t i = 0; i < 16u; ++i)
+                    std::fprintf(stderr, " %02x", ReadVramUnlocked(t.psm, t.tbp0, t.tbw, 40u * i, 30u * i) & 0xFFu);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
 
     static std::atomic<uint32_t> s_drawLogCount{0};
     if (s_drawLogCount.fetch_add(1) < 30)
@@ -788,6 +933,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
 {
+    ++g_gsPerf.pixels;
     const auto &ctx = state.context;
     if (x < ctx.scissor.x0 || x > ctx.scissor.x1 || y < ctx.scissor.y0 || y > ctx.scissor.y1)
         return;
@@ -954,32 +1100,54 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
 
 uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                   uint8_t index,
-                                  uint32_t cbp,
                                   uint8_t cpsm,
                                   uint8_t csm,
                                   uint8_t csa,
                                   uint8_t sourcePsm)
 {
-    const uint32_t clutIndex = resolveClutIndex(index, cpsm, csm, csa, sourcePsm);
-    const uint32_t clutWidth = (state.texclut.cbw != 0u) ? static_cast<uint32_t>(state.texclut.cbw) : 1u;
-    const uint32_t clutX = static_cast<uint32_t>(state.texclut.cou) + (clutIndex & 0x0Fu);
-    const uint32_t clutY = static_cast<uint32_t>(state.texclut.cov) + (clutIndex >> 4);
+    const bool sixteenBit = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
+    const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+    const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
+    const uint32_t sourceIndex = isFourBitIndexedPsm(sourcePsm)
+                                     ? (static_cast<uint32_t>(index) & 0x0Fu)
+                                     : static_cast<uint32_t>(index);
+
+    uint32_t clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
+    if (!sixteenBit && csm == 0u && isEightBitIndexedPsm(sourcePsm))
+    {
+        const uint32_t block = std::min((sourceIndex & 0xF0u) + clutBase, 240u);
+        clutIndex = block + (sourceIndex & 0x0Fu);
+    }
 
     switch (cpsm)
     {
     case GS_PSM_CT32:
-        return applyTexa(state.texa, cpsm, GSMem::ReadCT32(m_vram, cbp, clutWidth, clutX, clutY));
+    {
+        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        return applyTexa(state.texa, cpsm, raw);
+    }
     case GS_PSM_CT24:
-        return applyTexa(state.texa, cpsm, GSMem::ReadCT24(m_vram, cbp, clutWidth, clutX, clutY));
+    {
+        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
+    }
     case GS_PSM_CT16:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16(m_vram, cbp, clutWidth, clutX, clutY)));
     case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(GSMem::ReadCT16S(m_vram, cbp, clutWidth, clutX, clutY)));
+        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
     default:
+    {
+        static uint32_t s_badCpsmLog = 0u;
+        if (s_badCpsmLog < 16u)
+        {
+            std::fprintf(stderr, "[gs:bad_cpsm] cpsm=0x%x index=%u srcPsm=0x%x\n",
+                         static_cast<uint32_t>(cpsm), static_cast<uint32_t>(index), static_cast<uint32_t>(sourcePsm));
+            ++s_badCpsmLog;
+        }
         break;
     }
+    }
 
-    return 0xFFFF00FFu;
+    return 0x00000000u;
 }
 
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
@@ -1034,10 +1202,21 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         case GS_PSM_T4:
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+        default:
+        {
+            static uint32_t s_badPsmLog = 0u;
+            if (s_badPsmLog < 16u)
+            {
+                std::fprintf(stderr, "[gs:bad_psm] psm=0x%x tbp0=0x%x tbw=%u w=%d h=%d\n",
+                             tex.psm, tex.tbp0, tex.tbw, texW, texH);
+                ++s_badPsmLog;
+            }
+            break;
+        }
         }
 
-        return 0xFFFF00FFu;
+        return 0x00000000u;
     };
 
     if (!state.linearFilter)
@@ -1101,6 +1280,17 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     int x1 = static_cast<int>(v1.x) - ofx;
     int y1 = static_cast<int>(v1.y) - ofy;
     u32 z1 = static_cast<u32>(v1.z);
+
+    static std::atomic<uint32_t> s_spriteLog{0};
+    if (s_spriteLog.fetch_add(1) < 15)
+    {
+        std::cerr << "[GS:SPRITE #" << s_spriteLog.load() << "] v0=(" << v0.x << "," << v0.y << ") v1=(" << v1.x << "," << v1.y << ")"
+                  << " ofx=" << ofx << " ofy=" << ofy
+                  << " -> [" << x0 << "," << y0 << "]-[" << x1 << "," << y1 << "]"
+                  << " scissor=[" << ctx.scissor.x0 << ".." << ctx.scissor.x1 << "," << ctx.scissor.y0 << ".." << ctx.scissor.y1 << "]"
+                  << " fbp=" << ctx.frame.fbp
+                  << std::endl;
+    }
 
     if (x0 > x1)
         std::swap(x0, x1);
@@ -1390,6 +1580,17 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    static const bool s_texLog = std::getenv("ATV2_GS_TEXLOG") != nullptr;
+    static uint32_t s_xferLogCount = 0u;
+    if (s_texLog && s_xferLogCount < 400u)
+    {
+        ++s_xferLogCount;
+        const auto &b = command.bitbltbuf;
+        std::fprintf(stderr, "[gs:xfer] dir=%u dbp=0x%x dbw=%u dpsm=0x%x sbp=0x%x sbw=%u spsm=0x%x dsa=(%u,%u) ssa=(%u,%u) rr=%ux%u\n",
+                     command.direction, b.dbp, b.dbw, b.dpsm, b.sbp, b.sbw, b.spsm,
+                     command.trxpos.dsax, command.trxpos.dsay, command.trxpos.ssax, command.trxpos.ssay,
+                     command.trxreg.rrw, command.trxreg.rrh);
+    }
     m_transfer = command;
     m_transferState.x = command.trxpos.dsax;
     m_transferState.y = command.trxpos.dsay;
@@ -1406,6 +1607,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
+    struct UploadTimer
+    {
+        GsPerf::Clock::time_point start = GsPerf::Clock::now();
+        ~UploadTimer()
+        {
+            g_gsPerf.upload += GsPerf::Clock::now() - start;
+            ++g_gsPerf.uploads;
+        }
+    };
+    std::optional<UploadTimer> uploadTimer;
+    if (GsPerf::enabled())
+        uploadTimer.emplace();
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;

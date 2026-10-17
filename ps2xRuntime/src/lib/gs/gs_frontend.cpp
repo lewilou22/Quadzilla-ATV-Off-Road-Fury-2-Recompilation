@@ -14,6 +14,12 @@ namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
 
+    void loadBackendClut(GSRasterBackend *backend, const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+    {
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(backend))
+            cpu->LoadClut(tex0, texclut);
+    }
+
     GSPrimReg decodePrimRegister(uint64_t value)
     {
         GSPrimReg prim{};
@@ -1239,6 +1245,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        loadBackendClut(m_backend.get(), t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1269,6 +1276,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
+        loadBackendClut(m_backend.get(), t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:

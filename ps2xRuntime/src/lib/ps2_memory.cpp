@@ -3,6 +3,10 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <optional>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1284,6 +1288,51 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            {
+                // [DIAG] per-channel DMA kick trace (bounded)
+                static std::atomic<uint32_t> s_kickCounts[16]{};
+                const uint32_t ch = (channelBase >> 12) & 0xFu;
+                const uint32_t n = s_kickCounts[ch].fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (n <= 40u || (n % 500u) == 0u)
+                {
+                    std::cerr << "[DMA:KICK] ch=0x" << std::hex << channelBase
+                              << " n=" << std::dec << n
+                              << " chcr=0x" << std::hex << value
+                              << " mode=" << std::dec << ((value >> 2) & 0x3u)
+                              << " madr=0x" << std::hex << madr
+                              << " qwc=" << std::dec << qwc
+                              << " tadr=0x" << std::hex << m_ioRegisters[channelBase + 0x30]
+                              << std::dec << std::endl;
+                }
+                if (channelBase == 0x1000A000u && n == 100u && ((value >> 2) & 0x3u) == 1u)
+                {
+                    uint32_t t = m_ioRegisters[channelBase + 0x30] & 0x01FFFFF0u;
+                    uint32_t retStack[2]{};
+                    int sp = 0;
+                    for (int i = 0; i < 64 && t + 16u <= 0x02000000u; ++i)
+                    {
+                        uint64_t tag = 0;
+                        std::memcpy(&tag, m_rdram + t, 8);
+                        const uint32_t tqwc = static_cast<uint32_t>(tag & 0xFFFFu);
+                        const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
+                        const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u) & 0x01FFFFF0u;
+                        uint64_t gif = 0;
+                        const uint32_t dataAddr = (id == 0u || id == 3u || id == 4u) ? addr : t + 16u;
+                        if (dataAddr + 8u <= 0x02000000u)
+                            std::memcpy(&gif, m_rdram + dataAddr, 8);
+                        std::cerr << "[DMA:CHAIN] i=" << i << " tagAt=0x" << std::hex << t
+                                  << " id=" << std::dec << id << " qwc=" << tqwc
+                                  << " addr=0x" << std::hex << addr
+                                  << " firstGifTag=0x" << gif << std::dec << std::endl;
+                        if (id == 7u || id == 0u) break; // END / REFE
+                        if (id == 1u) t = t + 16u + tqwc * 16u;          // CNT
+                        else if (id == 2u) t = addr;                      // NEXT
+                        else if (id == 3u || id == 4u) t = t + 16u;       // REF/REFS
+                        else if (id == 5u) { if (sp < 2) retStack[sp++] = t + 16u + tqwc * 16u; t = addr; } // CALL
+                        else if (id == 6u) { if (sp == 0) break; t = retStack[--sp]; } // RET
+                    }
+                }
+            }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
                 (m_gsVRAM || channelBase == 0x10008000u))
@@ -1565,6 +1614,42 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
 void PS2Memory::processPendingTransfers()
 {
+    struct PerfScope
+    {
+        using Clock = std::chrono::steady_clock;
+        static bool enabled()
+        {
+            static const bool on = []() { const char *v = std::getenv("ATV2_PERF"); return v && v[0] && v[0] != '0'; }();
+            return on;
+        }
+        Clock::time_point start = Clock::now();
+        ~PerfScope()
+        {
+            static Clock::duration total{};
+            static uint64_t calls = 0;
+            static Clock::time_point windowStart = Clock::now();
+            const auto now = Clock::now();
+            total += now - start;
+            ++calls;
+            if (now - windowStart >= std::chrono::seconds(2))
+            {
+                std::cerr << "[ATV2:PERF] xfer calls=" << calls << " ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(total).count()
+                          << " of " << std::chrono::duration_cast<std::chrono::milliseconds>(now - windowStart).count()
+                          << std::endl;
+                total = {};
+                calls = 0;
+                windowStart = now;
+            }
+        }
+    };
+    std::optional<PerfScope> perf;
+    static thread_local int s_perfDepth = 0;
+    if (PerfScope::enabled() && s_perfDepth == 0)
+        perf.emplace();
+    ++s_perfDepth;
+    struct DepthGuard { ~DepthGuard() { --s_perfDepth; } } depthGuard;
+
     const bool hadGif = !m_pendingGifTransfers.empty();
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -1688,9 +1773,29 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif0Transfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    // A VIF1 I-bit hook (g_ps2Vif1IbitHook) can run guest code that starts a
+    // GIF DMA and re-enters this function mid-loop. That nested call must not
+    // re-run or clear the VIF1 list the outer call is still iterating.
+    static bool s_inVif1PendingLoop = false;
+    const bool hadVif1 = !s_inVif1PendingLoop && !m_pendingVif1Transfers.empty();
+    struct Vif1LoopGuard
+    {
+        bool active;
+        explicit Vif1LoopGuard(bool on) : active(on)
+        {
+            if (active)
+                s_inVif1PendingLoop = true;
+        }
+        ~Vif1LoopGuard()
+        {
+            if (active)
+                s_inVif1PendingLoop = false;
+        }
+    } vif1LoopGuard(hadVif1);
     for (auto &p : m_pendingVif1Transfers)
     {
+        if (!hadVif1)
+            break;
         if (!p.chainData.empty())
         {
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
@@ -1744,7 +1849,8 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
+    if (hadVif1)
+        m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)
         m_gifArbiter->drain();

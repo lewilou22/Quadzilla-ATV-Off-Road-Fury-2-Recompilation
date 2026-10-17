@@ -104,6 +104,9 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+    // newlib malloc keeps a 16-byte chunk header in front of every block; games write into
+    // the slack past their own allocations, so blocks must never be handed out back to back.
+    constexpr uint32_t kGuestHeapChunkHeader = 16u;
     // Real PS2 EE reserves the top 512KB of 32MB RDRAM for kernel stacks/pools; the user-heap
     // ceiling is 0x01F80000 (= 32MB - 512KB). Title CRTs size their dlmalloc arena from this,
     // so a lower hard limit makes their arena init produce a near-zero top chunk -> malloc fails.
@@ -1704,7 +1707,11 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
 
         const uint64_t blockStart = block.addr;
         const uint64_t blockEnd = blockStart + static_cast<uint64_t>(block.size);
-        const uint32_t alignedAddr = alignGuestHeapValue(block.addr, normalizedAlignment);
+        if (block.size <= kGuestHeapChunkHeader)
+        {
+            continue;
+        }
+        const uint32_t alignedAddr = alignGuestHeapValue(block.addr + kGuestHeapChunkHeader, normalizedAlignment);
         if (alignedAddr < block.addr)
         {
             continue;

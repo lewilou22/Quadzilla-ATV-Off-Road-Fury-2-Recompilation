@@ -4,7 +4,10 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -17,6 +20,9 @@ extern uint32_t g_ps2Pc0ResumeTarget;
 extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
+// Opt-in diagnostic: number of upcoming guest dispatches to log (0 = off).
+uint32_t g_ps2TraceDispatchRemaining = 0;
+uint32_t g_ps2TraceRange0Lo = 0, g_ps2TraceRange0Hi = 0, g_ps2TraceRange1Lo = 0, g_ps2TraceRange1Hi = 0;
 
 namespace
 {
@@ -62,6 +68,26 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+
+    // Host work the recompiled code does not account cycles for (software GS rasterization,
+    // HLE syscalls) can leave m_eeCycle far behind wall time. Real hardware keeps delivering
+    // VBlank at 60 Hz when a frame runs long, so once a deadline is overdue on the host clock,
+    // advance the guest clock to it instead of waiting for the cycle count to catch up.
+    // ATV2_VSYNC_REALTIME=0 restores purely cycle-gated delivery.
+    constexpr auto kRealtimeCatchUpSlack = std::chrono::milliseconds(2);
+    constexpr uint32_t kRealtimeCheckInterval = 1024u;
+
+    bool realtimeDeadlinesEnabled()
+    {
+        static const bool enabled = []()
+        {
+            const char *v = std::getenv("ATV2_VSYNC_REALTIME");
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
+        }();
+        return enabled;
+    }
+
+    std::atomic<int64_t> g_nextHostDeadlineTicks{std::numeric_limits<int64_t>::max()};
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -288,7 +314,12 @@ void EeScheduler::run()
                    << " pri=" << t.currentPriority
                    << " sus=" << t.suspendCount
                    << " pc=0x" << std::hex << pc
-                   << " sp=0x" << sp << std::dec
+                   << " sp=0x" << sp
+                   << " ra=0x" << getRegU32(&t.context, 31)
+                   << " v0=0x" << getRegU32(&t.context, 2)
+                   << " v1=0x" << getRegU32(&t.context, 3)
+                   << " a0=0x" << getRegU32(&t.context, 4)
+                   << " a1=0x" << getRegU32(&t.context, 5) << std::dec
                    << " inv=" << t.invocations.size() << "\n";
 
                 if (pc == 0x362FE0 || pc == 0x362FDC)
@@ -455,7 +486,10 @@ void EeScheduler::run()
                     SET_GPR_U32(&context, 4, g_ps2IdleResumeA0);
                 }
                 std::cerr << "[EeScheduler] pc=0 resume -> idle-target 0x"
-                          << std::hex << g_ps2IdleResumePc << std::dec << std::endl;
+                          << std::hex << g_ps2IdleResumePc
+                          << " (last=0x" << m_lastNonZeroPc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29) << ")" << std::dec << std::endl;
                 continue;
             }
 
@@ -509,6 +543,29 @@ void EeScheduler::run()
             if (context.pc != 0u)
             {
                 m_lastNonZeroPc = context.pc;
+            }
+            if (g_ps2TraceDispatchRemaining != 0u)
+            {
+                static uint32_t s_anyDispatchCount = 0;
+                ++s_anyDispatchCount;
+                const uint32_t currentSp = getRegU32(&context, 29);
+                const bool inFe = (context.pc >= 0x001DF2C0u && context.pc <= 0x001DF710u);
+                const bool isKeyTarget = inFe || (context.pc == 0x00256A20u) || (context.pc == 0x00256110u) || (context.pc == 0x001DF080u);
+                if (s_anyDispatchCount <= 30 || isKeyTarget || (s_anyDispatchCount >= 40240 && s_anyDispatchCount <= 40350))
+                {
+                    std::cerr << (inFe ? "[disp-FE] #" : "[disp-all] #") << s_anyDispatchCount
+                              << " pc=0x" << std::hex << context.pc
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " sp=0x" << currentSp
+                              << " v0=0x" << getRegU32(&context, 2)
+                              << " a0=0x" << getRegU32(&context, 4) << std::dec << std::endl;
+                }
+                else if ((s_anyDispatchCount % 5000) == 0)
+                {
+                    std::cerr << "[disp-heartbeat] #" << s_anyDispatchCount
+                              << " pc=0x" << std::hex << context.pc
+                              << " sp=0x" << currentSp << std::dec << std::endl;
+                }
             }
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
@@ -572,6 +629,11 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 
+    if (g_ps2HoldEeTimeslices != 0u)
+    {
+        return m_stopRequested.load(std::memory_order_acquire);
+    }
+
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
@@ -583,6 +645,23 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         m_checkpointPending.store(true, std::memory_order_release);
         return true;
+    }
+
+    static uint32_t s_realtimeCheckCountdown = kRealtimeCheckInterval;
+    if (--s_realtimeCheckCountdown == 0u)
+    {
+        s_realtimeCheckCountdown = kRealtimeCheckInterval;
+        if (realtimeDeadlinesEnabled())
+        {
+            const int64_t nextHost = g_nextHostDeadlineTicks.load(std::memory_order_acquire);
+            const auto overdueAt = std::chrono::steady_clock::now() - kRealtimeCatchUpSlack;
+            if (nextHost != std::numeric_limits<int64_t>::max() &&
+                overdueAt.time_since_epoch().count() >= nextHost)
+            {
+                m_checkpointPending.store(true, std::memory_order_release);
+                return true;
+            }
+        }
     }
 
     if (m_eeCycle < m_sliceEndCycle)
@@ -1286,7 +1365,9 @@ int EeScheduler::setAlarm(uint16_t ticks,
     {
         return KE_ERROR;
     }
-    m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
+    // Alarm handlers run in interrupt context, not on the caller's (still live) stack.
+    (void)sp;
+    m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, 0u});
     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
                   std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
@@ -1411,13 +1492,16 @@ int EeScheduler::addIrqHandler(bool dmac,
     }
     int &head = dmac ? m_dmacHeadOrder : m_intcHeadOrder;
     int &tail = dmac ? m_dmacTailOrder : m_intcTailOrder;
+    // Handlers run on the kernel exception stack; the registering thread's sp is still live
+    // when the interrupt fires, so a zero sp routes them to a dedicated invocation stack.
+    (void)sp;
     handlers.emplace(id,
                      EeIrqHandler{id,
                                   cause,
                                   handler,
                                   argument,
                                   gp,
-                                  sp,
+                                  0u,
                                   true,
                                   append ? ++tail : --head});
     return id;
@@ -1486,10 +1570,32 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    // A handler that is still pending or running absorbs the new edge, as the INTC would while
+    // the cause is unacknowledged. Without this, handlers that outlast the interrupt period (host
+    // rendering inside a VBlank chain) nest without bound and exhaust invocation stacks.
+    const auto handlerBusy = [this](uint32_t pc)
+    {
+        const auto isSame = [pc](const GuestInvocation &inv)
+        { return inv.kind == GuestInvocationKind::Interrupt && inv.tag == pc; };
+        if (std::any_of(m_pendingInvocations.begin(), m_pendingInvocations.end(), isSame))
+            return true;
+        for (const auto &[tid, t] : m_threads)
+        {
+            (void)tid;
+            if (std::any_of(t.invocations.begin(), t.invocations.end(), isSame))
+                return true;
+        }
+        return false;
+    };
     for (const EeIrqHandler &handler : matching)
     {
+        if (realtimeDeadlinesEnabled() && handlerBusy(handler.handler))
+        {
+            continue;
+        }
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Interrupt;
+        invocation.tag = handler.handler;
         invocation.context.pc = handler.handler;
         SET_GPR_U32(&invocation.context, 4, cause);
         SET_GPR_U32(&invocation.context, 5, handler.argument);
@@ -1990,6 +2096,24 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
+            if (realtimeDeadlinesEnabled())
+            {
+                uint64_t catchUpCycle = m_eeCycle;
+                for (const ScheduledEvent &item : m_deadlines)
+                {
+                    if (item.hostDeadline + kRealtimeCatchUpSlack <= now && item.deadlineCycle > catchUpCycle)
+                    {
+                        catchUpCycle = item.deadlineCycle;
+                    }
+                }
+                uint64_t remaining = catchUpCycle - m_eeCycle;
+                while (remaining > 0u)
+                {
+                    const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+                    accountCycles(step);
+                    remaining -= step;
+                }
+            }
             for (const ScheduledEvent &item : m_deadlines)
             {
                 if (item.deadlineCycle <= m_eeCycle &&
@@ -2055,11 +2179,24 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
-                scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              scheduled.hostDeadline + kVBlankDuration,
+                uint64_t baseCycle = scheduled.deadlineCycle;
+                auto baseHost = scheduled.hostDeadline;
+                if (realtimeDeadlinesEnabled())
+                {
+                    // Missed fields are dropped, not replayed: a burst of VBlanks would stack
+                    // interrupt invocations faster than the guest can retire them.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (baseHost + kVBlankPeriod < now)
+                    {
+                        baseHost = now;
+                        baseCycle = std::max(baseCycle, m_eeCycle);
+                    }
+                }
+                scheduleEvent(baseCycle + kVBlankDurationCycles,
+                              baseHost + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(baseCycle + kVBlankPeriodCycles,
+                              baseHost + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2280,8 +2417,15 @@ void EeScheduler::updateNextDeadline()
     if (m_deadlines.empty())
     {
         m_nextDeadlineCycle.store(0u, std::memory_order_release);
+        g_nextHostDeadlineTicks.store(std::numeric_limits<int64_t>::max(), std::memory_order_release);
         return;
     }
+    auto earliestHost = std::chrono::steady_clock::time_point::max();
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        earliestHost = std::min(earliestHost, item.hostDeadline);
+    }
+    g_nextHostDeadlineTicks.store(earliestHost.time_since_epoch().count(), std::memory_order_release);
     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
                                      [](const ScheduledEvent &left, const ScheduledEvent &right)
                                      {

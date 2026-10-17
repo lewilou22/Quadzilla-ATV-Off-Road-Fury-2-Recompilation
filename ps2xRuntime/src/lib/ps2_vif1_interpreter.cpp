@@ -2,6 +2,11 @@
 #include "runtime/ps2_memory.h"
 #include <cstring>
 
+// Optional game hook for VIF1 VIFcode I-bit stalls (FLUSH*/NOP only). The runtime
+// does not deliver the VIF1 INTC interrupt mid-stream, so a game override can do
+// the handler's work inline at the stall point. processVIF1Data only sets STAT.INT.
+void (*g_ps2Vif1IbitHook)(uint32_t vifcode) = nullptr;
+
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -30,18 +35,52 @@ namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
 
-    uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
+    uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
         if (!data || sizeBytes < 16u)
             return 0u;
 
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-        if (flg != kGifFmtImage)
-            return 0u;
+        uint32_t offset = 0u;
+        while (offset + 16u <= sizeBytes)
+        {
+            uint64_t tagLo = 0u;
+            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+            offset += 16u;
 
-        return static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+
+            uint64_t payloadBytes = 0u;
+            if (flg == 0u) // PACKED
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 16ull;
+            }
+            else if (flg == 1u) // REGLIST, padded to a quadword
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
+                payloadBytes = (payloadBytes + 15ull) & ~15ull;
+            }
+            else if (flg == kGifFmtImage)
+            {
+                payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
+                const uint64_t availableBytes = sizeBytes - offset;
+                if (payloadBytes > availableBytes)
+                    return static_cast<uint32_t>((payloadBytes - availableBytes) / 16ull);
+            }
+            else
+            {
+                return 0u;
+            }
+
+            if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
+                return 0u;
+            offset += static_cast<uint32_t>(payloadBytes);
+        }
+
+        return 0u;
     }
 }
 
@@ -316,6 +355,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         if (opcode == VIF_NOP)
         {
+            if (irq && g_ps2Vif1IbitHook)
+                g_ps2Vif1IbitHook(cmd);
             continue;
         }
         else if (opcode == VIF_STCYCL)
@@ -366,6 +407,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            // Earlier MSCAL/XGKICK work has already been emitted synchronously, so
+            // the flush is complete. An I-bit here is where real VIF1 stalls until
+            // the game's INTC handler restarts it (FBRST.STC).
+            if (irq && g_ps2Vif1IbitHook)
+                g_ps2Vif1IbitHook(cmd);
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
@@ -473,15 +519,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 const bool directHl = (opcode == VIF_DIRECTHL);
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
 
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
+                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+                if (pendingImageQw != 0u)
                 {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
-                    {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
-                    }
+                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+                    m_vif1PendingPath2DirectHl = directHl;
                 }
             }
 

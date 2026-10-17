@@ -2,13 +2,19 @@
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 #include "ps2_recompiled_functions.h"
+#include "Kernel/Stubs/Pad.h"
 
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 extern uint32_t g_ps2GuestVsyncCounterAddr;
 extern uint32_t g_ps2GuestVsyncCounterAddr2;
@@ -19,6 +25,9 @@ extern uint32_t g_ps2Pc0ResumeTarget;
 extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
+extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode); // ps2_vif1_interpreter.cpp
+extern uint32_t g_ps2TraceDispatchRemaining;
+extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
 namespace
 {
@@ -94,6 +103,294 @@ namespace
         runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
     }
 
+    // UI element initializer (0x2AE370..0x2AE380 prologue + call 0x235170).
+    // Rejoin the generated body at 0x2AE384.
+    void uiInit2ae370(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = getRegU32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x10u), &ra, sizeof(ra));
+        const auto s0 = GPR_VEC(ctx, 16);
+        std::memcpy(getMemPtr(rdram, sp), &s0, 16);
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+        SET_GPR_U32(ctx, 31, 0x002AE384u);
+        ctx->pc = 0x00235170u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00235170u,
+                0x002AE37Cu, 0x002AE384u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x002AE384u;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // UI virtual method merged into sub_002AD5E0 like 0x2AE370: prologue + `jal 0x2350D0`,
+    // then rejoins the generated body at return address 0x2AE2A4.
+    void uiUpdate2ae290(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = getRegU32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x10u), &ra, sizeof(ra));
+        const auto s0 = GPR_VEC(ctx, 16);
+        std::memcpy(getMemPtr(rdram, sp), &s0, 16);
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+        SET_GPR_U32(ctx, 31, 0x002AE2A4u);
+        ctx->pc = 0x002350D0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002350D0u,
+                0x002AE29Cu, 0x002AE2A4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x002AE2A4u;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // Remaining methods of the UI class with vtable 0x45D7C0 that the analyzer merged into
+    // sub_002AD5E0 (0x2AE220, 0x2AE280, 0x2AE3B0, 0x2AE400).
+
+    // 0x2AE220: prologue, `jal 0x2B4BD0` on child +0x68 (active) or +0x6C (idle), then rejoin.
+    void uiRelease2ae220(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t self = getRegU32(ctx, 4);
+        const uint32_t sp = getRegU32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x10u), &ra, sizeof(ra));
+        const auto s0 = GPR_VEC(ctx, 16);
+        std::memcpy(getMemPtr(rdram, sp), &s0, 16);
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+
+        uint32_t v0 = READ32(self + 0x7Cu);
+        bool active = false;
+        if (v0 != 0u)
+        {
+            v0 = READ32(self + 0xC8u);
+            active = (v0 != 0u);
+        }
+        SET_GPR_S32(ctx, 2, static_cast<int32_t>(v0));
+        const uint32_t child = READ32(self + (active ? 0x68u : 0x6Cu));
+        SET_GPR_S32(ctx, 4, static_cast<int32_t>(child));
+        const uint32_t site = active ? 0x002AE244u : 0x002AE254u;
+        const uint32_t ret = site + 8u;
+        SET_GPR_U32(ctx, 31, ret);
+        ctx->pc = 0x002B4BD0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B4BD0u, site, ret,
+                PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = ret;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // 0x2AE280: j 0x235050 (base-class method).
+    void uiTail2ae280(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = 0x00235050u;
+    }
+
+    // 0x2AE3B0: leaf timer step (f12 = dt), then tail-jumps to 0x1064B0.
+    void uiTimer2ae3b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t self = getRegU32(ctx, 4);
+        const uint32_t active = READ32(self + 0x7Cu);
+        SET_GPR_S32(ctx, 2, static_cast<int32_t>(active));
+        if (active != 0u)
+        {
+            const float elapsed = std::bit_cast<float>(READ32(self + 0xC4u));
+            const float limit = std::bit_cast<float>(READ32(self + 0xC0u));
+            ctx->f[1] = elapsed;
+            const bool running = elapsed < limit;
+            if (running)
+                ctx->fcr31 |= 0x00800000u;
+            else
+                ctx->fcr31 &= ~0x00800000u;
+            ctx->f[0] = elapsed + ctx->f[12];
+            if (running)
+            {
+                WRITE32(self + 0xC4u, std::bit_cast<uint32_t>(ctx->f[0]));
+            }
+            else
+            {
+                SET_GPR_U64(ctx, 2, 0u);
+                WRITE32(self + 0x7Cu, 0u);
+                WRITE32(self + 0xC4u, 0u);
+            }
+        }
+        ctx->pc = 0x001064B0u;
+    }
+
+    // 0x2AE400: leaf. If entry `t0` (5th arg) is one of the 16 ids at +0x80, marks the widget
+    // active and clears bit 3 / the +0xC link of every child node; otherwise resets +0x7C/+0xC4.
+    void uiSelect2ae400(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t self = getRegU32(ctx, 4);
+        const uint32_t key = getRegU32(ctx, 8);
+        bool found = false;
+        if (READ32(self + 0xC8u) != 0u)
+        {
+            for (uint32_t i = 0; i < 16u && !found; ++i)
+            {
+                if (READ32(self + 0x80u + i * 4u) != key)
+                    continue;
+                WRITE32(self + 0x7Cu, 1u);
+                WRITE32(self + 0xC4u, 0u);
+                const uint32_t table = READ32(READ32(0x00408398u) + 0x1Cu);
+                const uint32_t group = READ32(table + (READ32(self + 0x70u) << 4) + 4u);
+                found = true;
+                if (group == 0u)
+                    break;
+                const int32_t count = static_cast<int32_t>(READ32(group + 0x58u));
+                for (int32_t n = 0; n < count; ++n)
+                {
+                    const uint32_t node = READ32(group + static_cast<uint32_t>(n) * 4u + 0x5Cu);
+                    if (READ32(node + 0x1Cu) == 0u)
+                        continue;
+                    for (uint32_t k = 0; k < 2u; ++k)
+                    {
+                        const uint32_t slot = READ32(node + 0x1Cu) + k * 4u;
+                        const uint32_t item = READ32(slot + 0xCu);
+                        if (item == 0u)
+                            continue;
+                        WRITE8(item + 4u, static_cast<uint8_t>(READ8(item + 4u) & 0xF7u));
+                        WRITE32(item + 0xCu, 0u);
+                        const uint32_t item2 = READ32(READ32(node + 0x1Cu) + k * 4u + 0xCu);
+                        WRITE32(item2 + 0x10u, READ32(READ32(0x00404818u) + 0x234u));
+                    }
+                }
+            }
+        }
+        else
+        {
+            WRITE32(self + 0x7Cu, 0u);
+            WRITE32(self + 0xC4u, 0u);
+        }
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // Renderer virtual method merged into sub_00155850: prologue, one-time init of the
+    // gp-0x7DD4 flag / 0x486F20, `jal 0x1A8CC0` on +0x189C, then rejoins at 0x155AEC.
+    void renderBegin155ab0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = getRegU32(ctx, 29) - 0xE0u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x40u), &ra, sizeof(ra));
+        for (uint32_t r = 0; r < 4u; ++r)
+        {
+            const auto s = GPR_VEC(ctx, 16 + r);
+            std::memcpy(getMemPtr(rdram, sp + r * 0x10u), &s, 16);
+        }
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+
+        const uint32_t flagAddr = getRegU32(ctx, 28) - 0x7DD4u;
+        int32_t v0 = static_cast<int8_t>(READ8(flagAddr));
+        if (v0 == 0)
+        {
+            WRITE32(0x00486F20u, 0u);
+            v0 = 1;
+            WRITE8(flagAddr, 1u);
+        }
+        SET_GPR_S32(ctx, 2, v0);
+        SET_GPR_S32(ctx, 4, static_cast<int32_t>(READ32(getRegU32(ctx, 16) + 0x189Cu)));
+        SET_GPR_U32(ctx, 31, 0x00155AECu);
+        ctx->pc = 0x001A8CC0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001A8CC0u,
+                0x00155AE4u, 0x00155AECu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x00155AECu;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // Child-factory virtual method (0x2D5880..0x2D58C4 prologue + allocator call).
+    // Returns 0 unless a1 == 1; otherwise rejoins the generated body at 0x2D58C8.
+    void childFactory2d5880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (getRegU32(ctx, 5) != 1u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        const uint32_t sp = getRegU32(ctx, 29) - 0x40u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x30u), &ra, sizeof(ra));
+        const auto s2 = GPR_VEC(ctx, 18);
+        std::memcpy(getMemPtr(rdram, sp + 0x20u), &s2, 16);
+        const auto s1 = GPR_VEC(ctx, 17);
+        std::memcpy(getMemPtr(rdram, sp + 0x10u), &s1, 16);
+        const auto s0 = GPR_VEC(ctx, 16);
+        std::memcpy(getMemPtr(rdram, sp), &s0, 16);
+        SET_GPR_U64(ctx, 18, GPR_U64(ctx, 4));
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 5));
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 6));
+        SET_GPR_U64(ctx, 3, 1u);
+        SET_GPR_U32(ctx, 4, 0x568u);
+        SET_GPR_U32(ctx, 5, 0x00439660u);
+        SET_GPR_U32(ctx, 6, 0x816u);
+        SET_GPR_U32(ctx, 31, 0x002D58C8u);
+        ctx->pc = 0x00103E30u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E30u,
+                0x002D58C0u, 0x002D58C8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x002D58C8u;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // Attach-child virtual method at 0x2343B0: if (child = *(a0+0x238)) { 0x105FA0(a0, child, -1); return 1; } return 0.
+    // Rejoin the generated epilogue at 0x2343CC after the call.
+    void attachChild2343b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t child = READ32(getRegU32(ctx, 4) + 0x238u);
+        if (child == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        const uint32_t sp = getRegU32(ctx, 29) - 0x10u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp), &ra, sizeof(ra));
+        SET_GPR_U32(ctx, 5, child);
+        SET_GPR_S32(ctx, 6, -1);
+        SET_GPR_U64(ctx, 2, 0u);
+        SET_GPR_U32(ctx, 31, 0x002343CCu);
+        ctx->pc = 0x00105FA0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105FA0u,
+                0x002343C4u, 0x002343CCu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = 0x002343CCu;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // Leaf virtual methods following 0x2343B0.
+    void leafReturn2343e0(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void leafReturnOne234400(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void tailNodeUpdate234410(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ctx->pc = 0x001064B0u;
+    }
+
+    // Leaf getter at 0x2B5600: jr ra; lw v0, 0x44(a0).
+    void getField44_2b5600(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_S32(ctx, 2, static_cast<int32_t>(READ32(getRegU32(ctx, 4) + 0x44u)));
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void replaceIfMissing(PS2Runtime &runtime, uint32_t addr, PS2Runtime::RecompiledFunction fn)
+    {
+        if (!runtime.lookupFunction(addr))
+            runtime.replaceFunction(addr, fn);
+    }
+
     // Leaf accessor at 0x126FC0: swc1 f12, 0x24(a0); jr ra.
     void leafStoreF12_126fc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
@@ -126,6 +423,31 @@ namespace
                 0x002364DCu, 0x002364E4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002364E4u;
+        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+    }
+
+    // Constructors 0x1C7AC0 / 0x1C7C00 (JALR targets from the factory at 0x34D288),
+    // merged into generated sub_001C7A70 without re-entry cases. Both share the prologue
+    //   addiu sp,-0x20; sd ra,0x10(sp); sq s0,0(sp); jal 0x1C7A40; daddu s0,a0
+    // and rejoin the generated body right after the jal.
+    template <uint32_t Entry>
+    void ctorPrologue1c7a40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kJal = Entry + 0xCu;
+        constexpr uint32_t kRejoin = Entry + 0x14u;
+        const uint32_t sp = getRegU32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        const uint64_t ra = GPR_U64(ctx, 31);
+        std::memcpy(getMemPtr(rdram, sp + 0x10u), &ra, sizeof(ra));
+        const auto s0 = GPR_VEC(ctx, 16);
+        std::memcpy(getMemPtr(rdram, sp + 0x00u), &s0, 16);
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+        SET_GPR_U32(ctx, 31, kRejoin);
+        ctx->pc = 0x001C7A40u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C7A40u,
+                kJal, kRejoin, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = kRejoin;
         runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
     }
 
@@ -171,14 +493,76 @@ namespace
         runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
     }
 
-    // PCSX2: j 0x1D0890; lw a0,0x30(a0) (delay slot).
+    // Doubly-linked list insert tail @ 0x1749B0:
+    // a0 = list (header at a0: +0 head, +4 tail, +8 ?, +c count)
+    // a1 = item (+0xa8 next, +0xac prev)
+    void listInsertTail1749b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t list = GPR_U32(ctx, 4);
+        const uint32_t item = GPR_U32(ctx, 5);
+        if (list != 0u && item != 0u)
+        {
+            const uint32_t head = READ32(list);
+            if (head == 0u)
+            {
+                WRITE32(list, item);       // list->head = item
+                WRITE32(list + 4u, item);  // list->tail = item
+                WRITE32(item + 0xACu, 0u); // item->prev = NULL
+                WRITE32(item + 0xA8u, 0u); // item->next = NULL
+            }
+            else
+            {
+                const uint32_t tail = READ32(list + 4u);
+                if (tail != 0u)
+                    WRITE32(tail + 0xA8u, item); // tail->next = item
+                WRITE32(item + 0xACu, tail);     // item->prev = tail
+                WRITE32(list + 4u, item);        // list->tail = item
+                WRITE32(item + 0xA8u, 0u);       // item->next = NULL
+            }
+            const uint32_t count = READ32(list + 0xCu);
+            WRITE32(list + 0xCu, count + 1u);
+        }
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // Resource list insert @ 0x177AE0:
+    // a0 = resource manager (object at *(a0 + 0x30))
+    // a1 = item
+    // Forwards to list at (object + 0x10), calls listInsertTail1749b0.
     void resourceForward177ae0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t object = 0;
-        std::memcpy(&object, getMemPtr(rdram, getRegU32(ctx, 4) + 0x30u), 4);
-        SET_GPR_S32(ctx, 4, static_cast<int32_t>(object));
-        ctx->pc = 0x001D0890u;
-        runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+        const uint32_t mgr = GPR_U32(ctx, 4);
+        const uint32_t object = (mgr != 0u) ? READ32(mgr + 0x30u) : 0u;
+        SET_GPR_U32(ctx, 4, object + 0x10u);
+        listInsertTail1749b0(rdram, ctx, runtime);
+    }
+
+    // Resource list remove @ 0x177AF0:
+    // a0 = resource manager (object at *(a0 + 0x30))
+    // a1 = item
+    // Forwards to list at (object + 0x10), calls sub_00174A00_0x174a00.
+    void resourceRemove177af0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t mgr = GPR_U32(ctx, 4);
+        const uint32_t object = (mgr != 0u) ? READ32(mgr + 0x30u) : 0u;
+        SET_GPR_U32(ctx, 4, object + 0x10u);
+        ctx->pc = 0x00174A00u;
+        sub_00174A00_0x174a00(rdram, ctx, runtime);
+    }
+
+    // Forwarder @ 0x1D0890: a0 += 0x10; j 0x1749B0
+    void forward1d0890(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_U32(ctx, 4, GPR_U32(ctx, 4) + 0x10u);
+        listInsertTail1749b0(rdram, ctx, runtime);
+    }
+
+    // Forwarder @ 0x1D08A0: a0 += 0x10; j 0x174A00
+    void forward1d08a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_U32(ctx, 4, GPR_U32(ctx, 4) + 0x10u);
+        ctx->pc = 0x00174A00u;
+        sub_00174A00_0x174a00(rdram, ctx, runtime);
     }
 
     // Registry flags wrapper: preserve existing flags before the tail call.
@@ -610,6 +994,42 @@ namespace
 
     using RecompiledFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
     using RecompiledFunction = PS2Runtime::RecompiledFunction;
+
+    // A scratch-context call cannot be resumed after a scheduler checkpoint: the callee
+    // would be abandoned mid-way (e.g. with the pool allocator's free tree half-updated).
+    struct HoldEeTimeslices
+    {
+        uint32_t saved = g_ps2HoldEeTimeslices;
+        HoldEeTimeslices() { g_ps2HoldEeTimeslices = 1u; }
+        ~HoldEeTimeslices() { g_ps2HoldEeTimeslices = saved; }
+    };
+
+    // Generated code can still return early with pc at an inner return address (self-recursive
+    // JALs are lowered to gotos, so the innermost JR $ra leaves the whole host function).
+    // Keep re-entering at pc until the callee returns to the sentinel.
+    void runScratchToCompletion(PS2Runtime *runtime, uint8_t *rdram, R5900Context *scratch,
+                                RecompiledFn fn, uint32_t fnAddr)
+    {
+        constexpr uint32_t kScratchReturn = 0x0000FFF0u;
+        HoldEeTimeslices hold;
+        SET_GPR_U32(scratch, 31, kScratchReturn);
+        scratch->pc = fnAddr;
+        fn(rdram, scratch, runtime);
+        if (scratch->pc == fnAddr)
+            return;
+        for (uint32_t guard = 0; scratch->pc != kScratchReturn; ++guard)
+        {
+            if (scratch->pc == 0u || guard >= 1000000u || runtime->isStopRequested() ||
+                !runtime->hasFunction(scratch->pc))
+            {
+                std::cerr << "[SCUS_972.11] scratch call 0x" << std::hex << fnAddr
+                          << " stopped at pc=0x" << scratch->pc << std::dec << std::endl;
+                return;
+            }
+            runtime->lookupFunction(scratch->pc)(rdram, scratch, runtime);
+        }
+    }
+
     uint32_t callRecompiled4(PS2Runtime *runtime, uint8_t *rdram, R5900Context *callerCtx,
                              uint32_t fnAddr, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4)
     {
@@ -626,7 +1046,48 @@ namespace
         SET_GPR_U32(&scratch, 5, a2);
         SET_GPR_U32(&scratch, 6, a3);
         SET_GPR_U32(&scratch, 7, a4);
-        fn(rdram, &scratch, runtime);
+        runScratchToCompletion(runtime, rdram, &scratch, fn, fnAddr);
+        return getRegU32(&scratch, 2);
+    }
+
+    uint32_t callRecompiled5(PS2Runtime *runtime, uint8_t *rdram, R5900Context *callerCtx,
+                             uint32_t fnAddr, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+    {
+        RecompiledFn fn = runtime->lookupFunction(fnAddr);
+        if (fn == nullptr)
+        {
+            std::cerr << "[SCUS_972.11] callRecompiled5: helper 0x" << std::hex << fnAddr
+                      << " not found in table" << std::dec << std::endl;
+            return 0u;
+        }
+
+        R5900Context scratch = *callerCtx;
+        SET_GPR_U32(&scratch, 4, a1);
+        SET_GPR_U32(&scratch, 5, a2);
+        SET_GPR_U32(&scratch, 6, a3);
+        SET_GPR_U32(&scratch, 7, a4);
+        SET_GPR_U32(&scratch, 8, a5);
+        runScratchToCompletion(runtime, rdram, &scratch, fn, fnAddr);
+        return getRegU32(&scratch, 2);
+    }
+
+    uint32_t callRecompiledFloat(PS2Runtime *runtime, uint8_t *rdram, R5900Context *callerCtx,
+                                 uint32_t fnAddr, uint32_t a1, uint32_t a2, float f12Val, uint32_t a3)
+    {
+        RecompiledFn fn = runtime->lookupFunction(fnAddr);
+        if (fn == nullptr)
+        {
+            std::cerr << "[SCUS_972.11] callRecompiledFloat: helper 0x" << std::hex << fnAddr
+                      << " not found in table" << std::dec << std::endl;
+            return 0u;
+        }
+
+        R5900Context scratch = *callerCtx;
+        SET_GPR_U32(&scratch, 4, a1);
+        SET_GPR_U32(&scratch, 5, a2);
+        scratch.f[12] = f12Val;
+        SET_GPR_U32(&scratch, 6, a3);
+        runScratchToCompletion(runtime, rdram, &scratch, fn, fnAddr);
         return getRegU32(&scratch, 2);
     }
 
@@ -1804,6 +2265,3203 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
+    // Node virtual destructor @ 0x00152D50
+    // Merged into sub_00152C90; called via vtable[0] from 0x1074A0
+    void dtor152d50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        if (thisPtr != 0u)
+        {
+            // Set vtable to base Node vtable 0x00452A40
+            WRITE32(thisPtr + 8u, 0x00452A40u);
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x00152D80u);
+            ctx->pc = 0x0011B2D0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x0011B2D0u,
+                    0x00152D78u, 0x00152D80u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x00152D98u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x00152D90u, 0x00152D98u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Node subclass @ 0x00108070
+    // Merged into sub_00107FF0; called via vtable[0] from 0x1074A0
+    void dtor108070(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00451C80u);
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U32(ctx, 31, 0x0010809Cu);
+            ctx->pc = 0x001082C0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001082C0u,
+                    0x00108094u, 0x0010809Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x001080A8u);
+            ctx->pc = 0x00107410u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00107410u,
+                    0x001080A0u, 0x001080A8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001080C0u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x001080B8u, 0x001080C0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // ========================================================================
+    // Base Destructor @ 0x001C0880 (PSXSurfaceGeometry.cpp)
+    // ========================================================================
+    void dtor1c0880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t thisPtr, uint32_t deleteFlag)
+    {
+        if (thisPtr == 0u)
+            return;
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00454B10u;
+
+            const int32_t a1 = *reinterpret_cast<const int32_t *>(obj + 0);
+            if (a1 >= 0)
+            {
+                uint8_t *globPtr = getMemPtr(rdram, 0x00408398u);
+                const uint32_t globalA0 = (globPtr != nullptr) ? *reinterpret_cast<const uint32_t *>(globPtr) : 0u;
+                callRecompiled4(runtime, rdram, ctx, 0x001D2C00u, globalA0, static_cast<uint32_t>(a1), 0u, 0u);
+            }
+
+            const uint32_t p4 = *reinterpret_cast<const uint32_t *>(obj + 4);
+            if (p4 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, p4, 0u, 0u, 0u);
+            }
+        }
+
+        if (static_cast<int32_t>(static_cast<int16_t>(deleteFlag)) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+    }
+
+    void dtorWrapper1c0880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR1C0880] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << deleteFlag << std::endl;
+        dtor1c0880(rdram, ctx, runtime, thisPtr, deleteFlag);
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual Destructor @ 0x001BD180 (PSXSurfaceGeometry.cpp)
+    // ========================================================================
+    void dtor1bd180(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t delFlag = GPR_U32(ctx, 5);
+
+        std::cerr << "[ATV2:DTOR1BD180] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << delFlag << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00454A30u;
+            const uint8_t flag0f = obj[0x0F];
+            if ((flag0f & 1u) != 0u)
+            {
+                const uint32_t p10 = *reinterpret_cast<const uint32_t *>(obj + 0x10);
+                if (p10 != 0u)
+                {
+                    callRecompiled4(runtime, rdram, ctx, 0x00103DF0u, p10, 0x00424E90u, 37u, 0u);
+                }
+            }
+
+            const uint32_t p14 = *reinterpret_cast<const uint32_t *>(obj + 0x14);
+            if (p14 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103F20u, p14, 0u, 0u, 0u);
+            }
+        }
+
+        dtor1c0880(rdram, ctx, runtime, thisPtr, 0u);
+
+        if (static_cast<int32_t>(static_cast<int16_t>(delFlag)) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // Virtual destructor for Node subclass @ 0x00137EF0
+    // vtable = 0x00452480 (called via vtable[0] from 0x1074A0)
+    void dtor137ef0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR137EF0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00452480u);
+            const uint32_t globVal = READ32(0x0047D700u);
+            if (globVal != 0u)
+            {
+                SET_GPR_U64(ctx, 4, globVal);
+                SET_GPR_U64(ctx, 5, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x00137F30u);
+                ctx->pc = 0x00139CE0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00139CE0u,
+                        0x00137F28u, 0x00137F30u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t pD0 = READ32(thisPtr + 0xD0u);
+            if (pD0 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, pD0);
+                SET_GPR_U64(ctx, 5, 1u);
+                SET_GPR_U32(ctx, 31, 0x00137F44u);
+                ctx->pc = 0x001A4F50u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001A4F50u,
+                        0x00137F3Cu, 0x00137F44u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t pD8 = READ32(thisPtr + 0xD8u);
+            if (pD8 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, pD8);
+                SET_GPR_U32(ctx, 31, 0x00137F58u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x00137F50u, 0x00137F58u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x00137F64u);
+            ctx->pc = 0x00105C10u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105C10u,
+                    0x00137F5Cu, 0x00137F64u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x00137F7Cu);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x00137F74u, 0x00137F7Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Resource node subclass @ 0x001CE0E0
+    // vtable = 0x00455220 (slot +0x8)
+    void dtor1ce0e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR1CE0E0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00455220u);
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x001CE110u);
+            ctx->pc = 0x001CDF20u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001CDF20u,
+                    0x001CE108u, 0x001CE110u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001CE128u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x001CE120u, 0x001CE128u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Resource node subclass @ 0x001CE140
+    // vtable = 0x00455240 (slot +0x8)
+    void dtor1ce140(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR1CE140] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00455240u);
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x001CE170u);
+            ctx->pc = 0x001CDF20u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001CDF20u,
+                    0x001CE168u, 0x001CE170u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001CE188u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x001CE180u, 0x001CE188u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Resource node subclass @ 0x001CE330
+    // vtable = 0x00455280 (slot +0x8)
+    void dtor1ce330(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR1CE330] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00455280u);
+
+            static const uint32_t kOffsets[] = {
+                0x5Cu, 0x84u, 0xD8u, 0x88u, 0x8Cu, 0x90u, 0x94u, 0x98u,
+                0x9Cu, 0xA0u, 0xA4u, 0xACu, 0xA8u, 0xB8u, 0xBCu, 0xC0u,
+                0xB0u, 0xB4u, 0xC4u, 0xC8u
+            };
+            for (uint32_t off : kOffsets)
+            {
+                const uint32_t ptrVal = READ32(thisPtr + off);
+                if (ptrVal != 0u)
+                {
+                    SET_GPR_U64(ctx, 4, ptrVal);
+                    SET_GPR_U32(ctx, 31, 0x001CE36Cu);
+                    ctx->pc = 0x00103F20u;
+                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                            0x001CE364u, 0x001CE36Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                        return;
+                }
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x001CE4F4u);
+            ctx->pc = 0x00105C10u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105C10u,
+                    0x001CE4ECu, 0x001CE4F4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001CE50Cu);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x001CE504u, 0x001CE50Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for VertexBuffer node subclass @ 0x001C2A70
+    // vtable = 0x00454CB0 (slot +0x8)
+    void dtor1c2a70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x50u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x40u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x30u, GPR_VEC(ctx, 19));
+        WRITE128(sp + 0x20u, GPR_VEC(ctx, 18));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR1C2A70] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00454CB0u);
+
+            const uint32_t count = READ32(thisPtr + 0x1E4u);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t dataPtr = READ32(thisPtr + 0x1E4u + 8u);
+                const uint32_t item = (dataPtr != 0u) ? READ32(dataPtr + i * 4u) : 0u;
+                if (item != 0u)
+                {
+                    const uint32_t v210 = READ32(thisPtr + 0x210u);
+                    if (v210 != 0u)
+                    {
+                        const uint32_t item4 = READ32(item + 4u);
+                        const uint32_t arg0 = READ32(thisPtr + 0x214u);
+                        SET_GPR_U64(ctx, 4, arg0);
+                        SET_GPR_U64(ctx, 5, item4);
+                        SET_GPR_U32(ctx, 31, 0x001C2AD4u);
+                        ctx->pc = 0x00151300u;
+                        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00151300u,
+                                0x001C2ACCu, 0x001C2AD4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                            return;
+                    }
+                    SET_GPR_U64(ctx, 4, item);
+                    SET_GPR_U32(ctx, 31, 0x001C2AE0u);
+                    ctx->pc = 0x00103E70u;
+                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                            0x001C2AD8u, 0x001C2AE0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                        return;
+                }
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr + 0x1E4u);
+            SET_GPR_U32(ctx, 31, 0x001C2B00u);
+            ctx->pc = 0x001C4C50u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C4C50u,
+                    0x001C2AF8u, 0x001C2B00u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            SET_GPR_U64(ctx, 4, thisPtr + 0x1F8u);
+            SET_GPR_U32(ctx, 31, 0x001C2B08u);
+            ctx->pc = 0x001C4C50u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C4C50u,
+                    0x001C2B00u, 0x001C2B08u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            const uint32_t v20c = READ32(thisPtr + 0x20Cu);
+            if (v20c != 0u)
+            {
+                const uint32_t glob404818 = READ32(0x00404818u);
+                const uint32_t a0 = (glob404818 != 0u) ? READ32(glob404818) : 0u;
+                SET_GPR_U64(ctx, 4, a0);
+                SET_GPR_U64(ctx, 5, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001C2B2Cu);
+                ctx->pc = 0x00173FC0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00173FC0u,
+                        0x001C2B20u, 0x001C2B2Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t p200 = READ32(thisPtr + 0x200u);
+            if (p200 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p200);
+                SET_GPR_U32(ctx, 31, 0x001C2B40u);
+                ctx->pc = 0x00103F20u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                        0x001C2B34u, 0x001C2B40u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t p1ec = READ32(thisPtr + 0x1ECu);
+            if (p1ec != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p1ec);
+                SET_GPR_U32(ctx, 31, 0x001C2B54u);
+                ctx->pc = 0x00103F20u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                        0x001C2B48u, 0x001C2B54u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x001C2B5Cu);
+            ctx->pc = 0x001C1110u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C1110u,
+                    0x001C2B54u, 0x001C2B5Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001C2B74u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x001C2B6Cu, 0x001C2B74u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x40u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 19, READ128(sp + 0x30u));
+        SET_GPR_VEC(ctx, 18, READ128(sp + 0x20u));
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x50u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Highlight_Icon node subclass @ 0x002AD640
+    // vtable = 0x0045D790 (slot +0x8)
+    void dtor2ad640(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR2AD640] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x0045D790u);
+
+            const uint32_t p68 = READ32(thisPtr + 0x68u);
+            if (p68 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p68);
+                SET_GPR_U64(ctx, 5, 1u);
+                SET_GPR_U32(ctx, 31, 0x002AD674u);
+                ctx->pc = 0x002B48B0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B48B0u,
+                        0x002AD66Cu, 0x002AD674u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t p6c = READ32(thisPtr + 0x6Cu);
+            if (p6c != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p6c);
+                SET_GPR_U64(ctx, 5, 1u);
+                SET_GPR_U32(ctx, 31, 0x002AD680u);
+                ctx->pc = 0x002B48B0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B48B0u,
+                        0x002AD678u, 0x002AD680u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            WRITE32(thisPtr + 0x78u, 0u);
+            SET_GPR_U32(ctx, 31, 0x002AD690u);
+            ctx->pc = 0x00234F50u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234F50u,
+                    0x002AD688u, 0x002AD690u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x002AD6A8u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x002AD6A0u, 0x002AD6A8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Animated_Icon node subclass @ 0x002AE5A0
+    // vtable = 0x0045D6D0 (slot +0x8)
+    void dtor2ae5a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR2AE5A0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x0045D6D0u);
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x002AE5D0u);
+            ctx->pc = 0x002393A0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002393A0u,
+                    0x002AE5C8u, 0x002AE5D0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x002AE5E8u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x002AE5E0u, 0x002AE5E8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Slider node subclass @ 0x002AE8F0
+    // vtable = 0x0045D610 (slot +0x8)
+    void dtor2ae8f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR2AE8F0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x0045D610u);
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x002AE920u);
+            ctx->pc = 0x002393A0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002393A0u,
+                    0x002AE918u, 0x002AE920u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x002AE938u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x002AE930u, 0x002AE938u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for TextInput node subclass @ 0x00236440
+    // vtable = 0x00458A70 (slot +0x8)
+    void dtor236440(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR236440] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00458A70u);
+
+            const uint32_t p68 = READ32(thisPtr + 0x68u);
+            if (p68 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p68);
+                SET_GPR_U64(ctx, 5, 0x0043E0D0u);
+                SET_GPR_U64(ctx, 6, 0x318u); // line 792
+                SET_GPR_U32(ctx, 31, 0x00236480u);
+                ctx->pc = 0x00103DF0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103DF0u,
+                        0x00236478u, 0x00236480u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x0023648Cu);
+            ctx->pc = 0x00234F50u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234F50u,
+                    0x00236484u, 0x0023648Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x002364A4u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x0023649Cu, 0x002364A4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for Resource node subclass @ 0x0014E170
+    // vtable = 0x00452980 (slot +0x8)
+    void dtor14e170(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR14E170] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00452980u);
+
+            const uint32_t v114 = READ32(thisPtr + 0x114u);
+            if (v114 == 2u)
+            {
+                const int32_t a1 = static_cast<int32_t>(READ32(thisPtr + 0x134u));
+                if (a1 >= 0)
+                {
+                    const uint32_t v138 = READ32(thisPtr + 0x138u);
+                    const uint32_t a2 = READ32(thisPtr + 0x1B8u);
+                    SET_GPR_U64(ctx, 4, v138 + 0xC0u);
+                    SET_GPR_S32(ctx, 5, a1);
+                    SET_GPR_U64(ctx, 6, a2);
+                    SET_GPR_U64(ctx, 7, 0u);
+                    SET_GPR_U32(ctx, 31, 0x0014E1C8u);
+                    ctx->pc = 0x002F3280u;
+                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002F3280u,
+                            0x0014E1C0u, 0x0014E1C8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                        return;
+                }
+            }
+
+            SET_GPR_U64(ctx, 4, thisPtr);
+            SET_GPR_U64(ctx, 5, 0u);
+            SET_GPR_U32(ctx, 31, 0x0014E1D4u);
+            ctx->pc = 0x001072C0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001072C0u,
+                    0x0014E1CCu, 0x0014E1D4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x0014E1ECu);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x0014E1E4u, 0x0014E1ECu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual destructor for SearchList base class @ 0x001A2160
+    // vtable = 0x00454070 (slot +0x8)
+    void dtor1a2160(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR1A2160] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00454070u;
+
+            const uint32_t memObj = *reinterpret_cast<const uint32_t *>(obj + 0x20);
+            if (memObj != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103F20u, memObj, 0u, 0u, 0u);
+            }
+
+            // Base class destructor @ 0x00107410
+            callRecompiled4(runtime, rdram, ctx, 0x00107410u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // Virtual destructor for SearchList derived class @ 0x001ABB40
+    // vtable = 0x004543E0 (slot +0x8)
+    void dtor1abb40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR1ABB40] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x004543E0u;
+
+            const uint32_t chunkTable = *reinterpret_cast<const uint32_t *>(obj + 60);
+            if (chunkTable != 0u)
+            {
+                const uint32_t count = *reinterpret_cast<const uint32_t *>(obj + 52);
+                for (uint32_t i = 0u; i < count; ++i)
+                {
+                    uint8_t *slotPtr = getMemPtr(rdram, chunkTable + i * 4);
+                    if (slotPtr != nullptr)
+                    {
+                        const uint32_t chunkPtr = *reinterpret_cast<const uint32_t *>(slotPtr);
+                        if (chunkPtr != 0u)
+                        {
+                            callRecompiled4(runtime, rdram, ctx, 0x00103DF0u, chunkPtr, 0x004223B8u, 30u, 0u);
+                        }
+                    }
+                }
+
+                callRecompiled4(runtime, rdram, ctx, 0x00103DF0u, chunkTable, 0x004223B8u, 32u, 0u);
+            }
+
+            // Base class destructor 0x001A2160(thisPtr, 0)
+            callRecompiled4(runtime, rdram, ctx, 0x001A2160u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // PSXIcon helper destructor @ 0x00342060
+    void dtor342060(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR342060] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            const uint32_t p0c = READ32(thisPtr + 0x0Cu);
+            if (p0c != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p0c);
+                SET_GPR_U64(ctx, 5, 0x00447610u); // "PSXIcon.cpp"
+                SET_GPR_U64(ctx, 6, 45u);
+                SET_GPR_U32(ctx, 31, 0x00342094u);
+                ctx->pc = 0x00103DF0u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103DF0u,
+                        0x0034208Cu, 0x00342094u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t p18 = READ32(thisPtr + 0x18u);
+            if (p18 != 0u)
+            {
+                SET_GPR_U64(ctx, 4, p18);
+                SET_GPR_U32(ctx, 31, 0x003420ACu);
+                ctx->pc = 0x00103F20u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                        0x003420A0u, 0x003420ACu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x003420C4u);
+                ctx->pc = 0x00103E70u;
+                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                        0x003420B8u, 0x003420C4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // PSXIcon helper destructor @ 0x003424B0
+    // vtable = 0x00460E10
+    void dtor3424b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        SET_GPR_U64(ctx, 17, thisPtr);
+        SET_GPR_S32(ctx, 16, delFlag);
+
+        std::cerr << "[ATV2:DTOR3424B0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 0x20u, 0x00460E10u);
+
+            const uint32_t p30 = READ32(thisPtr + 0x30u);
+            if (p30 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00342060u, p30, 1u, 0u, 0u);
+            }
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Tail / epilogue of PSXIcon helper destructor @ 0x003424F0
+    void epilogue3424f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29);
+        const int32_t s0 = static_cast<int32_t>(GPR_U32(ctx, 16));
+        const uint32_t s1 = GPR_U32(ctx, 17);
+
+        if (s0 > 0 && s1 != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, s1, 0u, 0u, 0u);
+        }
+
+        SET_GPR_U64(ctx, 2, s1);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // PSXIcon base class destructor @ 0x00343D60
+    // vtable = 0x00460E60
+    void dtor343d60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR343D60] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00460E60u;
+
+            const uint32_t p00 = *reinterpret_cast<const uint32_t *>(obj + 0);
+            if (p00 != 0u)
+            {
+                uint8_t *p00Mem = getMemPtr(rdram, p00);
+                if (p00Mem != nullptr)
+                {
+                    const uint32_t vtbl = *reinterpret_cast<const uint32_t *>(p00Mem + 8);
+                    uint8_t *vtblMem = getMemPtr(rdram, vtbl);
+                    if (vtblMem != nullptr)
+                    {
+                        const uint32_t dtorFn = *reinterpret_cast<const uint32_t *>(vtblMem + 8);
+                        if (dtorFn != 0u)
+                        {
+                            callRecompiled4(runtime, rdram, ctx, dtorFn, p00, 1u, 0u, 0u);
+                        }
+                    }
+                }
+            }
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // PSXIcon base destructor @ 0x003441E0
+    // vtable = 0x00460E50
+    void dtor3441e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR3441E0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00460E50u;
+
+            // Base class destructor 0x00343D60(thisPtr, 0)
+            callRecompiled4(runtime, rdram, ctx, 0x00343D60u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // PSXIcon middle destructor @ 0x003426D0
+    // vtable = 0x00460E00
+    void dtor3426d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR3426D0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00460E00u;
+
+            const uint32_t p0c = *reinterpret_cast<const uint32_t *>(obj + 0x0C);
+            if (p0c != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x003424B0u, p0c, 1u, 0u, 0u);
+            }
+
+            // Base class destructor 0x003441E0(thisPtr, 0)
+            callRecompiled4(runtime, rdram, ctx, 0x003441E0u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // PSXIcon derived destructor @ 0x003429C0
+    // vtable = 0x00460DF0
+    void dtor3429c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+        std::cerr << "[ATV2:DTOR3429C0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00460DF0u;
+
+            const uint32_t p10 = *reinterpret_cast<const uint32_t *>(obj + 0x10);
+            if (p10 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, p10, 0u, 0u, 0u);
+            }
+
+            // Base class destructor 0x003426D0(thisPtr, 0)
+            callRecompiled4(runtime, rdram, ctx, 0x003426D0u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Structure / buffer initializer @ 0x002F1820
+    // Called via thunk 0x151970 (a0 += 0xC0).
+    // Clears internal buffers, initialises 24×2 flag-byte table, frees stale
+    // container entries, and resets the container.
+    // ========================================================================
+    void init2F1820(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4); // a0 = this (already offset by caller)
+
+        // std::cerr << "[ATV2:INIT2F1820] this=0x" << std::hex << thisPtr << std::dec << std::endl;
+
+        // --- this->DF0 = 0 ---
+        WRITE32(thisPtr + 0x0DF0u, 0u);
+
+        // --- memset(this+0x380, 0, 0x640) ---
+        std::memset(getMemPtr(rdram, thisPtr + 0x0380u), 0, 0x640u);
+
+        // --- memset(this+0x340, 0, 0x30) ---
+        std::memset(getMemPtr(rdram, thisPtr + 0x0340u), 0, 0x030u);
+
+        // --- memset(this+0x9D0, 0, 0x60) ---
+        std::memset(getMemPtr(rdram, thisPtr + 0x09D0u), 0, 0x060u);
+
+        // --- Nested loop: outer a3 = 0..1, inner t0 = 0..23 ---
+        // Each inner iteration operates on this + outerOff + t1, where
+        //   outerOff starts at 0 and increments by 0x1E0 each outer iter,
+        //   t1 starts at 0 and increments by 0x14 each inner iter.
+        // Operations per entry (byte at this + outerOff + t1 + 0x0A30):
+        //   bit0 cleared then set to 0 (AND 0xFFFE, OR 0x0000)  → bit0 = 0
+        //   bit1 cleared then set to 0 (AND 0xFFFD, OR 0x0000)  → bit1 = 0
+        //   bit2 cleared then set to 0 (AND 0xFFFB, OR 0x0000)  → bit2 = 0
+        //   bit3 cleared then set to 0 (AND 0xFFF7, OR 0x0000)  → bit3 = 0
+        //   → net effect: low 4 bits of byte cleared.
+        // Words at +4, +8, +12 set too.
+        {
+            uint32_t outerOff = 0u;
+            for (int outer = 0; outer < 2; ++outer)
+            {
+                uint32_t innerOff = 0u;
+                for (int inner = 0; inner < 24; ++inner)
+                {
+                    const uint32_t entryBase = thisPtr + outerOff + innerOff + 0x0A30u;
+
+                    // Clear low 4 bits of the flag byte
+                    uint8_t flagByte = READ8(entryBase);
+                    flagByte &= 0xF0u;
+                    WRITE8(entryBase, flagByte);
+
+                    // Remaining words in the 20-byte entry
+                    WRITE32(entryBase + 4u, 0xFFFFFFFFu);  // t6 = -1
+                    WRITE32(entryBase + 8u, 0xFFFFFFFFu);  // t6 = -1
+                    WRITE32(entryBase + 12u, 0x00000000u); // zero
+                    WRITE32(entryBase + 16u, 0x43340000u); // t5 = 0x4334 << 16 = float 180.0f
+
+                    innerOff += 0x14u;
+                }
+                outerOff += 0x1E0u;
+            }
+        }
+
+        // --- Loop: clear array entries via pointers at this+0x9C0 / this+0x9C8 ---
+        // for (a0=0, a1=0; a0 < this[0x37C]; a0++, a1+=4) {
+        //   *(this[0x9C0] + a1) = 0;
+        //   *(this[0x9C8] + a1) = 0x43340000; // float 180.0
+        // }
+        {
+            const uint32_t count = READ32(thisPtr + 0x037Cu);
+            const uint32_t ptrA  = READ32(thisPtr + 0x09C0u);
+            const uint32_t ptrB  = READ32(thisPtr + 0x09C8u);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (ptrA != 0u) WRITE32(ptrA + i * 4u, 0u);
+                if (ptrB != 0u) WRITE32(ptrB + i * 4u, 0x43340000u);
+            }
+        }
+
+        // --- Loop: for each entry in container at this+0x988C, call 0x2F5370 ---
+        // then delete the returned pointer.
+        // for (s1 = 0; s1 < *(this+0x988C); s1++) {
+        //   v0 = call 0x2F5370(this+0x988C, s1);
+        //   call delete(v0);
+        // }
+        {
+            const uint32_t containerAddr = thisPtr + 0x988Cu;
+            // Read count from *(this+0x988C) — but the loop loads it indirectly:
+            // ori at, zero, 0x988C; addu v0, s0, at; lw v0, 0(v0) → count = *(this+0x988C)
+            // Actually the lw is at (s0 + 0x988C + 0) so count = READ32(thisPtr + 0x988C)
+            // Wait, let me re-read. The MIPS is:
+            //   0x2F1980: ori v0, zero, 0x988C    v0 = 0x988C
+            //   0x2F1984: addu v0, s0, v0          v0 = s0 + 0x988C = this+0x988C
+            //   0x2F1988: lw v0, 0(v0)             v0 = *(this+0x988C)
+            //   0x2F198C: slt v0, s1, v0            v0 = (s1 < count)
+            // So count = READ32(thisPtr + 0x988C). But this is likely a struct with
+            // count at offset 0 from containerAddr.
+            const uint32_t containerCount = READ32(containerAddr);
+            for (uint32_t idx = 0; idx < containerCount; ++idx)
+            {
+                // call 0x2F5370(containerAddr, idx)
+                uint32_t ptr = callRecompiled4(runtime, rdram, ctx, 0x002F5370u,
+                                               containerAddr, idx, 0u, 0u);
+                // call delete(ptr) = 0x103E70
+                if (ptr != 0u)
+                {
+                    callRecompiled4(runtime, rdram, ctx, 0x00103E70u,
+                                    ptr, 0u, 0u, 0u);
+                }
+            }
+
+            // call 0x2F5390(containerAddr) — reset/clear container
+            callRecompiled4(runtime, rdram, ctx, 0x002F5390u,
+                            containerAddr, 0u, 0u, 0u);
+        }
+
+        // --- call 0x2F0150(this, 35, 0, 0) ---
+        callRecompiled4(runtime, rdram, ctx, 0x002F0150u,
+                        thisPtr, 35u, 0u, 0u);
+
+        // Return: v0 is not used by caller in the thunk path
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Forwarding thunk @ 0x00151970
+    //   j 0x002F1820        ; jump to init2F1820
+    //   addiu a0, a0, 0xC0  ; (delay slot) offset this by +0xC0
+    // Called from vtable at 0x00452A20 slot +0x14.
+    // ========================================================================
+    void thunk151970(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Apply the delay-slot offset: a0 += 0xC0
+        const uint32_t a0 = GPR_U32(ctx, 4) + 0xC0u;
+        SET_GPR_U32(ctx, 4, a0);
+
+        // Tail-call to init2F1820
+        init2F1820(rdram, ctx, runtime);
+    }
+
+    // ========================================================================
+    // Environment / Scene configuration parser @ 0x00202BD0 (Scene.cpp)
+    // Virtual method in vtable 0x00456DB0 (+0x08).
+    // Parses Environment section, SkyCubes, EcosystemFile, TerrainFile,
+    // terrain bounds/scales, water, and particle textures.
+    // ========================================================================
+    void configParser202bd0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+        const int32_t zoneCount = static_cast<int32_t>(GPR_U32(ctx, 6));
+
+        // Allocate local frame
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x390u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+
+        // 1. Check section "Environment" (0x00429268)
+        const uint32_t hasSection = callRecompiled4(runtime, rdram, ctx, 0x00141810u,
+                                                   stream, 0x00429268u, 0u, 0u);
+        if (hasSection == 0u)
+        {
+            SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x390u));
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // 2. Read int "NumberOfSkyCubes" (0x00429AA0) into thisPtr[0]
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u,
+                        stream, 0x00429AA0u, 1u, thisPtr);
+
+        const int32_t numSkyCubes = static_cast<int32_t>(READ32(thisPtr));
+        if (numSkyCubes > 0)
+        {
+            // Allocate array of pointers: numSkyCubes * 4
+            const uint32_t ptrsAddr = callRecompiled4(runtime, rdram, ctx, 0x00103EE0u,
+                                                     static_cast<uint32_t>(numSkyCubes * 4),
+                                                     0x004291C8u, 2889u, 0u);
+            WRITE32(thisPtr + 4u, ptrsAddr);
+
+            for (int32_t i = 0; i < numSkyCubes; ++i)
+            {
+                // Allocate 260-byte string buffer for each cube file
+                const uint32_t strBuf = callRecompiled4(runtime, rdram, ctx, 0x00103EE0u,
+                                                       260u, 0x004291C8u, 2892u, 0u);
+                WRITE32(ptrsAddr + static_cast<uint32_t>(i * 4), strBuf);
+
+                // Format key: snprintf(temp, 260, "%s%d", "CubeFile", i + 1)
+                char keyBuf[260];
+                std::snprintf(keyBuf, sizeof(keyBuf), "CubeFile%d", i + 1);
+                std::memcpy(getMemPtr(rdram, sp + 96u), keyBuf, std::strlen(keyBuf) + 1);
+
+                // ReadString(stream, key, "none", destBuf, -1)
+                uint32_t readOk = callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                                 stream, sp + 96u, 0x004296E0u, strBuf, 0xFFFFFFFFu);
+                if (readOk == 0u && i == 0)
+                {
+                    // Fallback to "CubeFile" without number
+                    std::snprintf(keyBuf, sizeof(keyBuf), "CubeFile");
+                    std::memcpy(getMemPtr(rdram, sp + 96u), keyBuf, std::strlen(keyBuf) + 1);
+                    callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                    stream, sp + 96u, 0x004296E0u, strBuf, 0xFFFFFFFFu);
+                }
+            }
+
+            // Check if zoneCount > 0
+            if (zoneCount > 0)
+            {
+                const uint32_t zoneArray = callRecompiled4(runtime, rdram, ctx, 0x00103EE0u,
+                                                          static_cast<uint32_t>(zoneCount * 4),
+                                                          0x004291C8u, 2902u, 0u);
+                WRITE32(thisPtr + 8u, zoneArray);
+
+                for (int32_t z = 0; z < zoneCount; ++z)
+                {
+                    char keyBuf[260];
+                    std::snprintf(keyBuf, sizeof(keyBuf), "CubeFileForZone%d", z + 1);
+                    std::memcpy(getMemPtr(rdram, sp + 368u), keyBuf, std::strlen(keyBuf) + 1);
+
+                    const uint32_t destWord = zoneArray + static_cast<uint32_t>(z * 4);
+                    callRecompiled4(runtime, rdram, ctx, 0x001421B0u,
+                                    stream, sp + 368u, 1u, destWord);
+                    // Decrement by 1 (1-based to 0-based index)
+                    const int32_t val = static_cast<int32_t>(READ32(destWord));
+                    WRITE32(destWord, static_cast<uint32_t>(val - 1));
+                }
+            }
+        }
+
+        // Special case: if numSkyCubes == 1 and str is "none", unref and clear
+        if (READ32(thisPtr) == 1u)
+        {
+            const uint32_t ptrsAddr = READ32(thisPtr + 4u);
+            if (ptrsAddr != 0u)
+            {
+                const uint32_t firstStr = READ32(ptrsAddr);
+                if (firstStr != 0u)
+                {
+                    const char *s = reinterpret_cast<const char*>(getMemPtr(rdram, firstStr));
+                    if (s != nullptr && std::strcmp(s, "none") == 0)
+                    {
+                        callRecompiled4(runtime, rdram, ctx, 0x00103F20u, firstStr, 0u, 0u, 0u);
+                        WRITE32(ptrsAddr, 0u);
+                        WRITE32(thisPtr, 0u);
+                    }
+                }
+            }
+        }
+
+        // Read EcosystemFile (0x00429AE0) into thisPtr + 0x318
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429AE0u, 0x004296E0u, thisPtr + 0x0318u, 0xFFFFFFFFu);
+
+        // Process EcosystemFile path if not "none"
+        char *ecoStr = reinterpret_cast<char*>(getMemPtr(rdram, thisPtr + 0x0318u));
+        if (ecoStr != nullptr && std::strcmp(ecoStr, "none") != 0)
+        {
+            // Strip any extension starting with '.'
+            char *dot = std::strrchr(ecoStr, '.');
+            if (dot != nullptr)
+            {
+                *dot = '\0';
+            }
+            char formattedEco[260];
+            std::snprintf(formattedEco, sizeof(formattedEco), "tracks\\%s.est", ecoStr);
+            std::strncpy(ecoStr, formattedEco, 259);
+            ecoStr[259] = '\0';
+        }
+
+        // Read TerrainFile (0x00429AF0) into thisPtr + 0x0C
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429AF0u, 0x004296E0u, thisPtr + 0x000Cu, 0xFFFFFFFFu);
+
+        // Read Floats
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B00u, 0.0f, thisPtr + 0x0520u); // TerrainWidth
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B10u, 0.0f, thisPtr + 0x0524u); // TerrainBreadth
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B20u, 0.0f, thisPtr + 0x0528u); // TerrainWidthScale
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B40u, 0.0f, thisPtr + 0x052Cu); // TerrainBreadthScale
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B60u, 0.0f, thisPtr + 0x0530u); // TerrainBorderWidth
+
+        float tWidth = 0.0f, tBreadth = 0.0f, tWScale = 0.0f, tBScale = 0.0f, tBorder = 0.0f;
+        std::memcpy(&tWidth, getMemPtr(rdram, thisPtr + 0x0520u), sizeof(float));
+        std::memcpy(&tBreadth, getMemPtr(rdram, thisPtr + 0x0524u), sizeof(float));
+        std::memcpy(&tWScale, getMemPtr(rdram, thisPtr + 0x0528u), sizeof(float));
+        std::memcpy(&tBScale, getMemPtr(rdram, thisPtr + 0x052Cu), sizeof(float));
+        std::memcpy(&tBorder, getMemPtr(rdram, thisPtr + 0x0530u), sizeof(float));
+
+        // Xmin (0x0534)
+        uint32_t ok = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x004298F0u, 0.0f, thisPtr + 0x0534u);
+        if (ok == 0u)
+        {
+            float defVal = -tBorder;
+            std::memcpy(getMemPtr(rdram, thisPtr + 0x0534u), &defVal, sizeof(float));
+        }
+
+        // Xmax (0x0538)
+        ok = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x004298F8u, 0.0f, thisPtr + 0x0538u);
+        if (ok == 0u)
+        {
+            float defVal = tBorder + 256.0f * (tWidth * tWScale);
+            std::memcpy(getMemPtr(rdram, thisPtr + 0x0538u), &defVal, sizeof(float));
+        }
+
+        // Zmin (0x053C)
+        ok = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429900u, 0.0f, thisPtr + 0x053Cu);
+        if (ok == 0u)
+        {
+            float defVal = -tBorder;
+            std::memcpy(getMemPtr(rdram, thisPtr + 0x053Cu), &defVal, sizeof(float));
+        }
+
+        // Zmax (0x0540)
+        ok = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429908u, 0.0f, thisPtr + 0x0540u);
+        if (ok == 0u)
+        {
+            float defVal = tBorder + 256.0f * (tBreadth * tBScale);
+            std::memcpy(getMemPtr(rdram, thisPtr + 0x0540u), &defVal, sizeof(float));
+        }
+
+        // MinDivisionSize (0x0544) default 96.0f
+        ok = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B80u, 0.0f, thisPtr + 0x0544u);
+        if (ok == 0u)
+        {
+            float defVal = 96.0f;
+            std::memcpy(getMemPtr(rdram, thisPtr + 0x0544u), &defVal, sizeof(float));
+        }
+
+        // EcoDistance2D (0x0548) default 180.0f
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429B90u, 180.0f, thisPtr + 0x0548u);
+
+        // EcoDistance3D (0x054C) default 120.0f
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429BA0u, 120.0f, thisPtr + 0x054Cu);
+
+        // Read WaterFile (0x00429BB0) into thisPtr + 0x110
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429BB0u, 0x004296E0u, thisPtr + 0x0110u, 0xFFFFFFFFu);
+
+        // Read ParticleTextureMapName (0x00429BC0) into thisPtr + 0x41C
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429BC0u, 0x004296E0u, thisPtr + 0x041Cu, 0xFFFFFFFFu);
+
+        // Restore stack and return 1 (true)
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x390u));
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Light configuration parser @ 0x00203310 (Scene.cpp)
+    // Virtual method in vtable 0x00456DA0 (+0x08).
+    // Parses Light%d section, Type, ColorRGB, InitialZone, Position,
+    // LookVector, Range, Cones, LensFlares, and Flashers.
+    // ========================================================================
+    void lightParser203310(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+        const int32_t lightIndex = static_cast<int32_t>(GPR_U32(ctx, 6));
+
+        // Allocate local frame
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x390u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+
+        // 1. Format section name: "Light%d" (index + 1)
+        char sectionName[260];
+        std::snprintf(sectionName, sizeof(sectionName), "Light%d", lightIndex + 1);
+        std::memcpy(getMemPtr(rdram, sp + 64u), sectionName, std::strlen(sectionName) + 1);
+
+        WRITE32(sp + 908u, 0u);
+
+        // CheckSection(stream, "Light%d")
+        callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, sp + 64u, 0u, 0u);
+
+        // 2. ReadString(stream, "Type", "none", sp + 336, -1)
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429BE0u, 0x004296E0u, sp + 336u, 0xFFFFFFFFu);
+
+        // 3. Sub-type parse: sub_00203AC0(thisPtr, sp + 336)
+        uint32_t lightType = callRecompiled4(runtime, rdram, ctx, 0x00203AC0u,
+                                            thisPtr, sp + 336u, 0u, 0u);
+        WRITE32(thisPtr, lightType);
+        if (lightType == 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x001FB930u, 0u, 0u, 0u, 0u);
+            lightType = 4u;
+            WRITE32(thisPtr, lightType);
+        }
+
+        // 4. ReadString(stream, "ColorRGB", "none", sp + 336, -1)
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429BE8u, 0x004296E0u, sp + 336u, 0xFFFFFFFFu);
+
+        // Vector parse: sub_001FB940(sp + 832, sp + 336)
+        callRecompiled4(runtime, rdram, ctx, 0x001FB940u,
+                        sp + 832u, sp + 336u, 0u, 0u);
+
+        // Copy color floats from sp + 832 to thisPtr + 4, 8, 12, 16
+        std::memcpy(getMemPtr(rdram, thisPtr + 4u), getMemPtr(rdram, sp + 832u), 16);
+
+        // ReadInt(stream, "InitialZone", 1, thisPtr + 32)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u,
+                        stream, 0x00429670u, 1u, thisPtr + 32u);
+
+        // Decrement InitialZone by 1
+        const int32_t zoneVal = static_cast<int32_t>(READ32(thisPtr + 32u));
+        WRITE32(thisPtr + 32u, static_cast<uint32_t>(zoneVal - 1));
+
+        // If lightType == 4 (Ambient), finish!
+        if (lightType == 4u)
+        {
+            SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x390u));
+            SET_GPR_U64(ctx, 2, 1u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // For non-ambient lights (Directional / Point / Spot):
+        const uint32_t posVec = callRecompiled4(runtime, rdram, ctx, 0x00103E30u, 16u, 0x004291C8u, 3057u, 0u);
+        WRITE32(thisPtr + 20u, posVec);
+
+        const uint32_t lookVec = callRecompiled4(runtime, rdram, ctx, 0x00103E30u, 16u, 0x004291C8u, 3058u, 0u);
+        WRITE32(thisPtr + 24u, lookVec);
+
+        const uint32_t targetPos = callRecompiled4(runtime, rdram, ctx, 0x00103E30u, 16u, 0x004291C8u, 3059u, 0u);
+        WRITE32(thisPtr + 28u, targetPos);
+
+        // Position (0x00429598):
+        callRecompiled5(runtime, rdram, ctx, 0x00142250u,
+                        stream, 0x00429598u, 0x004A73F0u, posVec, 0u);
+
+        // LookVector (0x00429BF8):
+        uint32_t hasLook = callRecompiled5(runtime, rdram, ctx, 0x00142250u,
+                                          stream, 0x00429BF8u, 0x004A73F0u, sp + 608u, 0u);
+        if (hasLook != 0u)
+        {
+            std::memcpy(getMemPtr(rdram, lookVec), getMemPtr(rdram, sp + 608u), 16);
+        }
+        else
+        {
+            uint32_t hasTarget = callRecompiled5(runtime, rdram, ctx, 0x00142250u,
+                                                stream, 0x004295A8u, 0x004A73F0u, sp + 608u, 0u);
+            if (hasTarget != 0u)
+            {
+                float p0 = 0, p1 = 0, p2 = 0, t0 = 0, t1 = 0, t2 = 0;
+                std::memcpy(&p0, getMemPtr(rdram, posVec), 4);
+                std::memcpy(&p1, getMemPtr(rdram, posVec + 4), 4);
+                std::memcpy(&p2, getMemPtr(rdram, posVec + 8), 4);
+                std::memcpy(&t0, getMemPtr(rdram, sp + 608), 4);
+                std::memcpy(&t1, getMemPtr(rdram, sp + 612), 4);
+                std::memcpy(&t2, getMemPtr(rdram, sp + 616), 4);
+                float d0 = t0 - p0, d1 = t1 - p1, d2 = t2 - p2, d3 = 1.0f;
+                std::memcpy(getMemPtr(rdram, lookVec), &d0, 4);
+                std::memcpy(getMemPtr(rdram, lookVec + 4), &d1, 4);
+                std::memcpy(getMemPtr(rdram, lookVec + 8), &d2, 4);
+                std::memcpy(getMemPtr(rdram, lookVec + 12), &d3, 4);
+            }
+            else
+            {
+                std::memcpy(getMemPtr(rdram, lookVec), getMemPtr(rdram, 0x004A73F0u), 16);
+            }
+        }
+
+        // Attenuation (0x00429C08):
+        float defAtten[4] = {0.03f, 0.0005f, 0.0001f, 1.0f};
+        std::memcpy(getMemPtr(rdram, sp + 624u), defAtten, 16);
+        callRecompiled5(runtime, rdram, ctx, 0x00142250u,
+                        stream, 0x00429C08u, sp + 624u, targetPos, 0u);
+
+        // Range (0x00429C18): default 0.0f
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429C18u, 0.0f, thisPtr + 36u);
+
+        // InnerConeAngle (0x00429C20): default 30.0f
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429C20u, 30.0f, thisPtr + 44u);
+
+        // OuterConeAngle (0x00429C30): default 45.0f
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429C30u, 45.0f, thisPtr + 48u);
+
+        // Flags at thisPtr + 40
+        uint8_t flags = READ8(thisPtr + 40u);
+
+        // PlaceLightAtInfinity (0x00429C40)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429C40u, 1u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~1u) | (READ32(sp + 908u) & 1u));
+
+        // CastsShadows (0x00429C58)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429C58u, 1u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~2u) | ((READ32(sp + 908u) & 1u) << 1));
+
+        // EmitsLight (0x00429C68)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429C68u, 1u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~4u) | ((READ32(sp + 908u) & 1u) << 2));
+
+        // HasLensFlare (0x00429C78)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429C78u, 0u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~8u) | ((READ32(sp + 908u) & 1u) << 3));
+        WRITE8(thisPtr + 40u, flags);
+
+        // HasLightFlare (0x00429D18)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429D18u, 0u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~16u) | ((READ32(sp + 908u) & 1u) << 4));
+        WRITE8(thisPtr + 40u, flags);
+
+        // HasFlasher (0x00429D98)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429D98u, 0u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~32u) | ((READ32(sp + 908u) & 1u) << 5));
+        WRITE8(thisPtr + 40u, flags);
+
+        // ShowDebugSphere (0x00429DE0)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429DE0u, 0u, sp + 908u);
+        flags = static_cast<uint8_t>((flags & ~64u) | ((READ32(sp + 908u) & 1u) << 6));
+        WRITE8(thisPtr + 40u, flags);
+
+        // Restore stack and return 1 (true)
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x390u));
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Zone configuration parser @ 0x00201F60 (Scene.cpp)
+    // Called from sub_002041D0 (0x00204260) to parse Zone%d / StaticModels.
+    // ========================================================================
+    void zoneParser201f60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t scenePtr = GPR_U32(ctx, 5);
+        const uint32_t stream = GPR_U32(ctx, 6);
+        const int32_t zoneIndex = static_cast<int32_t>(GPR_U32(ctx, 7));
+
+        // Allocate local frame (928 bytes)
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x3A0u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+
+        // 1. Store 0-based zone index at thisPtr + 0
+        WRITE32(thisPtr, static_cast<uint32_t>(zoneIndex - 1));
+
+        // 2. Format section name: "Zone%d" (1-based index)
+        char sectionName[260];
+        std::snprintf(sectionName, sizeof(sectionName), "Zone%d", zoneIndex);
+        std::memcpy(getMemPtr(rdram, thisPtr + 4u), sectionName, std::strlen(sectionName) + 1);
+
+        // 3. CheckSection(stream, thisPtr + 4)
+        uint32_t found = callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, thisPtr + 4u, 0u, 0u);
+        if (found == 0u)
+        {
+            if (zoneIndex != 1)
+            {
+                // Not zone 1, finish (return 0)
+                SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+                SET_GPR_U64(ctx, 2, 0u);
+                ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+                return;
+            }
+
+            // Fallback for Zone 1: check section "StaticModels"
+            std::snprintf(sectionName, sizeof(sectionName), "StaticModels");
+            std::memcpy(getMemPtr(rdram, thisPtr + 4u), sectionName, std::strlen(sectionName) + 1);
+            found = callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, thisPtr + 4u, 0u, 0u);
+            if (found == 0u)
+            {
+                SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+                SET_GPR_U64(ctx, 2, 0u);
+                ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+                return;
+            }
+        }
+
+        // 4. ReadInt(stream, "EnvironmentNodeVisible", 1, sp + 924)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x004297D0u, 1u, sp + 924u);
+        uint32_t envNodeVis = READ32(sp + 924u);
+        uint8_t flags328 = READ8(thisPtr + 328u);
+        flags328 = static_cast<uint8_t>((flags328 & ~2u) | ((envNodeVis & 1u) << 1));
+
+        const char *secStr = reinterpret_cast<const char*>(getMemPtr(rdram, thisPtr + 4u));
+        if (secStr && std::strcmp(secStr, "StaticModels") == 0)
+        {
+            flags328 |= 4u;
+        }
+        else
+        {
+            flags328 &= ~4u;
+        }
+        WRITE8(thisPtr + 328u, flags328);
+
+        // 5. ReadInt(stream, "NumberOfStaticModels", 0, thisPtr + 264)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x004297F0u, 0u, thisPtr + 264u);
+
+        // 6. SearchType parsing
+        uint32_t hasSearchType = callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                                stream, 0x00429808u, 0x00429818u, sp + 80u, 0xFFFFFFFFu);
+        if (hasSearchType != 0u)
+        {
+            uint32_t searchTypeVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+            WRITE32(thisPtr + 272u, searchTypeVal);
+            WRITE32(thisPtr + 280u, searchTypeVal);
+            WRITE32(thisPtr + 276u, searchTypeVal);
+            WRITE32(thisPtr + 284u, searchTypeVal);
+        }
+        else
+        {
+            // VisibilitySearchType
+            uint32_t hasVisSearch = callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                                   stream, 0x00429820u, 0x00429818u, sp + 80u, 0xFFFFFFFFu);
+            if (hasVisSearch != 0u)
+            {
+                uint32_t visVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 272u, visVal);
+                WRITE32(thisPtr + 280u, visVal);
+            }
+            else
+            {
+                // StaticVisibilitySearchType (default QuadTree)
+                callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                stream, 0x00429840u, 0x00429860u, sp + 80u, 0xFFFFFFFFu);
+                uint32_t staticVisVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 280u, staticVisVal);
+
+                // DynamicVisibilitySearchType (default QuadTree)
+                callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                stream, 0x00429870u, 0x00429860u, sp + 80u, 0xFFFFFFFFu);
+                uint32_t dynVisVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 272u, dynVisVal);
+            }
+
+            // CollisionSearchType
+            uint32_t hasCollSearch = callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                                    stream, 0x00429890u, 0x00429818u, sp + 80u, 0xFFFFFFFFu);
+            if (hasCollSearch != 0u)
+            {
+                uint32_t collVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 276u, collVal);
+                WRITE32(thisPtr + 280u, READ32(thisPtr + 272u));
+            }
+            else
+            {
+                // StaticCollisionSearchType (default QuadTree)
+                callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                stream, 0x004298B0u, 0x00429860u, sp + 80u, 0xFFFFFFFFu);
+                uint32_t staticCollVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 284u, staticCollVal);
+
+                // DynamicCollisionSearchType (default QuadTree)
+                callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                stream, 0x004298D0u, 0x00429860u, sp + 80u, 0xFFFFFFFFu);
+                uint32_t dynCollVal = callRecompiled4(runtime, rdram, ctx, 0x002025A0u, thisPtr, sp + 80u, 0u, 0u);
+                WRITE32(thisPtr + 276u, dynCollVal);
+            }
+        }
+
+        // Validate search types
+        if (READ32(thisPtr + 272u) == 0u ||
+            READ32(thisPtr + 280u) == 0u ||
+            READ32(thisPtr + 276u) == 0u ||
+            READ32(thisPtr + 284u) == 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x001FB930u, 0u, 0u, 0u, 0u);
+            SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // 7. Bounds: Xmin, Xmax, Zmin, Zmax
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x004298F0u, 0.0f, thisPtr + 332u);
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x004298F8u, 0.0f, thisPtr + 336u);
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429900u, 0.0f, thisPtr + 340u);
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429908u, 0.0f, thisPtr + 344u);
+
+        // 8. ZoneReverb
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429910u, 0u, thisPtr + 296u);
+
+        // 9. FogColorRGB
+        const uint32_t envObj = (scenePtr != 0u) ? READ32(scenePtr + 940u) : 0u;
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                        stream, 0x00429920u, 0x004291C0u, sp + 80u, 0xFFFFFFFFu);
+        const char *fogStr = reinterpret_cast<const char*>(getMemPtr(rdram, sp + 80u));
+        if (fogStr && std::strcmp(fogStr, "undef") != 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x001FB940u, sp + 880u, sp + 80u, 0u, 0u);
+            std::memcpy(getMemPtr(rdram, thisPtr + 300u), getMemPtr(rdram, sp + 880u), 16);
+        }
+        else if (envObj != 0u)
+        {
+            std::memcpy(getMemPtr(rdram, thisPtr + 300u), getMemPtr(rdram, envObj), 16);
+        }
+
+        // FogVisibility & FogHaziness defaults from envObj
+        float defFogVis = 0.0f;
+        float defFogHaz = 0.0f;
+        if (envObj != 0u)
+        {
+            std::memcpy(&defFogVis, getMemPtr(rdram, envObj + 16u), sizeof(float));
+            std::memcpy(&defFogHaz, getMemPtr(rdram, envObj + 20u), sizeof(float));
+        }
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429930u, defFogVis, thisPtr + 316u);
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429940u, defFogHaz, thisPtr + 320u);
+
+        if (envObj != 0u)
+        {
+            uint32_t match = callRecompiled4(runtime, rdram, ctx, 0x002042B0u, envObj, thisPtr + 300u, 0u, 0u);
+            if (match == 0u && scenePtr != 0u)
+            {
+                uint8_t b1272 = READ8(scenePtr + 1272u);
+                b1272 &= ~1u;
+                WRITE8(scenePtr + 1272u, b1272);
+            }
+        }
+
+        // 10. ExclusionList
+        WRITE32(thisPtr + 292u, 0u);
+        uint32_t hasExcl = callRecompiled5(runtime, rdram, ctx, 0x00142150u,
+                                          stream, 0x00429950u, 0x004291F0u, sp + 624u, 128u);
+        if (hasExcl != 0u)
+        {
+            const char *exclStr = reinterpret_cast<const char*>(getMemPtr(rdram, sp + 624u));
+            if (exclStr && *exclStr)
+            {
+                std::vector<int> tokens;
+                char temp[256];
+                std::strncpy(temp, exclStr, sizeof(temp));
+                temp[sizeof(temp) - 1] = '\0';
+                char *tok = std::strtok(temp, ",\n \r\t");
+                while (tok)
+                {
+                    if (*tok)
+                    {
+                        tokens.push_back(std::atoi(tok) - 1);
+                    }
+                    tok = std::strtok(nullptr, ",\n \r\t");
+                }
+                if (!tokens.empty())
+                {
+                    WRITE32(thisPtr + 292u, static_cast<uint32_t>(tokens.size()));
+                    uint32_t allocBytes = static_cast<uint32_t>(tokens.size() * 4);
+                    uint32_t listMem = callRecompiled4(runtime, rdram, ctx, 0x00103EE0u,
+                                                      allocBytes, 0x004291C8u, 2686u, 0u);
+                    WRITE32(thisPtr + 288u, listMem);
+                    for (size_t i = 0; i < tokens.size(); ++i)
+                    {
+                        WRITE32(listMem + static_cast<uint32_t>(i * 4), static_cast<uint32_t>(tokens[i]));
+                    }
+                }
+            }
+        }
+
+        // 11. CollisionObjects
+        std::snprintf(sectionName, sizeof(sectionName), "Zone%d", zoneIndex);
+        std::memcpy(getMemPtr(rdram, sp + 352u), sectionName, std::strlen(sectionName) + 1);
+        uint32_t hasCollSection = callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, sp + 352u, 0u, 0u);
+        if (hasCollSection == 0u)
+        {
+            if (zoneIndex != 1)
+            {
+                SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+                SET_GPR_U64(ctx, 2, 1u);
+                ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+                return;
+            }
+
+            std::snprintf(sectionName, sizeof(sectionName), "CollisionObjects");
+            std::memcpy(getMemPtr(rdram, sp + 352u), sectionName, std::strlen(sectionName) + 1);
+            hasCollSection = callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, sp + 352u, 0u, 0u);
+            if (hasCollSection == 0u)
+            {
+                uint32_t numStatic = READ32(thisPtr + 264u);
+                WRITE32(thisPtr + 268u, numStatic);
+                uint8_t f = READ8(thisPtr + 328u);
+                f &= ~1u;
+                WRITE8(thisPtr + 328u, f);
+
+                SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+                SET_GPR_U64(ctx, 2, 1u);
+                ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+                return;
+            }
+        }
+
+        // Section exists: Read NumberOfCollisionObjects
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429990u, 0xFFFFFFFFu, thisPtr + 268u);
+        int32_t numCollObj = static_cast<int32_t>(READ32(thisPtr + 268u));
+        if (numCollObj == -1)
+        {
+            uint8_t f = READ8(thisPtr + 328u);
+            f &= ~1u;
+            WRITE8(thisPtr + 328u, f);
+            WRITE32(thisPtr + 268u, READ32(thisPtr + 264u));
+        }
+
+        // Return 1 (true)
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x3A0u));
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual destructor for Node/Resource subclass @ 0x001B8DB0
+    // vtable 0x00454930 (+0x08).
+    // Cleans up linked list at thisPtr + 488, calls base dtor 0x001BF310,
+    // and if deleteFlag > 0 calls operator delete 0x00103E70.
+    // ========================================================================
+    void dtor1b8db0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+
+        std::cerr << "[ATV2:DTOR1B8DB0] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00454930u);
+            uint32_t p = READ32(thisPtr + 488u);
+            while (p != 0u)
+            {
+                uint32_t next = READ32(p + 8u);
+                callRecompiled4(runtime, rdram, ctx, 0x001B8CB0u, p, 1u, 0u, 0u);
+                p = next;
+            }
+
+            // Base destructor @ 0x001BF310
+            callRecompiled4(runtime, rdram, ctx, 0x001BF310u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(thisPtr));
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual destructor for Node subclass @ 0x0012B160
+    // vtable 0x00452120 (+0x08).
+    // Cleans up member at thisPtr + 92 (calls 0x001274F0), calls base dtor 0x00105C10,
+    // and if deleteFlag > 0 calls operator delete 0x00103E70.
+    // ========================================================================
+    void dtor12b160(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const int32_t delFlag = static_cast<int32_t>(GPR_U32(ctx, 5));
+
+        std::cerr << "[ATV2:DTOR12B160] this=0x" << std::hex << thisPtr << " delFlag=" << delFlag << std::dec << std::endl;
+
+        if (thisPtr != 0u)
+        {
+            WRITE32(thisPtr + 8u, 0x00452120u);
+            const uint32_t p92 = READ32(thisPtr + 92u);
+            if (p92 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x001274F0u, p92, 1u, 0u, 0u);
+            }
+
+            // Base destructor @ 0x00105C10
+            callRecompiled4(runtime, rdram, ctx, 0x00105C10u, thisPtr, 0u, 0u, 0u);
+
+            if (delFlag > 0)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(thisPtr));
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element configuration parser @ 0x00204A30 (Scene.cpp)
+    // Calls base parser 0x00204530(thisPtr, stream), then parses "CycleTime"
+    // into thisPtr + 384.
+    // ========================================================================
+    void parser204a30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // Call base parser @ 0x00204530
+        uint32_t baseResult = callRecompiled4(runtime, rdram, ctx, 0x00204530u, thisPtr, stream, 0u, 0u);
+        if (baseResult == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // ReadFloat(stream, "CycleTime", 0.0f, thisPtr + 384)
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x0042A070u, 0.0f, thisPtr + 384u);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // SceneInfo configuration parser @ 0x00201D70 (Scene.cpp)
+    // Seeks to [SceneInfo] section, then parses:
+    // - "DefaultStartPosition" into thisPtr + 0
+    // - "DefaultStartDirection" into thisPtr + 16
+    // ========================================================================
+    void parser201d70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // 0x00201D90: SeekToSection(stream, "SceneInfo")
+        uint32_t found = callRecompiled4(runtime, rdram, ctx, 0x00141810u, stream, 0x00429208u, 0u, 0u);
+        if (found == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // 0x00201DB8: ReadVector(stream, "DefaultStartPosition", defaultPos, thisPtr + 0)
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, stream, 0x00429780u, 0x004A73F0u, thisPtr + 0u);
+
+        // 0x00201DD4: ReadVector(stream, "DefaultStartDirection", defaultDir, thisPtr + 16)
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, stream, 0x004297A0u, 0x004A7420u, thisPtr + 16u);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // QuadzillaScene starting positions parser @ 0x0020C570 (QuadzillaScene.cpp)
+    // ========================================================================
+    void quadzillaSceneParser20c570(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // 0x0020C58C: base parser 0x00201D70
+        uint32_t baseResult = callRecompiled4(runtime, rdram, ctx, 0x00201D70u, thisPtr, stream, 0u, 0u);
+        if (baseResult == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // 0x0020C5B0: ReadInt(stream, "NumStartPositions", 0, thisPtr + 56)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x0042AFA0u, 0u, thisPtr + 56u);
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj == nullptr)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        const uint32_t numStartPositions = *reinterpret_cast<const uint32_t *>(obj + 56);
+        if (numStartPositions == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 1u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // 0x0020C5D0: calloc/new[](numStartPositions, 16, "QuadzillaScene.cpp", 1902)
+        const uint32_t startsArray = callRecompiled4(runtime, rdram, ctx, 0x00103D80u, numStartPositions, 16u, 0x0042AA40u, 1902u);
+        *reinterpret_cast<uint32_t *>(obj + 48) = startsArray;
+
+        // 0x0020C5EC: calloc/new[](numStartPositions, 16, "QuadzillaScene.cpp", 1903)
+        const uint32_t dirsArray = callRecompiled4(runtime, rdram, ctx, 0x00103D80u, numStartPositions, 16u, 0x0042AA40u, 1903u);
+        *reinterpret_cast<uint32_t *>(obj + 52) = dirsArray;
+
+        // Scratch buffer on guest stack for sprintf nameBuf
+        const uint32_t sp = static_cast<uint32_t>(GPR_U64(ctx, 29));
+        const uint32_t nameBufAddr = sp - 0x140u;
+        uint8_t *nameBuf = getMemPtr(rdram, nameBufAddr);
+
+        for (uint32_t i = 0u; i < numStartPositions; ++i)
+        {
+            if (nameBuf != nullptr)
+            {
+                std::snprintf(reinterpret_cast<char *>(nameBuf), 260, "Start%d", i + 1);
+            }
+            callRecompiled4(runtime, rdram, ctx, 0x00142250u, stream, nameBufAddr, 0x004A7440u, startsArray + i * 16u);
+
+            if (nameBuf != nullptr)
+            {
+                std::snprintf(reinterpret_cast<char *>(nameBuf), 260, "Direction%d", i + 1);
+            }
+            callRecompiled4(runtime, rdram, ctx, 0x00142250u, stream, nameBufAddr, 0x004A7470u, dirsArray + i * 16u);
+        }
+
+        uint8_t *startsPtr = getMemPtr(rdram, startsArray);
+        if (startsPtr != nullptr)
+        {
+            std::memcpy(obj + 0, startsPtr, 16);
+        }
+        uint8_t *dirsPtr = getMemPtr(rdram, dirsArray);
+        if (dirsPtr != nullptr)
+        {
+            std::memcpy(obj + 16, dirsPtr, 16);
+        }
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Destructor @ 0x00206DB0 (Scene member)
+    // ========================================================================
+    void dtor206db0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t thisPtr, uint32_t deleteFlag)
+    {
+        if (thisPtr == 0u) return;
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj == nullptr) return;
+        *reinterpret_cast<uint32_t *>(obj + 12) = 0x00456930u;
+        const uint32_t ptr8 = *reinterpret_cast<const uint32_t *>(obj + 8);
+        if (ptr8 != 0u) {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, ptr8, 0u, 0u, 0u);
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0u;
+        }
+        if (static_cast<int32_t>(deleteFlag) > 0) {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+    }
+
+    void dtorWrapper206db0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        dtor206db0(rdram, ctx, runtime, thisPtr, deleteFlag);
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Base Destructor @ 0x00207930 (Scene member array)
+    // ========================================================================
+    void dtor207930(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t thisPtr, uint32_t deleteFlag)
+    {
+        if (thisPtr == 0u) return;
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj == nullptr) return;
+        *reinterpret_cast<uint32_t *>(obj + 8) = 0x00456800u;
+        const uint32_t arrPtr = *reinterpret_cast<const uint32_t *>(obj + 52);
+        if (arrPtr != 0u) {
+            const uint32_t count = *reinterpret_cast<const uint32_t *>(obj + 48);
+            for (uint32_t i = 0u; i < count; ++i) {
+                uint8_t *slotPtr = getMemPtr(rdram, arrPtr + i * 4);
+                if (slotPtr != nullptr) {
+                    const uint32_t elem = *reinterpret_cast<const uint32_t *>(slotPtr);
+                    if (elem != 0u) {
+                        dtor206db0(rdram, ctx, runtime, elem, 1u);
+                        *reinterpret_cast<uint32_t *>(slotPtr) = 0u;
+                    }
+                }
+            }
+            callRecompiled4(runtime, rdram, ctx, 0x00103F20u, arrPtr, 0u, 0u, 0u);
+            *reinterpret_cast<uint32_t *>(obj + 52) = 0u;
+        }
+        callRecompiled4(runtime, rdram, ctx, 0x00105C10u, thisPtr, 0u, 0u, 0u);
+        if (static_cast<int32_t>(deleteFlag) > 0) {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+    }
+
+    void dtorWrapper207930(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        dtor207930(rdram, ctx, runtime, thisPtr, deleteFlag);
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual Destructor @ 0x0020C6C0 (Scene subclass)
+    // ========================================================================
+    void dtor20c6c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        if (thisPtr == 0u) {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr) {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x00456FC0u;
+        }
+        dtor207930(rdram, ctx, runtime, thisPtr, 0u);
+        if (static_cast<int32_t>(deleteFlag) > 0) {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Base Destructor @ 0x001585A0 (PSXRenderTarget.cpp)
+    // ========================================================================
+    void dtor1585a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t thisPtr, uint32_t deleteFlag)
+    {
+        if (thisPtr == 0u)
+            return;
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 0) = 0x00452C60u;
+
+            const uint32_t p4 = *reinterpret_cast<const uint32_t *>(obj + 4);
+            if (p4 != 0u)
+            {
+                uint8_t *p4Ptr = getMemPtr(rdram, p4);
+                if (p4Ptr != nullptr)
+                {
+                    const uint32_t vptr = *reinterpret_cast<const uint32_t *>(p4Ptr + 8);
+                    uint8_t *vptrMem = getMemPtr(rdram, vptr);
+                    if (vptrMem != nullptr)
+                    {
+                        const uint32_t vfunc = *reinterpret_cast<const uint32_t *>(vptrMem + 8);
+                        if (vfunc != 0u)
+                        {
+                            callRecompiled4(runtime, rdram, ctx, vfunc, p4, 1u, 0u, 0u);
+                        }
+                    }
+                }
+            }
+
+            const uint32_t p8 = *reinterpret_cast<const uint32_t *>(obj + 8);
+            if (p8 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x001274F0u, p8, 1u, 0u, 0u);
+            }
+        }
+
+        if (static_cast<int32_t>(static_cast<int16_t>(deleteFlag)) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+    }
+
+    void dtorWrapper1585a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR1585A0] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << deleteFlag << std::endl;
+        dtor1585a0(rdram, ctx, runtime, thisPtr, deleteFlag);
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual Destructor @ 0x001587A0 (PSXRenderTarget.cpp)
+    // ========================================================================
+    void dtor1587a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR1587A0] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << deleteFlag << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 0) = 0x00452C50u;
+        }
+
+        dtor1585a0(rdram, ctx, runtime, thisPtr, 0u);
+
+        if (static_cast<int32_t>(static_cast<int16_t>(deleteFlag)) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element constructor @ 0x002046D0 (Scene.cpp)
+    // ========================================================================
+    void ctor2046d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00204460u, thisPtr, 0u, 0u, 0u);
+
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 376) = 0x00456CE0u;
+                *reinterpret_cast<uint32_t *>(obj + 384) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 388) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 392) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 396) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 400) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 404) = 0u;
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element configuration parser @ 0x00204720 (Scene.cpp)
+    // ========================================================================
+    void parser204720(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // Call base parser @ 0x00204530
+        uint32_t baseResult = callRecompiled4(runtime, rdram, ctx, 0x00204530u, thisPtr, stream, 0u, 0u);
+        if (baseResult == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // ReadInt(stream, "MaterialSampleSpeed", 0, thisPtr + 384)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429F80u, 0u, thisPtr + 384u);
+
+        // ReadInt(stream, "MaterialMinVolume", 0, thisPtr + 388)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429FA0u, 0u, thisPtr + 388u);
+
+        // ReadInt(stream, "MaterialMinSpeed", 0, thisPtr + 392)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429FC0u, 0u, thisPtr + 392u);
+
+        // ReadInt(stream, "MaterialMaxSpeed", 0, thisPtr + 396)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429FE0u, 0u, thisPtr + 396u);
+
+        // ReadInt(stream, "MaterialResonantFreqSpeed", 0, thisPtr + 400)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x0042A000u, 0u, thisPtr + 400u);
+
+        // ReadFloat(stream, "MaterialFreqSlope", 0.0f, thisPtr + 404)
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x0042A020u, 0.0f, thisPtr + 404u);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // PortalInfo::Parse @ 0x00202670 (Scene.cpp)
+    // ========================================================================
+    void portalParser202670(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t s1 = GPR_U32(ctx, 4);
+        const uint32_t s0 = GPR_U32(ctx, 5);
+        const uint32_t a2 = GPR_U32(ctx, 6);
+
+        std::cerr << "[ATV2:PORTAL_PARSER] s1=0x" << std::hex << s1 << " stream=0x" << s0 << " idx=" << std::dec << a2 << std::endl;
+
+        const uint32_t sp = GPR_U32(ctx, 29) - 320u;
+        const uint32_t bufSection = sp + 48u;
+        char *bufSectionHost = reinterpret_cast<char *>(getMemPtr(rdram, bufSection));
+        if (bufSectionHost != nullptr)
+        {
+            snprintf(bufSectionHost, 260, "Portal%d", a2);
+        }
+        callRecompiled4(runtime, rdram, ctx, 0x00141810u, s0, bufSection, 0u, 0u);
+
+        // Vertex1 @ 0x004299C8 -> s1 + 0
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, s0, 0x004299C8u, 0x004A73F0u, s1);
+
+        // Vertex2 @ 0x004299D0 -> s1 + 16
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, s0, 0x004299D0u, 0x004A73F0u, s1 + 16u);
+
+        // Vertex3 @ 0x004299D8 -> s1 + 32
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, s0, 0x004299D8u, 0x004A73F0u, s1 + 32u);
+
+        // Vertex4 @ 0x004299E0 -> s1 + 48
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, s0, 0x004299E0u, 0x004A73F0u, s1 + 48u);
+
+        // Connect1 @ 0x004299E8 -> s1 + 64
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s0, 0x004299E8u, 0u, s1 + 64u);
+
+        // Connect2 @ 0x004299F8 -> s1 + 68
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s0, 0x004299F8u, 0u, s1 + 68u);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // TerrainZoneInfo constructor @ 0x00202770 (Scene.cpp)
+    // ========================================================================
+    void ctor202770(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                const uint32_t oneF = 0x3F800000u; // 1.0f
+                *reinterpret_cast<uint32_t *>(obj + 28) = 0x00456DD0u;
+                *reinterpret_cast<uint32_t *>(obj + 4) = 0u;        // drag = 0.0f
+                *reinterpret_cast<uint32_t *>(obj + 0) = oneF;      // friction = 1.0f
+                *reinterpret_cast<uint32_t *>(obj + 8) = oneF;      // traction = 1.0f
+                *reinterpret_cast<uint32_t *>(obj + 12) = oneF;     // powerslide = 1.0f
+                *reinterpret_cast<uint32_t *>(obj + 16) = oneF;     // braking = 1.0f
+                *reinterpret_cast<uint32_t *>(obj + 20) = 1u;       // generateDust = 1
+                *reinterpret_cast<uint32_t *>(obj + 24) = 1u;       // generateDirt = 1
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // TerrainZoneInfo::Parse @ 0x002027B0 (Scene.cpp)
+    // ========================================================================
+    void parser2027b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        std::cerr << "[ATV2:TERRAIN_ZONE_PARSER] this=0x" << std::hex << thisPtr << " stream=0x" << stream << std::dec << std::endl;
+
+        uint32_t ok = 1u;
+
+        // SurfaceDrag @ 0x00429A08, default 0.0f -> thisPtr + 4
+        uint32_t r = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429A08u, 0.0f, thisPtr + 4u);
+        if (r == 0u) ok = 0u;
+
+        // SurfaceFriction @ 0x00429A20, default 1.0f -> thisPtr + 0
+        r = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429A20u, 1.0f, thisPtr + 0u);
+        if (r == 0u) ok = 0u;
+
+        // SurfaceTraction @ 0x00429A30, default 1.0f -> thisPtr + 8
+        r = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429A30u, 1.0f, thisPtr + 8u);
+        if (r == 0u) ok = 0u;
+
+        // PowerslideFrictionScale @ 0x00429A40, default 1.0f -> thisPtr + 12
+        r = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429A40u, 1.0f, thisPtr + 12u);
+        if (r == 0u) ok = 0u;
+
+        // SurfaceBraking @ 0x00429A58, default 1.0f -> thisPtr + 16
+        r = callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, stream, 0x00429A58u, 1.0f, thisPtr + 16u);
+        if (r == 0u) ok = 0u;
+
+        // GenerateDust @ 0x00429A68, default 1 -> thisPtr + 20
+        r = callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429A68u, 1u, thisPtr + 20u);
+        if (r == 0u) ok = 0u;
+
+        // GenerateDirt @ 0x00429A78, default 1 -> thisPtr + 24
+        r = callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x00429A78u, 1u, thisPtr + 24u);
+        if (r == 0u) ok = 0u;
+
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(ok));
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // WeatherInfo::Parse @ 0x00208CC0 (QuadzillaScene.cpp / Scene.cpp)
+    // ========================================================================
+    void weatherParser208cc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t s3 = GPR_U32(ctx, 4);
+        const uint32_t s2 = GPR_U32(ctx, 5);
+        const uint32_t sp = GPR_U32(ctx, 29) - 208u;
+
+        std::cerr << "[ATV2:WEATHER_PARSER] s3=0x" << std::hex << s3 << " parser=0x" << s2 << std::dec << std::endl;
+
+        // Check if section [Weather] exists: 0x0042AAC0 = "Weather"
+        const uint32_t hasWeather = callRecompiled4(runtime, rdram, ctx, 0x00141810u, s2, 0x0042AAC0u, 0u, 0u);
+        if (hasWeather == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // ChanceOfWeather @ 0x0042AAD0, default 0.0f -> s3 + 8
+        callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, s2, 0x0042AAD0u, 0.0f, s3 + 8u);
+
+        // SltName @ 0x0042AAE0, default "NONE" (0x0042AAB8) -> s3 + 12, maxLen 64
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u, s2, 0x0042AAE0u, 0x0042AAB8u, s3 + 12u, 64u);
+
+        // MaxLensDrops @ 0x0042AAE8, default 20 -> s3 + 76
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AAE8u, 20u, s3 + 76u);
+
+        // MaxWorldDrops @ 0x0042AAF8, default 100 -> s3 + 80
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AAF8u, 100u, s3 + 80u);
+
+        // Color @ 0x0042AB08, default vec4 (0x004A7440) -> s3 + 96
+        callRecompiled4(runtime, rdram, ctx, 0x00142250u, s2, 0x0042AB08u, 0x004A7440u, s3 + 96u);
+
+        // ColorOffsetStart @ 0x0042AB10, default 0 -> s3 + 112
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AB10u, 0u, s3 + 112u);
+
+        // ColorOffsetEnd @ 0x0042AB28, default 0 -> s3 + 116
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AB28u, 0u, s3 + 116u);
+
+        // WeatherType @ 0x0042AB38, default "NONE" (0x0042AAB8) -> sp + 80, maxLen 64
+        const uint32_t bufType = sp + 80u;
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u, s2, 0x0042AB38u, 0x0042AAB8u, bufType, 64u);
+
+        const char *weatherTypeStr = reinterpret_cast<const char *>(getMemPtr(rdram, bufType));
+        if (weatherTypeStr != nullptr)
+        {
+            if (_stricmp(weatherTypeStr, "RAIN") == 0)
+            {
+                WRITE32(s3 + 120u, 1u);
+            }
+            else if (_stricmp(weatherTypeStr, "SNOW") == 0)
+            {
+                WRITE32(s3 + 120u, 2u);
+            }
+        }
+
+        // UseRingEmitters @ 0x0042AB60, default 0 -> s3 + 124
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AB60u, 0u, s3 + 124u);
+
+        const uint32_t useRings = READ32(s3 + 124u);
+        if (useRings != 0u)
+        {
+            // NumberOfRings @ 0x0042AB70, default 4 -> s3 + 128
+            callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AB70u, 4u, s3 + 128u);
+
+            // RingHeight @ 0x0042AB80, default 60.0f -> s3 + 132
+            callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, s2, 0x0042AB80u, 60.0f, s3 + 132u);
+
+            // RingInitialRadius @ 0x0042AB90, default 50.0f -> s3 + 136
+            callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, s2, 0x0042AB90u, 50.0f, s3 + 136u);
+
+            // RingDeltaRadius @ 0x0042ABB0, default 50.0f -> s3 + 140
+            callRecompiledFloat(runtime, rdram, ctx, 0x00142200u, s2, 0x0042ABB0u, 50.0f, s3 + 140u);
+
+            // RingInitialDivisions @ 0x0042ABC0, default 4 -> s3 + 144
+            callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042ABC0u, 4u, s3 + 144u);
+        }
+
+        // NumParticleEmitters @ 0x0042ABE0, default 0 -> s3 + 0
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042ABE0u, 0u, s3);
+
+        const int32_t numEmitters = static_cast<int32_t>(READ32(s3));
+        if (numEmitters > 0 && useRings == 0u)
+        {
+            const uint32_t allocSize = static_cast<uint32_t>(numEmitters) * 32u;
+            // operator new[](size, "QuadzillaScene.cpp", 396) @ 0x00103C20
+            const uint32_t emitterArray = callRecompiled4(runtime, rdram, ctx, 0x00103C20u, allocSize, 0x0042AA40u, 396u, 0u);
+            WRITE32(s3 + 4u, emitterArray);
+
+            const uint32_t bufSection = sp + 144u;
+            char *bufSectionHost = reinterpret_cast<char *>(getMemPtr(rdram, bufSection));
+
+            for (int32_t i = 0; i < numEmitters; ++i)
+            {
+                if (bufSectionHost != nullptr)
+                {
+                    snprintf(bufSectionHost, 64, "WeatherEmitter%d", i + 1);
+                }
+                callRecompiled4(runtime, rdram, ctx, 0x00141810u, s2, bufSection, 0u, 0u);
+
+                const uint32_t elem = emitterArray + static_cast<uint32_t>(i) * 32u;
+                // OffsetFromCamera @ 0x0042AC20, default vec4 0x004A7440 -> elem + 16
+                callRecompiled4(runtime, rdram, ctx, 0x00142250u, s2, 0x0042AC20u, 0x004A7440u, elem + 16u);
+
+                // EmitterNumber @ 0x0042AC38, default 0 -> elem + 0
+                callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AC38u, 0u, elem);
+
+                // InstanceNumber @ 0x0042AC48, default 0 -> elem + 4
+                callRecompiled4(runtime, rdram, ctx, 0x001421B0u, s2, 0x0042AC48u, 0u, elem + 4u);
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // WeatherInfo virtual destructor @ 0x00209040 (QuadzillaScene.cpp)
+    // ========================================================================
+    void dtor209040(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t delFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR209040] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << delFlag << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            *reinterpret_cast<uint32_t *>(obj + 8) = 0x004571E0u;
+
+            const uint32_t count = *reinterpret_cast<const uint32_t *>(obj + 56);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t elem = callRecompiled4(runtime, rdram, ctx, 0x0020C850u, thisPtr + 56u, i, 0u, 0u);
+                if (elem != 0u)
+                {
+                    callRecompiled4(runtime, rdram, ctx, 0x00103DF0u, elem, 0x0042AA40u, 436u, 0u);
+                }
+            }
+
+            const uint32_t p76 = *reinterpret_cast<const uint32_t *>(obj + 76);
+            if (p76 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103F20u, p76, 0u, 0u, 0u);
+                *reinterpret_cast<uint32_t *>(obj + 76) = 0u;
+            }
+
+            const uint32_t p64 = *reinterpret_cast<const uint32_t *>(obj + 64);
+            if (p64 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103F20u, p64, 0u, 0u, 0u);
+            }
+        }
+
+        callRecompiled4(runtime, rdram, ctx, 0x00105C10u, thisPtr, 0u, 0u, 0u);
+
+        if (static_cast<int32_t>(static_cast<int16_t>(delFlag)) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Utility @ 0x0034A340
+    // Decrements *a0 by a1, returns 0x004FBE30 + (*a0 * 8)
+    // ========================================================================
+    void util34a340(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4);
+        const uint32_t a1 = GPR_U32(ctx, 5);
+
+        uint32_t val = READ32(a0);
+        val -= a1;
+        WRITE32(a0, val);
+
+        const uint32_t ret = 0x004FBE30u + (val * 8u);
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(ret));
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element constructor @ 0x002047F0 (Scene.cpp)
+    // ========================================================================
+    void ctor2047f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00204460u, thisPtr, 0u, 0u, 0u);
+
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 376) = 0x00456CD0u;
+                std::memcpy(obj + 384, "body\0", 5);
+                *reinterpret_cast<uint32_t *>(obj + 904) = 0u;
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // VisibilityQuadTreeNode constructor @ 0x00162800 (VisibilityQuadTree.cpp)
+    // ========================================================================
+    void ctor162800(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 16) = 0x00452D50u;
+                *reinterpret_cast<uint32_t *>(obj + 0) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 4) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 8) = 0u;
+                *reinterpret_cast<uint32_t *>(obj + 12) = 0xFF7FFFFFu;
+
+                uint8_t *globPtr = getMemPtr(rdram, 0x00489020u);
+                if (globPtr != nullptr)
+                {
+                    const uint32_t a2 = *reinterpret_cast<const uint32_t *>(globPtr);
+                    uint8_t *a2Ptr = getMemPtr(rdram, a2 + 2184u);
+                    if (a2Ptr != nullptr)
+                    {
+                        *reinterpret_cast<uint32_t *>(a2Ptr) += 1u;
+                    }
+                }
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // VisibilityQuadTreeLeaf constructor @ 0x0016DE70 (VisibilityQuadTree.cpp)
+    // ========================================================================
+    void ctor16de70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00162800u, thisPtr, 0u, 0u, 0u);
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 16) = 0x004531A0u;
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // VisibilityQuadTreeLeaf factory @ 0x0016DE30 (VisibilityQuadTree.cpp)
+    // ========================================================================
+    void factory16de30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t obj = callRecompiled4(runtime, rdram, ctx, 0x00103E30u, 20u, 0x00420420u, 91u, 0u);
+        if (obj != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x0016DE70u, obj, 0u, 0u, 0u);
+        }
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(obj));
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element configuration parser @ 0x00204990 (Scene.cpp)
+    // Calls base parser 0x00204530(thisPtr, stream), then parses "AttachToObject"
+    // (default "body") into thisPtr + 384 via ReadString (0x00142150).
+    // ========================================================================
+    void parser204990(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // Call base parser @ 0x00204530
+        uint32_t baseResult = callRecompiled4(runtime, rdram, ctx, 0x00204530u, thisPtr, stream, 0u, 0u);
+        if (baseResult == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // ReadString(stream, "AttachToObject", "body", thisPtr + 384, -1)
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u, stream, 0x0042A040u, 0x0042A038u, thisPtr + 384u, 0xFFFFFFFFu);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element configuration parser @ 0x00204870 (Scene.cpp)
+    // Calls base parser 0x00204530(thisPtr, stream), then parses:
+    // - "AttachToObject" (default "body") into thisPtr + 384 via 0x00142150
+    // - "StartDisabled" (default 0) into thisPtr + 904 via 0x001421B0
+    // - "SoundConfigFile" (default "") into thisPtr + 644 via 0x00142150
+    // ========================================================================
+    void parser204870(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t stream = GPR_U32(ctx, 5);
+
+        // Call base parser @ 0x00204530
+        uint32_t baseResult = callRecompiled4(runtime, rdram, ctx, 0x00204530u, thisPtr, stream, 0u, 0u);
+        if (baseResult == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        // ReadString(stream, "AttachToObject", "body", thisPtr + 384, -1)
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u, stream, 0x0042A040u, 0x0042A038u, thisPtr + 384u, 0xFFFFFFFFu);
+
+        // ReadInt(stream, "StartDisabled", 0, thisPtr + 904)
+        callRecompiled4(runtime, rdram, ctx, 0x001421B0u, stream, 0x0042A050u, 0u, thisPtr + 904u);
+
+        // ReadString(stream, "SoundConfigFile", "", thisPtr + 644, -1)
+        callRecompiled5(runtime, rdram, ctx, 0x00142150u, stream, 0x0042A060u, 0x004291F0u, thisPtr + 644u, 0xFFFFFFFFu);
+
+        SET_GPR_U64(ctx, 2, 1u);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element constructor @ 0x002049F0 (Scene.cpp)
+    // ========================================================================
+    void ctor2049f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00204460u, thisPtr, 0u, 0u, 0u);
+
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 376) = 0x00456CB0u;
+                *reinterpret_cast<uint32_t *>(obj + 384) = 0u;
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Screen/Scene element constructor @ 0x00204910 (Scene.cpp)
+    // ========================================================================
+    void ctor204910(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        if (thisPtr != 0u)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00204460u, thisPtr, 0u, 0u, 0u);
+
+            uint8_t *obj = getMemPtr(rdram, thisPtr);
+            if (obj != nullptr)
+            {
+                *reinterpret_cast<uint32_t *>(obj + 376) = 0x00456CC0u;
+                std::memcpy(obj + 384, "body\0", 5);
+            }
+        }
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Base Destructor @ 0x001C0570 (PSXSurfaceShader.cpp base / Resource list)
+    // ========================================================================
+    void dtor1c0570(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t thisPtr, uint32_t deleteFlag)
+    {
+        if (thisPtr == 0u)
+            return;
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj == nullptr)
+            return;
+
+        // 0x001C0598: vtable = 0x00454AD8
+        *reinterpret_cast<uint32_t *>(obj + 16396) = 0x00454AD8u;
+
+        // 0x001C05A0: member at +8
+        const uint32_t member8 = *reinterpret_cast<const uint32_t *>(obj + 8);
+        if (member8 != 0u)
+        {
+            uint8_t *m8Ptr = getMemPtr(rdram, member8);
+            if (m8Ptr != nullptr)
+            {
+                const uint32_t vt = *reinterpret_cast<const uint32_t *>(m8Ptr + 8);
+                uint8_t *vtPtr = getMemPtr(rdram, vt);
+                if (vtPtr != nullptr)
+                {
+                    const uint32_t fn = *reinterpret_cast<const uint32_t *>(vtPtr + 16);
+                    if (fn != 0u)
+                    {
+                        callRecompiled4(runtime, rdram, ctx, fn, member8, 0u, 0u, 0u);
+                    }
+                }
+            }
+        }
+
+        // 0x001C05BC: check global singleton pointer at 0x00499038
+        uint8_t *globMem = getMemPtr(rdram, 0x00499038u);
+        if (globMem != nullptr)
+        {
+            if (*reinterpret_cast<const uint32_t *>(globMem) == thisPtr)
+            {
+                *reinterpret_cast<uint32_t *>(globMem) = 0u;
+            }
+        }
+
+        // 0x001C0608: loop over array of elements at this + 12
+        const uint32_t count = *reinterpret_cast<const uint32_t *>(obj + 0);
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            const uint32_t elem = *reinterpret_cast<const uint32_t *>(obj + 12 + i * 4);
+            if (elem != 0u)
+            {
+                uint8_t *elemPtr = getMemPtr(rdram, elem);
+                if (elemPtr != nullptr)
+                {
+                    const uint32_t vt = *reinterpret_cast<const uint32_t *>(elemPtr + 40);
+                    uint8_t *vtPtr = getMemPtr(rdram, vt);
+                    if (vtPtr != nullptr)
+                    {
+                        const uint32_t dtorFn = *reinterpret_cast<const uint32_t *>(vtPtr + 8);
+                        if (dtorFn != 0u)
+                        {
+                            callRecompiled4(runtime, rdram, ctx, dtorFn, elem, 1u, 0u, 0u);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 0x001C0620: delete this if deleteFlag > 0
+        if (static_cast<int32_t>(deleteFlag) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+    }
+
+    void dtorWrapper1c0570(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR1C0570] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << deleteFlag << std::endl;
+        dtor1c0570(rdram, ctx, runtime, thisPtr, deleteFlag);
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // ========================================================================
+    // Virtual Destructor @ 0x001BABA0 (PSXSurfaceShader.cpp)
+    // ========================================================================
+    void dtor1baba0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        const uint32_t deleteFlag = GPR_U32(ctx, 5);
+        std::cerr << "[ATV2:DTOR1BABA0] this=0x" << std::hex << thisPtr
+                  << " delFlag=" << std::dec << deleteFlag << std::endl;
+
+        if (thisPtr == 0u)
+        {
+            SET_GPR_U64(ctx, 2, 0u);
+            ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+            return;
+        }
+
+        uint8_t *obj = getMemPtr(rdram, thisPtr);
+        if (obj != nullptr)
+        {
+            // Set derived vtable
+            *reinterpret_cast<uint32_t *>(obj + 16396) = 0x004549F8u;
+
+            const uint32_t ptr16400 = *reinterpret_cast<const uint32_t *>(obj + 16400);
+            if (ptr16400 != 0u)
+            {
+                callRecompiled4(runtime, rdram, ctx, 0x00103DF0u, ptr16400, 0x00424970u, 677u, 0u);
+            }
+        }
+
+        // Call base destructor with deleteFlag = 0
+        dtor1c0570(rdram, ctx, runtime, thisPtr, 0u);
+
+        // Free this object if deleteFlag > 0
+        if (static_cast<int32_t>(deleteFlag) > 0)
+        {
+            callRecompiled4(runtime, rdram, ctx, 0x00103E70u, thisPtr, 0u, 0u, 0u);
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        ctx->pc = static_cast<uint32_t>(GPR_U64(ctx, 31));
+    }
+
+    // MSL soft-float dptoul (Double-Precision to Unsigned Long) @ 0x003B5590
+    void dptoul3b5590(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint64_t a0Bits = GPR_U64(ctx, 4);
+        double val = 0.0;
+        std::memcpy(&val, &a0Bits, sizeof(double));
+
+        uint32_t result = 0;
+        if (!std::isnan(val) && val > 0.0)
+        {
+            if (val >= 4294967295.0)
+                result = 0xFFFFFFFFu;
+            else
+                result = static_cast<uint32_t>(val);
+        }
+
+        SET_GPR_U64(ctx, 2, static_cast<uint64_t>(result));
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // Diagnostics wrapper for func_256A70 (child teardown)
+    void func256a70_wrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cerr << "[ATV2:256A70] ENTER: a0=0x" << std::hex << GPR_U32(ctx, 4) << std::dec << std::endl;
+        sub_00256A70_0x256a70(rdram, ctx, runtime);
+        std::cerr << "[ATV2:256A70] EXIT: pc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+    }
+
+    // Diagnostics wrapper for func_2FF730
+    void func2ff730_wrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cerr << "[ATV2:2FF730] ENTER: a0=0x" << std::hex << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5) << std::dec << std::endl;
+        sub_002FF730_0x2ff730(rdram, ctx, runtime);
+        std::cerr << "[ATV2:2FF730] EXIT: pc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+    }
+
+    // Diagnostics wrapper for func_1DFB00 (UI resource archive & viewport init)
+    void func1dfb00_wrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        uint32_t gameObj = GPR_U32(ctx, 4);
+        uint32_t renderer = 0;
+        uint32_t mode = 0;
+        uint32_t snd = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, 0x004975B0u));
+        uint32_t vpBefore = 0;
+        if (gameObj != 0) {
+            renderer = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x298u));
+            if (renderer != 0) {
+                mode = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, renderer + 0x4u));
+            }
+            vpBefore = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+        }
+        std::cerr << "[ATV2:1DFB00] ENTER: gameObj=0x" << std::hex << gameObj 
+                  << " renderer=0x" << renderer 
+                  << " mode=" << std::dec << mode 
+                  << " vpBefore=0x" << std::hex << vpBefore
+                  << " snd=0x" << snd << std::dec << std::endl;
+
+        sub_001DFB00_0x1dfb00(rdram, ctx, runtime);
+
+        uint32_t vpAfter = 0;
+        if (gameObj != 0) {
+            vpAfter = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+        }
+        std::cerr << "[ATV2:1DFB00] YIELD/EXIT: pc=0x" << std::hex << ctx->pc 
+                  << " v0=" << GPR_U32(ctx, 2) 
+                  << " vpAfter=0x" << vpAfter << std::dec << std::endl;
+    }
+
     // Frame limiter hook @ 0x0015DA90
     // Runs on the main EE thread every frame.
     // Phase 1: Create viewport by calling func_1DFB00 (skipped because we bypass video).
@@ -1811,81 +5469,50 @@ namespace
     void frameLimiter15da90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static int s_frameCount = 0;
-        static bool s_viewportCreated = false;
-        static bool s_screenCreated = false;
+        static bool s_state5Triggered = false;
+        // ATV2_NATIVE_LOOP=1: skip the hand-driven FrontendManager harness below and let the
+        // game's own main loop run, so we can see what it does without forced state changes.
+        static const bool s_nativeLoop = []() {
+            const char *v = std::getenv("ATV2_NATIVE_LOOP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
         ++s_frameCount;
 
-        if (s_frameCount > 60)
+        // ATV2_STACKSCAN=1: at frames 30 and 90, list guest return addresses on the stack
+        // (words preceded by jal/jalr) to recover the call chain that reached the limiter.
+        static const bool s_stackScan = []() {
+            const char *v = std::getenv("ATV2_STACKSCAN");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (s_stackScan && (s_frameCount == 30 || s_frameCount == 90))
+        {
+            const uint32_t sp = GPR_U32(ctx, 29);
+            std::cerr << "[ATV2:STACKSCAN] frame=" << s_frameCount << " sp=0x" << std::hex << sp
+                      << " ra=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
+            for (uint32_t a = sp & ~3u; a < 0x01FFFFF0u; a += 4u)
+            {
+                const uint32_t w = *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a));
+                if (w < 0x00100008u || w >= 0x003C0000u || (w & 3u) != 0u)
+                    continue;
+                const uint32_t call = *reinterpret_cast<uint32_t *>(getMemPtr(rdram, w - 8u));
+                const bool isJal = (call >> 26) == 3u;
+                const bool isJalr = (call & 0xFC00003Fu) == 0x00000009u;
+                if (!isJal && !isJalr)
+                    continue;
+                std::cerr << "[ATV2:STACKSCAN]   @0x" << std::hex << a << " ret=0x" << w;
+                if (isJal)
+                    std::cerr << " jal 0x" << ((call & 0x03FFFFFFu) << 2);
+                else
+                    std::cerr << " jalr";
+                std::cerr << std::dec << std::endl;
+            }
+        }
+
+        if (!s_nativeLoop && s_frameCount > 60)
         {
             uint32_t gameObj = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, 0x00404818u));
             if (gameObj != 0u)
             {
-                // --- Phase 1: Create viewport (one-shot) ---
-                // On real hardware, State 2 calls func_1DFB00(gameObj) to create the
-                // 3D viewport, open the CD archive, and load menu resources.
-                // Since we bypass video, State 2 never runs, so we call it directly.
-                if (!s_viewportCreated)
-                {
-                    uint32_t viewport = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
-                    if (viewport == 0u)
-                    {
-                        std::cerr << "[ATV2:BOOT] Creating viewport via func_1DFB00(gameObj=0x"
-                                  << std::hex << gameObj << ")..." << std::dec << std::endl;
-
-                        R5900Context savedCtx = *ctx;
-                        SET_GPR_U32(ctx, 4, gameObj);
-                        SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                        ctx->pc = 0x001DFB00u;
-                        sub_001DFB00_0x1dfb00(rdram, ctx, runtime);
-                        *ctx = savedCtx;
-
-                        viewport = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
-                        std::cerr << "[ATV2:BOOT] After func_1DFB00: viewport=0x"
-                                  << std::hex << viewport << std::dec << std::endl;
-                    }
-                    s_viewportCreated = true;
-                }
-
-                // --- Phase 1b: Create the main menu screen (one-shot, after viewport) ---
-                // State 14 handler calls func_1E0810(gameObj, feMgr->screenId, feMgr->transId, 1)
-                // to build the menu UI. We call it with the stored screen/trans IDs.
-                if (s_viewportCreated && !s_screenCreated && s_frameCount > 90)
-                {
-                    uint32_t feMgr = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x2B0u));
-                    if (feMgr != 0u)
-                    {
-                        uint32_t screenId = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xC0u));
-                        uint32_t transId  = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xC4u));
-
-                        std::cerr << "[ATV2:BOOT] Creating menu screen via func_1E0810(gameObj=0x"
-                                  << std::hex << gameObj << ", screen=" << std::dec << screenId
-                                  << ", trans=" << transId << ", flags=1)..." << std::endl;
-
-                        R5900Context savedCtx = *ctx;
-                        SET_GPR_U32(ctx, 4, gameObj);
-                        SET_GPR_U32(ctx, 5, screenId);
-                        SET_GPR_U32(ctx, 6, transId);
-                        SET_GPR_U32(ctx, 7, 1u);
-                        SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                        ctx->pc = 0x001E0810u;
-                        sub_001E0810_0x1e0810(rdram, ctx, runtime);
-                        *ctx = savedCtx;
-
-                        // Also unlink feMgr from scene graph as State 14 does
-                        {
-                            R5900Context savedCtx2 = *ctx;
-                            SET_GPR_U32(ctx, 4, feMgr);
-                            SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                            ctx->pc = 0x00106050u;
-                            sub_00106050_0x106050(rdram, ctx, runtime);
-                            *ctx = savedCtx2;
-                        }
-
-                        s_screenCreated = true;
-                        std::cerr << "[ATV2:BOOT] Menu screen creation done." << std::endl;
-                    }
-                }
-
                 // --- Phase 2: Tick FrontendManager every frame ---
                 uint32_t feMgr = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x2B0u));
                 if (feMgr != 0u)
@@ -1895,48 +5522,173 @@ namespace
                     uint32_t *pFlags20 = reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0x20u));
                     uint32_t *pFlags24 = reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0x24u));
 
-                    // Force visibility flags on feMgr
-                    *pFlags20 |= 0x8u;
-                    *pFlags24 |= 0x8u;
+                    auto enableNodeTree = [&](auto& self, uint32_t node) -> void {
+                        if (node == 0u || node >= 0x02000000u) return;
+                        *reinterpret_cast<uint32_t*>(getMemPtr(rdram, node + 0x20u)) |= 0xAu;
+                        *reinterpret_cast<uint32_t*>(getMemPtr(rdram, node + 0x24u)) |= 0xAu;
+                        uint8_t *p28 = reinterpret_cast<uint8_t*>(getMemPtr(rdram, node + 0x28u));
+                        uint8_t *p29 = reinterpret_cast<uint8_t*>(getMemPtr(rdram, node + 0x29u));
+                        *p28 = 0xFFu;
+                        *p29 = (*p29 | 0x01u) & ~0x0Cu;
+                        for (uint32_t ch = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, node + 0x18u));
+                             ch != 0u && ch < 0x02000000u;
+                             ch = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, ch + 0x14u))) {
+                            self(self, ch);
+                        }
+                    };
 
-                    // Ensure feScreen (feMgr + 0xB8) also has visibility flags
+                    uint32_t root = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x10u));
                     uint32_t feScreen = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB8u));
-                    if (feScreen != 0u)
+                    uint32_t feMenu = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB0u));
+                    uint32_t feTitle = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB4u));
+
+                    enableNodeTree(enableNodeTree, feMgr);
+                    if (root != 0u) enableNodeTree(enableNodeTree, root);
+                    if (feScreen != 0u) enableNodeTree(enableNodeTree, feScreen);
+                    if (feMenu != 0u) enableNodeTree(enableNodeTree, feMenu);
+                    if (feTitle != 0u) enableNodeTree(enableNodeTree, feTitle);
+
+                    // Status logging every 30 frames:
+                    if (s_frameCount % 30 == 0)
                     {
-                        *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feScreen + 0x20u)) |= 0x8u;
-                        *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feScreen + 0x24u)) |= 0x8u;
+                        uint32_t renderer = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x298u));
+                        uint32_t mode = (renderer != 0u) ? *reinterpret_cast<uint32_t*>(getMemPtr(rdram, renderer + 0x4u)) : 0u;
+                        uint32_t vp = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+                        uint32_t snd = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, 0x004975B0u));
+                        std::cerr << "[ATV2:STATUS] frame=" << s_frameCount
+                                  << " gameObj=0x" << std::hex << gameObj
+                                  << " renderer=0x" << renderer
+                                  << " mode=" << std::dec << mode
+                                  << " vp=0x" << std::hex << vp
+                                  << " snd=0x" << snd
+                                  << " cur=" << std::dec << *pCur
+                                  << " pend=" << *pPend
+                                  << " feMenu=0x" << std::hex << feMenu
+                                  << " feTitle=0x" << feTitle
+                                  << " root=0x" << root
+                                  << std::endl;
+                    }
+
+                    // Drive state transitions:
+                    // State 5 (0x05) triggers Case 5 (0x25663C), which runs func_257910 and func_255F30.
+                    // func_255F30 creates TitleScreen (0x004555E0) into feMgr + 0xB4, and attaches it to root (gameObj + 0x10).
+                    if (s_frameCount >= 62 && !s_state5Triggered && *pCur == 0u && *pPend == 0u)
+                    {
+                        std::cerr << "[ATV2:STATE] Triggering transition State 0 -> State 5 (0x5) via pendState=5" << std::endl;
+                        *pPend = 5u;
+                        s_state5Triggered = true;
+                    }
+
+                    auto runGuestToCompletion = [&](uint32_t entryPc, uint32_t a0, float f12 = 0.0f) -> uint32_t
+                    {
+                        R5900Context savedCtx = *ctx;
+                        SET_GPR_U32(ctx, 4, a0);
+                        ctx->f[12] = f12;
+                        const uint32_t targetRa = 0x0015DA90u;
+                        SET_GPR_U32(ctx, 31, targetRa);
+                        ctx->pc = entryPc;
+
+                        int steps = 0;
+                        uint32_t prevVp = (gameObj != 0u) ? *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu)) : 0u;
+                        while (ctx->pc != targetRa && ctx->pc != 0u && !runtime->isStopRequested() && steps < 20000000)
+                        {
+                            ++steps;
+                            PS2Runtime::RecompiledFunction fn = runtime->lookupFunction(ctx->pc);
+                            if (!fn)
+                            {
+                                std::cerr << "[ATV2:RUN] Missing function for PC 0x" << std::hex << ctx->pc << std::dec << std::endl;
+                                break;
+                            }
+                            fn(rdram, ctx, runtime);
+
+                            if (gameObj != 0u)
+                            {
+                                uint32_t curVp = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+                                if (curVp != 0u && prevVp == 0u)
+                                {
+                                    std::cerr << "[ATV2:VIEWPORT_ALLOCATED!] gameObj->vp=0x" << std::hex << curVp 
+                                              << " at step " << std::dec << steps 
+                                              << " pc=0x" << std::hex << ctx->pc << std::dec << std::endl;
+                                    prevVp = curVp;
+                                }
+                            }
+                        }
+                        uint32_t finalPc = ctx->pc;
+                        if (steps >= 50000)
+                        {
+                            std::cerr << "[ATV2:RUN] entryPc=0x" << std::hex << entryPc 
+                                      << " steps=" << std::dec << steps 
+                                      << " finalPc=0x" << std::hex << finalPc << std::dec << std::endl;
+                        }
+                        *ctx = savedCtx;
+                        return finalPc;
+                    };
+
+                    // --- Phase 1: Initialize 3D Viewport via func_1DFB00 once ---
+                    static bool s_vpInitialized = false;
+                    if (!s_vpInitialized && s_frameCount >= 61)
+                    {
+                        uint32_t vp = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+                        if (vp == 0u)
+                        {
+                            std::cerr << "[ATV2:VIEWPORT] Initializing 3D Viewport via func_1DFB00..." << std::endl;
+                            runGuestToCompletion(0x001DFB00u, gameObj);
+                            vp = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+                            std::cerr << "[ATV2:VIEWPORT] Result vp=0x" << std::hex << vp << std::dec << std::endl;
+                        }
+                        s_vpInitialized = true;
                     }
 
                     // 1. Tick FrontendManager::Update(feMgr, dt=0.03333333f)
+                    uint32_t updRet = runGuestToCompletion(0x00256110u, feMgr, 0.03333333f);
+                    feMenu = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB0u));
+
+                    if (s_frameCount >= 60 && s_frameCount <= 75)
                     {
-                        R5900Context savedCtx = *ctx;
-                        SET_GPR_U32(ctx, 4, feMgr);
-                        ctx->f[12] = 0.03333333f;
-                        SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                        ctx->pc = 0x00256110u;
-                        sub_002560A0_0x2560a0(rdram, ctx, runtime);
-                        *ctx = savedCtx;
+                        uint32_t feScr = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB8u));
+                        uint32_t vp = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, gameObj + 0x29Cu));
+                        std::cerr << "[ATV2:UPDATE_COMPLETION] frame=" << s_frameCount
+                                  << " updRet=0x" << std::hex << updRet
+                                  << " vp=0x" << vp
+                                  << " cur=" << std::dec << *pCur
+                                  << " pend=" << *pPend
+                                  << " feMenu=0x" << std::hex << feMenu << std::endl;
                     }
 
-                    // 2. Draw feMgr via Node::Draw (0x00106370)
+                    // 2. Advance Node::Update(dt=0.03333333f) on scene trees so transformations/animations step
+                    if (root != 0u)
                     {
-                        R5900Context savedCtx = *ctx;
-                        SET_GPR_U32(ctx, 4, feMgr);
-                        SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                        ctx->pc = 0x00106370u;
-                        sub_00106370_0x106370(rdram, ctx, runtime);
-                        *ctx = savedCtx;
+                        runGuestToCompletion(0x001064B0u, root, 0.03333333f);
+                    }
+                    runGuestToCompletion(0x001064B0u, feMgr, 0.03333333f);
+
+                    // 3. Draw root via Node::Draw (0x00106370) - traverses full scene hierarchy
+                    if (root != 0u)
+                    {
+                        runGuestToCompletion(0x00106370u, root);
                     }
 
-                    // 3. Draw feScreen directly (via 0x0025C680)
+                    // 4. Draw feMgr via Node::Draw (0x00106370)
+                    runGuestToCompletion(0x00106370u, feMgr);
+
+                    // 5. Draw feTitle directly via TitleScreen::Render (0x001D3F50)
+                    feTitle = *reinterpret_cast<uint32_t*>(getMemPtr(rdram, feMgr + 0xB4u));
+                    if (feTitle != 0u)
+                    {
+                        enableNodeTree(enableNodeTree, feTitle);
+                        runGuestToCompletion(0x001D3F50u, feTitle);
+                    }
+
+                    // 6. Also explicitly ensure feMenu is drawn if instantiated:
+                    if (feMenu != 0u)
+                    {
+                        runGuestToCompletion(0x00106370u, feMenu);
+                    }
+
+                    // 7. Draw feScreen directly (via 0x0025C680)
                     if (feScreen != 0u)
                     {
-                        R5900Context savedCtx = *ctx;
-                        SET_GPR_U32(ctx, 4, feScreen);
-                        SET_GPR_U32(ctx, 31, 0x0015DA90u);
-                        ctx->pc = 0x0025C680u;
-                        sub_0025C680_0x25c680(rdram, ctx, runtime);
-                        *ctx = savedCtx;
+                        runGuestToCompletion(0x0025C680u, feScreen);
                     }
 
                     static int s_feTicks = 0;
@@ -1947,6 +5699,7 @@ namespace
                                   << " feMgr=0x" << std::hex << feMgr
                                   << " cur=" << std::dec << *pCur
                                   << " pend=" << *pPend
+                                  << " feMenu=0x" << std::hex << feMenu
                                   << " feScreen=0x" << std::hex << feScreen
                                   << " viewport=0x" << viewport
                                   << std::dec << std::endl;
@@ -1954,9 +5707,406 @@ namespace
                 }
             }
         }
+        if (s_nativeLoop && s_frameCount == 120)
+        {
+            auto rd32 = [&](uint32_t a) -> uint32_t {
+                if (a == 0u || a >= 0x02000000u) return 0u;
+                return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a));
+            };
+            const uint32_t gameObj = rd32(0x00404818u);
+            const uint32_t core = rd32(gameObj + 0x284u);
+            const uint32_t coreVt = rd32(core);
+            std::cerr << std::hex << "[ATV2:TREE] gameObj=0x" << gameObj << " core(+0x284)=0x" << core
+                      << " coreVt=0x" << coreVt;
+            for (uint32_t off : {0x10u, 0x34u, 0x48u, 0x50u})
+                std::cerr << " vt+0x" << off << "=0x" << rd32(coreVt + off);
+            std::cerr << " root(+0x10)=0x" << rd32(gameObj + 0x10u)
+                      << " feMgr(+0x2b0)=0x" << rd32(gameObj + 0x2B0u)
+                      << " +0x2b4=0x" << rd32(gameObj + 0x2B4u) << std::dec << std::endl;
+            const uint32_t root = rd32(gameObj + 0x10u);
+            int shown = 0;
+            for (uint32_t n = rd32(root + 0x18u); n != 0u && shown < 40; n = rd32(n + 0x14u), ++shown)
+            {
+                const uint32_t vt = rd32(n + 8u);
+                std::cerr << std::hex << "[ATV2:TREE]   child=0x" << n << " vt=0x" << vt
+                          << " flags20=0x" << rd32(n + 0x20u) << " flags24=0x" << rd32(n + 0x24u)
+                          << " b29=0x" << (rd32(n + 0x28u) >> 8 & 0xFFu)
+                          << " upd(+0x44)=0x" << rd32(vt + 0x44u)
+                          << " draw(+0x48)=0x" << rd32(vt + 0x48u) << std::dec << std::endl;
+            }
+            std::cerr << "[ATV2:TREE] root flags24=0x" << std::hex << rd32(root + 0x24u)
+                      << " flags20=0x" << rd32(root + 0x20u) << std::dec << std::endl;
+        }
 
         ctx->pc = 0x0015DA90u;
         sub_0015DA90_0x15da90(rdram, ctx, runtime);
+    }
+
+    // ---- Opt-in front-end trace (ATV2_TRACE_FE=1) -------------------------------------
+    // Wraps a few functions of the front-end start-up path. Each wrapper logs its arguments
+    // and return address for a bounded number of calls, then runs the original generated
+    // function unchanged. Used to find out why the game's own flow never leaves state 0.
+    struct FeTraceEntry
+    {
+        uint32_t addr;
+        const char *name;
+        PS2Runtime::RecompiledFunction orig;
+        int calls;
+        int limit;
+    };
+
+    FeTraceEntry g_feTrace[] = {
+        {0x001DF2C0u, "StartFrontEnd(0x1DF2C0)", nullptr, 0, 20},
+        {0x00256A20u, "FeSetPendingState(0x256A20)", nullptr, 0, 60},
+        {0x00256110u, "FeUpdate(0x256110)", nullptr, 0, 4},
+        {0x001DF080u, "GameInitA(0x1DF080)", nullptr, 0, 20},
+        {0x001DF5D0u, "StartFE_AfterInit(0x1DF5D0)", nullptr, 0, 20},
+        {0x00176B60u, "VifRendererCtor(0x176B60)", nullptr, 0, 8},
+        {0x00176D60u, "VifRendererInit(0x176D60)", nullptr, 0, 8},
+        {0x0016B900u, "RenderNodeInit(0x16B900)", nullptr, 0, 8},
+        {0x00177190u, "VifRendererDraw(0x177190)", nullptr, 0, 4},
+        {0x001D0780u, "DrawListCtor(0x1D0780)", nullptr, 0, 8},
+        {0x00157900u, "GsRendererVt24(0x157900)", nullptr, 0, 8},
+        {0x00157A60u, "GsRendererKick(0x157A60)", nullptr, 0, 8},
+        {0x00157510u, "GsDmaSend(0x157510)", nullptr, 0, 8},
+        {0x0035A420u, "FlushCache(0x35A420)", nullptr, 0, 8},
+    };
+
+    template <int I>
+    void feTraceWrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        FeTraceEntry &e = g_feTrace[I];
+        if (I == 0 && e.calls == 0)
+        {
+            g_ps2TraceDispatchRemaining = 50000u;
+        }
+        if (++e.calls <= e.limit)
+        {
+            std::cerr << "[ATV2:FETRACE] " << e.name << " call#" << e.calls
+                      << " a0=0x" << std::hex << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5)
+                      << " ra=0x" << GPR_U32(ctx, 31)
+                      << " sp=0x" << GPR_U32(ctx, 29);
+            const uint32_t a0 = GPR_U32(ctx, 4);
+            if (a0 >= 0x00100000u && a0 < 0x02000000u)
+                std::cerr << " a0[+30]=0x" << READ32(a0 + 0x30u)
+                          << " a0[+5c/60/64]=0x" << READ32(a0 + 0x5Cu) << "/0x" << READ32(a0 + 0x60u)
+                          << "/0x" << READ32(a0 + 0x64u);
+            std::cerr << " [sp+10]=0x" << READ32(GPR_U32(ctx, 29) + 0x10u);
+            std::cerr << std::dec << std::endl;
+        }
+        const uint32_t ra = GPR_U32(ctx, 31);
+        const uint32_t slot = GPR_U32(ctx, 29) + 0x10u;
+        if (e.orig)
+            e.orig(rdram, ctx, runtime);
+        if (e.calls <= e.limit)
+        {
+            std::cerr << "[ATV2:FETRACE] " << e.name << (ctx->pc == ra ? " return#" : " exit#") << e.calls
+                      << " pc=0x" << std::hex << ctx->pc << " ra=0x" << GPR_U32(ctx, 31)
+                      << " v0=0x" << GPR_U32(ctx, 2) << " sp=0x" << GPR_U32(ctx, 29)
+                      << " [entrySp+10]=0x" << READ32(slot) << std::dec << std::endl;
+        }
+    }
+
+    template <int... Is>
+    void registerFeTraceImpl(PS2Runtime &runtime, std::integer_sequence<int, Is...>)
+    {
+        PS2Runtime::RecompiledFunction wrappers[] = {&feTraceWrap<Is>...};
+        for (int i = 0; i < static_cast<int>(sizeof...(Is)); ++i)
+        {
+            FeTraceEntry &e = g_feTrace[i];
+            e.orig = runtime.lookupFunction(e.addr);
+            if (!e.orig)
+            {
+                std::cerr << "[ATV2:FETRACE] no generated function at 0x" << std::hex << e.addr
+                          << std::dec << " (" << e.name << "); not wrapped" << std::endl;
+                continue;
+            }
+            runtime.replaceFunction(e.addr, wrappers[i]);
+        }
+    }
+
+    // Screen fade 0x15FE20 computes alpha = cvt.w.s(fade * 128 + 0.5) with fade += elapsed / duration.
+    // Callers pass duration 0: the R5900 returns +FLT_MAX for x/0 and cvt.w.s saturates to 0x7FFFFFFF,
+    // ending the loop after one step. Host IEEE gives inf -> 0x80000000, so the loop never exits.
+    // The converted alpha is stored at caller sp+0xD8 right before `jal 0x160D10` (return 0x16019C).
+    PS2Runtime::RecompiledFunction g_fadeStep160d10Orig = nullptr;
+
+    void fadeStep160d10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (GPR_U32(ctx, 31) == 0x0016019Cu && std::isinf(ctx->f[21]))
+        {
+            uint32_t *alpha = reinterpret_cast<uint32_t *>(getMemPtr(rdram, GPR_U32(ctx, 29) + 0xD8u));
+            if (*alpha == 0x80000000u)
+                *alpha = (ctx->f[21] > 0.0f) ? 0x7FFFFFFFu : 0x80000000u;
+            ctx->f[21] = std::copysign(std::numeric_limits<float>::max(), ctx->f[21]);
+        }
+        g_fadeStep160d10Orig(rdram, ctx, runtime);
+    }
+
+    // ---- VIF1 I-bit texture streaming (same engine as ATV1 0x1EEEC0) ---------------
+    // PSXTextureMapManager::Create (0x176D60) installs 0x174AE0 as the VIF1 INTC
+    // handler and builds a FLUSHA+I packet (VIFcode 0x93000000) that the render
+    // lists insert ahead of each part needing a new texture. BeginTransfer sends
+    // entry 0; each I-bit makes the handler call SendCurrentTransfer (0x178DF0,
+    // mgr=*0x48A1C0, a1=0) for the next entry and restart VIF1 (FBRST.STC).
+    // The runtime cannot deliver that interrupt mid-stream, so do the send inline.
+    constexpr uint32_t kTextureMapManagerPtr = 0x0048A1C0u;
+    constexpr uint32_t kSendCurrentTransfer = 0x00178DF0u;
+    constexpr uint32_t kTransferListIndex = 0x0048A390u;
+    constexpr uint32_t kTextureSendDonePc = 0xFFFFFFE0u;
+    PS2Runtime *g_ibitRuntime = nullptr;
+    PS2Runtime::RecompiledFunction g_sendCurrentTransfer = nullptr;
+
+    void onVif1TextureIbit(uint32_t vifcode)
+    {
+        static bool s_inHook = false;
+        static uint32_t s_logs = 0u;
+        if (s_inHook || g_ibitRuntime == nullptr || g_sendCurrentTransfer == nullptr)
+            return;
+        uint8_t *rdram = g_ibitRuntime->memory().getRDRAM();
+        R5900Context *live = g_ibitRuntime->eeScheduler().currentContext();
+        if (rdram == nullptr || live == nullptr)
+            return;
+        auto rd = [&](uint32_t a) { return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a)); };
+        const uint32_t mgr = rd(kTextureMapManagerPtr);
+        if (mgr == 0u)
+            return;
+
+        const uint32_t idxBefore = rd(kTransferListIndex);
+        R5900Context tmp = *live;
+        SET_GPR_U32(&tmp, 29, (GPR_U32(live, 29) - 0x400u) & ~0xFu);
+        SET_GPR_U32(&tmp, 4, mgr);
+        SET_GPR_U32(&tmp, 5, 0u);
+        SET_GPR_U32(&tmp, 31, kTextureSendDonePc);
+        tmp.pc = kSendCurrentTransfer;
+        const uint32_t savedHold = g_ps2HoldEeTimeslices;
+        g_ps2HoldEeTimeslices = 1u;
+        s_inHook = true;
+        g_sendCurrentTransfer(rdram, &tmp, g_ibitRuntime);
+        s_inHook = false;
+        g_ps2HoldEeTimeslices = savedHold;
+
+        if (s_logs < 24u)
+        {
+            ++s_logs;
+            std::cerr << "[ATV2:IBIT] vifcode=0x" << std::hex << vifcode << std::dec
+                      << " texture send " << idxBefore << "->" << rd(kTransferListIndex)
+                      << " exitPc=0x" << std::hex << tmp.pc << std::dec << std::endl;
+        }
+    }
+
+    void registerVif1TextureIbit(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("ATV2_IBIT_TEX_SYNC");
+        if (v != nullptr && v[0] == '0')
+            return;
+        g_sendCurrentTransfer = runtime.lookupFunction(kSendCurrentTransfer);
+        if (!g_sendCurrentTransfer)
+        {
+            std::cerr << "[ATV2:IBIT] no generated function at 0x178DF0; texture I-bit sync not installed" << std::endl;
+            return;
+        }
+        g_ibitRuntime = &runtime;
+        g_ps2Vif1IbitHook = &onVif1TextureIbit;
+    }
+
+    // ATV2 links libpad "PsIIlibpad 2500" without symbols, and nothing on the IOP side services
+    // padman's SIF RPC (0x80000100/0x80000101) or fills its DMA buffer. Route the library's entry
+    // points to the runtime's HLE pad implementation, which reads the host keyboard/gamepad.
+    struct PadHleEntry
+    {
+        uint32_t addr;
+        const char *name;
+        PS2Runtime::RecompiledFunction hle;
+        int32_t forcedSuccessReturn;
+    };
+
+    const PadHleEntry kPadHleEntries[] = {
+        {0x00377320u, "scePadInit", &ps2_stubs::scePadInit, 0},
+        {0x00377580u, "scePadPortOpen", &ps2_stubs::scePadPortOpen, 0},
+        {0x003778D0u, "scePadRead", &ps2_stubs::scePadRead, 32},
+        {0x00377950u, "scePadGetState", &ps2_stubs::scePadGetState, 0},
+        {0x00377A00u, "scePadSetReqState", &ps2_stubs::scePadSetReqState, 0},
+        {0x00377A68u, "scePadGetReqState", &ps2_stubs::scePadGetReqState, 0},
+        {0x00377AF0u, "scePadInfoAct", &ps2_stubs::scePadInfoAct, 0},
+        {0x00377D30u, "scePadInfoMode", &ps2_stubs::scePadInfoMode, 0},
+        {0x00377E68u, "scePadSetMainMode", &ps2_stubs::scePadSetMainMode, 0},
+        {0x00377F20u, "scePadSetActDirect", &ps2_stubs::scePadSetActDirect, 0},
+        {0x00377FE0u, "scePadSetActAlign", &ps2_stubs::scePadSetActAlign, 0},
+        {0x003780B8u, "scePadGetButtonMask", &ps2_stubs::scePadGetButtonMask, 0},
+        {0x00378170u, "scePadSetButtonInfo", &ps2_stubs::scePadSetButtonInfo, 0},
+        {0x00378220u, "scePadInfoPressMode", &ps2_stubs::scePadInfoPressMode, 0},
+        {0x00378280u, "scePadEnterPressMode", &ps2_stubs::scePadEnterPressMode, 0},
+        {0x003784D0u, "scePadGetModVersion", &ps2_stubs::scePadGetModVersion, 0},
+    };
+
+    template <size_t I>
+    void padHleWrap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int s_logged = 0;
+        const PadHleEntry &e = kPadHleEntries[I];
+        const uint32_t ra = getRegU32(ctx, 31);
+        const uint32_t a0 = getRegU32(ctx, 4), a1 = getRegU32(ctx, 5), a2 = getRegU32(ctx, 6);
+        if constexpr (I == 2)
+        {
+            // ATV2_AUTO_CROSS=<n>: test aid, holds Cross for 8 port-0 reads starting at read n.
+            static const int s_autoCross = []() { const char *s = std::getenv("ATV2_AUTO_CROSS"); return s ? std::atoi(s) : 0; }();
+            static int s_reads = 0;
+            if (s_autoCross > 0 && a0 == 0u)
+            {
+                ++s_reads;
+                if ((s_reads % 25) == 0)
+                    std::cerr << "[ATV2:PAD] port0 reads=" << s_reads << " ra=0x" << std::hex << ra << std::dec << std::endl;
+                if (s_reads == s_autoCross)
+                {
+                    std::cerr << "[ATV2:PAD] auto Cross press at read " << s_reads << std::endl;
+                    for (int reg = 16; reg <= 23; ++reg)
+                    {
+                        const uint32_t obj = getRegU32(ctx, reg);
+                        if (obj < 0x00100000u || obj >= 0x01FF0000u || READ32(obj + 4u) != 16u)
+                            continue;
+                        const uint32_t table = READ32(obj + 0x14u);
+                        std::cerr << "[ATV2:PAD] map obj=0x" << std::hex << obj << " table=0x" << table << std::dec;
+                        for (uint32_t i = 0; i < 16u; ++i)
+                        {
+                            const uint32_t e = table + i * 12u;
+                            std::cerr << " [" << i << ":f" << static_cast<int>(READ8(e)) << ",p" << READ32(e + 4u)
+                                      << ",m0x" << std::hex << READ16(e + 8u) << std::dec << "]";
+                        }
+                        std::cerr << std::endl;
+                        break;
+                    }
+                    ps2_stubs::setPadOverrideState(0xFFFFu & ~0x4000u, 0x80u, 0x80u, 0x80u, 0x80u);
+                }
+                else if (s_reads > s_autoCross && ((s_reads - s_autoCross) % 30) == 0)
+                {
+                    const bool start = (((s_reads - s_autoCross) / 30) % 2) == 1;
+                    std::cerr << "[ATV2:PAD] auto " << (start ? "Start" : "Cross") << " repeat at read " << s_reads << std::endl;
+                    ps2_stubs::setPadOverrideState(0xFFFFu & ~(start ? 0x0008u : 0x4000u), 0x80u, 0x80u, 0x80u, 0x80u);
+                }
+                else if (s_reads > s_autoCross && ((s_reads - s_autoCross) % 30) == 4)
+                {
+                    ps2_stubs::clearPadOverrideState();
+                }
+            }
+        }
+        e.hle(rdram, ctx, runtime);
+        if (e.forcedSuccessReturn != 0 && getRegU32(ctx, 2) != 0u)
+            SET_GPR_S32(ctx, 2, e.forcedSuccessReturn);
+        if (s_logged < 4)
+        {
+            ++s_logged;
+            std::cerr << "[ATV2:PAD] " << e.name << "(0x" << std::hex << a0 << ",0x" << a1 << ",0x" << a2
+                      << ") -> 0x" << getRegU32(ctx, 2) << " ra=0x" << ra << std::dec << std::endl;
+        }
+        ctx->pc = ra;
+    }
+
+    template <size_t... I>
+    void registerPadHleImpl(PS2Runtime &runtime, std::index_sequence<I...>)
+    {
+        (runtime.replaceFunction(kPadHleEntries[I].addr, &padHleWrap<I>), ...);
+    }
+
+    PS2Runtime::RecompiledFunction g_padEvent122930Orig = nullptr;
+
+    void padEvent122930(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int s_logged = 0;
+        if (s_logged < 40)
+        {
+            ++s_logged;
+            std::cerr << "[ATV2:PAD] event(0x122930) a1(button)=" << getRegU32(ctx, 5)
+                      << " a2=" << getRegU32(ctx, 6) << " a3(down)=" << getRegU32(ctx, 7)
+                      << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        }
+        g_padEvent122930Orig(rdram, ctx, runtime);
+    }
+
+    void registerPadHle(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("ATV2_PAD_HLE");
+        if (v != nullptr && v[0] == '0')
+            return;
+        registerPadHleImpl(runtime, std::make_index_sequence<std::size(kPadHleEntries)>{});
+        if (std::getenv("ATV2_AUTO_CROSS") != nullptr)
+        {
+            g_padEvent122930Orig = runtime.lookupFunction(0x00122930u);
+            if (g_padEvent122930Orig)
+                runtime.replaceFunction(0x00122930u, &padEvent122930);
+        }
+    }
+
+    void registerFadeStepFix(PS2Runtime &runtime)
+    {
+        g_fadeStep160d10Orig = runtime.lookupFunction(0x00160D10u);
+        if (!g_fadeStep160d10Orig)
+        {
+            std::cerr << "[ATV2:FADE] no generated function at 0x160D10; fade fix not installed" << std::endl;
+            return;
+        }
+        runtime.replaceFunction(0x00160D10u, &fadeStep160d10);
+    }
+
+    // ---- Opt-in heap trace (ATV2_HEAPTRACE=1) ---------------------------------------
+    // Logs malloc (0x36BD98) calls that are large or touch the top of the heap,
+    // where the 26MB pool (0x103B20) and its 0x18-byte lock must not overlap.
+    PS2Runtime::RecompiledFunction g_malloc36bd98Orig = nullptr;
+    int g_heapTraceLines = 0;
+
+    bool heapTraceInteresting(uint32_t size, uint32_t ptr)
+    {
+        return size >= 0x10000u || ptr >= 0x01F70000u || size == 0x18u;
+    }
+
+    void heapTraceDumpAllocator(uint8_t *rdram)
+    {
+        auto rd = [&](uint32_t a) { return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a)); };
+        std::cerr << "[ATV2:HEAP] top=0x" << std::hex << rd(0x004124D0u)
+                  << " break=0x" << rd(0x00410AD4u)
+                  << " base=0x" << rd(0x004128E0u)
+                  << " ext=0x" << rd(0x004128E8u) << "/0x" << rd(0x004128F0u) << "/0x" << rd(0x004128F8u)
+                  << std::dec << std::endl;
+    }
+
+    void malloc36bd98Trace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t size = GPR_U32(ctx, 4);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        g_malloc36bd98Orig(rdram, ctx, runtime);
+        if (ctx->pc != ra || g_heapTraceLines >= 400)
+            return;
+        const uint32_t ptr = GPR_U32(ctx, 2);
+        if (!heapTraceInteresting(size, ptr))
+            return;
+        ++g_heapTraceLines;
+        std::cerr << "[ATV2:HEAP] malloc(0x" << std::hex << size << ") = 0x" << ptr
+                  << " ra=0x" << ra << std::dec << std::endl;
+        if (size >= 0x100000u || ptr >= 0x01F70000u)
+            heapTraceDumpAllocator(rdram);
+    }
+
+    void registerHeapTrace(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("ATV2_HEAPTRACE");
+        if (v == nullptr || v[0] == '\0' || v[0] == '0')
+            return;
+        g_malloc36bd98Orig = runtime.lookupFunction(0x0036BD98u);
+        if (!g_malloc36bd98Orig)
+        {
+            std::cerr << "[ATV2:HEAP] no generated function at 0x36BD98; heap trace not installed" << std::endl;
+            return;
+        }
+        runtime.replaceFunction(0x0036BD98u, &malloc36bd98Trace);
+    }
+
+    void registerFeTrace(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("ATV2_TRACE_FE");
+        if (v == nullptr || v[0] == '\0' || v[0] == '0')
+            return;
+        registerFeTraceImpl(runtime, std::make_integer_sequence<int, 14>{});
     }
 
     void applyScus97211Overrides(PS2Runtime &runtime)
@@ -1968,13 +6118,35 @@ namespace
         runtime.replaceFunction(0x001AE800u, &nameRegistry1ae800);
         runtime.replaceFunction(0x001D2FA0u, &registryFlags1d2fa0);
         runtime.replaceFunction(0x00177AE0u, &resourceForward177ae0);
+        runtime.replaceFunction(0x00177AF0u, &resourceRemove177af0);
+        runtime.replaceFunction(0x001D0890u, &forward1d0890);
+        runtime.replaceFunction(0x001D08A0u, &forward1d08a0);
+        runtime.replaceFunction(0x001749B0u, &listInsertTail1749b0);
         runtime.replaceFunction(0x001CE020u, &resourceRead1ce020);
         // PCSX2 confirms the adjacent resource type uses identical instructions.
         runtime.replaceFunction(0x001CE0C0u, &resourceRead1ce020);
         runtime.replaceFunction(0x002AE950u, &sliderInit2ae950);
         runtime.replaceFunction(0x002364C0u, &textInputInit2364c0);
+        runtime.replaceFunction(0x001C7AC0u, &ctorPrologue1c7a40<0x001C7AC0u>);
+        runtime.replaceFunction(0x001C7C00u, &ctorPrologue1c7a40<0x001C7C00u>);
         runtime.replaceFunction(0x00126FC0u, &leafStoreF12_126fc0);
         runtime.replaceFunction(0x002AE600u, &iconInit2ae600);
+        // Method-table entry discovery in the recompiler now registers these; the overrides only
+        // cover runners generated without it.
+        replaceIfMissing(runtime, 0x002AE370u, &uiInit2ae370);
+        replaceIfMissing(runtime, 0x002AE290u, &uiUpdate2ae290);
+        replaceIfMissing(runtime, 0x002AE220u, &uiRelease2ae220);
+        replaceIfMissing(runtime, 0x002AE280u, &uiTail2ae280);
+        replaceIfMissing(runtime, 0x002AE3B0u, &uiTimer2ae3b0);
+        replaceIfMissing(runtime, 0x002AE400u, &uiSelect2ae400);
+        replaceIfMissing(runtime, 0x00155AB0u, &renderBegin155ab0);
+        replaceIfMissing(runtime, 0x002D5880u, &childFactory2d5880);
+        replaceIfMissing(runtime, 0x002343B0u, &attachChild2343b0);
+        replaceIfMissing(runtime, 0x002343E0u, &leafReturn2343e0);
+        replaceIfMissing(runtime, 0x002343F0u, &leafReturn2343e0);
+        replaceIfMissing(runtime, 0x00234400u, &leafReturnOne234400);
+        replaceIfMissing(runtime, 0x00234410u, &tailNodeUpdate234410);
+        replaceIfMissing(runtime, 0x002B5600u, &getField44_2b5600);
         runtime.replaceFunction(0x002AD6C0u, &highlightInit2ad6c0);
         runtime.replaceFunction(0x00204390u, &screenConfig204390);
         runtime.replaceFunction(0x002D1F10u, &ctor2d1f10);
@@ -2062,11 +6234,13 @@ namespace
 
         // VBlank-chain vtable method @ 0x156e80 (JALR from 0x1538ac in the VBlank
         // chain). Merged boundary; re-entry switch lacks case 0x156e80u.
-        runtime.replaceFunction(0x00156e80u, &vtableMethod156e80);
+        replaceIfMissing(runtime, 0x00156e80u, &vtableMethod156e80);
 
         // Boot-path vtable method @ 0x176d60 (JALR from 0x10455c after the display
         // system allocates its object at 0x4891C0). Merged boundary; missed target.
-        runtime.replaceFunction(0x00176d60u, &vtableMethod176d60);
+        // callRecompiled4 loses the rest of the init when the pool allocator yields, and the
+        // packet codes it writes are truncated; generated code is used whenever it has the entry.
+        replaceIfMissing(runtime, 0x00176d60u, &vtableMethod176d60);
 
         // Sound driver RPC dispatcher (PS2SOUND.IRX, sid=0x34567).
         runtime.replaceFunction(0x002f0150u, &soundRpcCall2f0150);
@@ -2094,6 +6268,248 @@ namespace
 
         // Frame limiter: ticks FrontendManager update and draw every frame
         runtime.replaceFunction(0x0015DA90u, &frameLimiter15da90);
+
+        // Diagnostics wrapper for func_1DFB00
+        runtime.replaceFunction(0x001DFB00u, &func1dfb00_wrapper);
+
+        // Diagnostics wrappers for State 2 sub-calls
+        runtime.replaceFunction(0x00256A70u, &func256a70_wrapper);
+        runtime.replaceFunction(0x002FF730u, &func2ff730_wrapper);
+
+        // Virtual destructor for Node subclass @ 0x00152D50
+        runtime.replaceFunction(0x00152D50u, &dtor152d50);
+
+        // Virtual destructor for Node subclass @ 0x00108070
+        runtime.replaceFunction(0x00108070u, &dtor108070);
+
+        // MSL soft-float dptoul (Double-Precision to Unsigned Long) @ 0x003B5590
+        runtime.replaceFunction(0x003B5590u, &dptoul3b5590);
+
+        // Virtual destructor for Resource node subclass @ 0x001BD180
+        runtime.replaceFunction(0x001BD180u, &dtor1bd180);
+
+        // Virtual destructor for Node subclass @ 0x00137EF0
+        runtime.replaceFunction(0x00137EF0u, &dtor137ef0);
+
+        // Virtual destructors for Resource node subclasses @ 0x001CE0E0, 0x001CE140, 0x001CE330
+        runtime.replaceFunction(0x001CE0E0u, &dtor1ce0e0);
+        runtime.replaceFunction(0x001CE140u, &dtor1ce140);
+        runtime.replaceFunction(0x001CE330u, &dtor1ce330);
+
+        // Virtual destructor for VertexBuffer node subclass @ 0x001C2A70
+        runtime.replaceFunction(0x001C2A70u, &dtor1c2a70);
+
+        // Virtual destructors for UI node subclasses: Highlight_Icon, Animated_Icon, Slider, TextInput
+        runtime.replaceFunction(0x002AD640u, &dtor2ad640);
+        runtime.replaceFunction(0x002AE5A0u, &dtor2ae5a0);
+        runtime.replaceFunction(0x002AE8F0u, &dtor2ae8f0);
+        runtime.replaceFunction(0x00236440u, &dtor236440);
+
+        // Virtual destructor for Resource node subclass @ 0x0014E170
+        runtime.replaceFunction(0x0014E170u, &dtor14e170);
+
+        // Virtual destructors for SearchList classes @ 0x001A2160 and 0x001ABB40
+        runtime.replaceFunction(0x001A2160u, &dtor1a2160);
+        runtime.replaceFunction(0x001ABB40u, &dtor1abb40);
+
+        // Destructors for PSXIcon family classes
+        runtime.replaceFunction(0x00342060u, &dtor342060);
+        runtime.replaceFunction(0x003424B0u, &dtor3424b0);
+        runtime.replaceFunction(0x00343D60u, &dtor343d60);
+        runtime.replaceFunction(0x003441E0u, &dtor3441e0);
+        runtime.replaceFunction(0x003426D0u, &dtor3426d0);
+        runtime.replaceFunction(0x003429C0u, &dtor3429c0);
+
+        // Structure initializer and forwarding thunk for viewport/scene init
+        runtime.replaceFunction(0x002F1820u, &init2F1820);
+        runtime.replaceFunction(0x00151970u, &thunk151970);
+
+        // Environment / Scene configuration parser @ 0x00202BD0
+        runtime.replaceFunction(0x00202BD0u, &configParser202bd0);
+
+        // PSXIcon destructor epilogue @ 0x003424F0
+        runtime.replaceFunction(0x003424F0u, &epilogue3424f0);
+
+        // Light configuration parser @ 0x00203310
+        runtime.replaceFunction(0x00203310u, &lightParser203310);
+
+        // Zone configuration parser @ 0x00201F60
+        runtime.replaceFunction(0x00201F60u, &zoneParser201f60);
+
+        // Virtual destructor for Node/Resource subclass @ 0x001B8DB0
+        runtime.replaceFunction(0x001B8DB0u, &dtor1b8db0);
+
+        // Virtual destructor for Node subclass @ 0x0012B160
+        runtime.replaceFunction(0x0012B160u, &dtor12b160);
+
+        // Screen element configuration parser @ 0x00204A30
+        runtime.replaceFunction(0x00204A30u, &parser204a30);
+
+        // Virtual destructor for PSXSurfaceShader subclass @ 0x001BABA0
+        runtime.replaceFunction(0x001BABA0u, &dtor1baba0);
+
+        // Base destructor for PSXSurfaceShader base @ 0x001C0570
+        runtime.replaceFunction(0x001C0570u, &dtorWrapper1c0570);
+
+        // Screen element configuration parser @ 0x00204990
+        runtime.replaceFunction(0x00204990u, &parser204990);
+
+        // Screen element configuration parser @ 0x00204870
+        runtime.replaceFunction(0x00204870u, &parser204870);
+
+        // Screen element constructor @ 0x002049F0
+        runtime.replaceFunction(0x002049F0u, &ctor2049f0);
+
+        // Screen element constructor @ 0x00204910
+        runtime.replaceFunction(0x00204910u, &ctor204910);
+
+        // Screen element constructor @ 0x002046D0
+        runtime.replaceFunction(0x002046D0u, &ctor2046d0);
+
+        // Screen element configuration parser @ 0x00204720
+        runtime.replaceFunction(0x00204720u, &parser204720);
+
+        // Screen element constructor @ 0x002047F0
+        runtime.replaceFunction(0x002047F0u, &ctor2047f0);
+
+        // SceneInfo configuration parser @ 0x00201D70
+        runtime.replaceFunction(0x00201D70u, &parser201d70);
+
+        // QuadzillaScene starting positions parser @ 0x0020C570
+        runtime.replaceFunction(0x0020C570u, &quadzillaSceneParser20c570);
+
+        // Scene member destructor @ 0x00206DB0
+        runtime.replaceFunction(0x00206DB0u, &dtorWrapper206db0);
+
+        // Scene member array destructor @ 0x00207930
+        runtime.replaceFunction(0x00207930u, &dtorWrapper207930);
+
+        // Scene subclass destructor @ 0x0020C6C0
+        runtime.replaceFunction(0x0020C6C0u, &dtor20c6c0);
+
+        // PSXSurfaceGeometry base destructor @ 0x001C0880
+        runtime.replaceFunction(0x001C0880u, &dtorWrapper1c0880);
+
+        // PSXRenderTarget base destructor @ 0x001585A0
+        runtime.replaceFunction(0x001585A0u, &dtorWrapper1585a0);
+
+        // PSXRenderTarget virtual destructor @ 0x001587A0
+        runtime.replaceFunction(0x001587A0u, &dtor1587a0);
+
+        // WeatherInfo configuration parser @ 0x00208CC0
+        runtime.replaceFunction(0x00208CC0u, &weatherParser208cc0);
+
+        // WeatherInfo virtual destructor @ 0x00209040
+        runtime.replaceFunction(0x00209040u, &dtor209040);
+
+        // PortalInfo configuration parser @ 0x00202670
+        runtime.replaceFunction(0x00202670u, &portalParser202670);
+
+        // TerrainZoneInfo constructor @ 0x00202770
+        runtime.replaceFunction(0x00202770u, &ctor202770);
+
+        // TerrainZoneInfo configuration parser @ 0x002027B0
+        runtime.replaceFunction(0x002027B0u, &parser2027b0);
+
+        // Utility @ 0x0034A340
+        runtime.replaceFunction(0x0034A340u, &util34a340);
+
+        // VisibilityQuadTreeNode constructor @ 0x00162800
+        runtime.replaceFunction(0x00162800u, &ctor162800);
+
+        // VisibilityQuadTreeLeaf constructor @ 0x0016DE70
+        runtime.replaceFunction(0x0016DE70u, &ctor16de70);
+
+        // VisibilityQuadTreeLeaf factory @ 0x0016DE30
+        runtime.replaceFunction(0x0016DE30u, &factory16de30);
+
+        // Secondary function entry point @ 0x001AC030
+        runtime.replaceFunction(0x001AC030u, &sub_001ABAE0_0x1abae0);
+
+        // Secondary function entry point @ 0x001D47E0
+        runtime.replaceFunction(0x001D47E0u, &sub_001D4790_0x1d4790);
+
+        // Secondary function entry point @ 0x001B9EC0
+        runtime.replaceFunction(0x001B9EC0u, &sub_001B9E80_0x1b9e80);
+
+        // Secondary function entry point @ 0x00177A60 and fused sub-functions
+        runtime.replaceFunction(0x00177180u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177190u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x001771E0u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177A60u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177AC0u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177AD0u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177AE0u, &sub_00177160_0x177160);
+        runtime.replaceFunction(0x00177AF0u, &sub_00177160_0x177160);
+
+        // Secondary function entry point @ 0x002D4F20
+        runtime.replaceFunction(0x002D4F20u, &sub_002D4EE0_0x2d4ee0);
+
+        // UI & TitleScreen secondary entry points for virtual dispatch
+        runtime.replaceFunction(0x001D3AE0u, &sub_001D3A40_0x1d3a40);
+        runtime.replaceFunction(0x001D3F50u, &sub_001D3F30_0x1d3f30);
+        runtime.replaceFunction(0x001D4140u, &sub_001D4130_0x1d4130);
+        runtime.replaceFunction(0x001D4200u, &sub_001D41C0_0x1d41c0);
+        runtime.replaceFunction(0x001D4260u, &sub_001D41C0_0x1d41c0);
+        runtime.replaceFunction(0x001D44B0u, &sub_001D4400_0x1d4400);
+        runtime.replaceFunction(0x001D49D0u, &sub_001D4890_0x1d4890);
+        runtime.replaceFunction(0x001D4B20u, &sub_001D4890_0x1d4890);
+        runtime.replaceFunction(0x001D4C30u, &sub_001D4890_0x1d4890);
+        runtime.replaceFunction(0x001D4CC0u, &sub_001D4890_0x1d4890);
+
+        // Subclass virtual methods in sub_0014EBB0
+        runtime.replaceFunction(0x0014EBD0u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014ED40u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014EF60u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014EF70u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014EF80u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014EFB0u, &sub_0014EBB0_0x14ebb0);
+        runtime.replaceFunction(0x0014EFE0u, &sub_0014EBB0_0x14ebb0);
+
+        // Subclass virtual methods in sub_0022FB70 and sub_0022FDA0
+        runtime.replaceFunction(0x0022FBB0u, &sub_0022FB70_0x22fb70);
+        runtime.replaceFunction(0x0022FF00u, &sub_0022FDA0_0x22fda0);
+
+        // PSXIcon methods in sub_00342750 and sub_00342AD0
+        runtime.replaceFunction(0x003427E0u, &sub_00342750_0x342750);
+        runtime.replaceFunction(0x00342B10u, &sub_00342AD0_0x342ad0);
+
+        // Animated_Icon methods in sub_002AE560
+        runtime.replaceFunction(0x002AE5A0u, &sub_002AE560_0x2ae560);
+        runtime.replaceFunction(0x002AE630u, &sub_002AE560_0x2ae560);
+        runtime.replaceFunction(0x002AE660u, &sub_002AE560_0x2ae560);
+        runtime.replaceFunction(0x002AE670u, &sub_002AE560_0x2ae560);
+        runtime.replaceFunction(0x002AE750u, &sub_002AE560_0x2ae560);
+        runtime.replaceFunction(0x002AE830u, &sub_002AE560_0x2ae560);
+
+        // UI Slider methods in sub_002AE840
+        runtime.replaceFunction(0x002AE8F0u, &sub_002AE840_0x2ae840);
+        runtime.replaceFunction(0x002AEBF0u, &sub_002AE840_0x2ae840);
+        runtime.replaceFunction(0x002AEC10u, &sub_002AE840_0x2ae840);
+        runtime.replaceFunction(0x002AEC20u, &sub_002AE840_0x2ae840);
+
+        // UI Node Draw / Accessors in sub_00239940
+        runtime.replaceFunction(0x00239950u, &sub_00239940_0x239940);
+        runtime.replaceFunction(0x00239980u, &sub_00239940_0x239940);
+        runtime.replaceFunction(0x002399B0u, &sub_00239940_0x239940);
+
+        // UI Node Update in sub_002399F0
+        runtime.replaceFunction(0x00239A00u, &sub_002399F0_0x2399f0);
+        runtime.replaceFunction(0x00239A10u, &sub_002399F0_0x2399f0);
+
+        // Game/Renderer virtual dispatch methods in sub_00104290 and sub_00153680
+        runtime.replaceFunction(0x00104680u, &sub_00104290_0x104290);
+        runtime.replaceFunction(0x00153840u, &sub_00153680_0x153680);
+        runtime.replaceFunction(0x00153850u, &sub_00153680_0x153680);
+        runtime.replaceFunction(0x00153860u, &sub_00153680_0x153680);
+        runtime.replaceFunction(0x00153870u, &sub_00153680_0x153680);
+        runtime.replaceFunction(0x001538C0u, &sub_00153680_0x153680);
+
+        registerFadeStepFix(runtime);
+        registerFeTrace(runtime);
+        registerHeapTrace(runtime);
+        registerVif1TextureIbit(runtime);
+        registerPadHle(runtime);
     }
 }
 

@@ -1883,6 +1883,113 @@ namespace ps2recomp
             }
         }
 
+        // Virtual methods are only referenced from vtables, so the analyzer can merge them into the
+        // preceding function. Treat runs of data words that point at decoded instructions as method
+        // tables; a run whose targets all share one owner looks like a jump table and is left alone.
+        // Section-less ELFs expose one RWX load segment, so words inside function bodies are skipped.
+        std::vector<const Function *> owners;
+        for (const auto &function : m_functions)
+        {
+            if (function.isRecompiled && !function.isStub && !function.isSkipped &&
+                !isEntryFunctionName(function.name) && m_decodedFunctions.contains(function.start))
+            {
+                owners.push_back(&function);
+            }
+        }
+        std::sort(owners.begin(), owners.end(),
+                  [](const Function *a, const Function *b)
+                  { return a->start < b->start; });
+
+        auto ownerContaining = [&](uint32_t address) -> const Function *
+        {
+            auto it = std::upper_bound(owners.begin(), owners.end(), address,
+                                       [](uint32_t value, const Function *f)
+                                       { return value < f->start; });
+            for (int steps = 0; it != owners.begin() && steps < 8; ++steps)
+            {
+                --it;
+                if (address < (*it)->end)
+                {
+                    return *it;
+                }
+            }
+            return nullptr;
+        };
+
+        auto ownerDecoding = [&](uint32_t address) -> const Function *
+        {
+            const Function *owner = ownerContaining(address);
+            if (owner == nullptr)
+            {
+                return nullptr;
+            }
+            const auto &decoded = m_decodedFunctions.at(owner->start);
+            auto it = std::lower_bound(decoded.begin(), decoded.end(), address,
+                                       [](const Instruction &inst, uint32_t value)
+                                       { return inst.address < value; });
+            return (it != decoded.end() && it->address == address) ? owner : nullptr;
+        };
+
+        size_t dataPointerTargets = 0u;
+        for (const auto &section : m_sections)
+        {
+            if (section.isBSS || section.data == nullptr || section.size < 8u)
+            {
+                continue;
+            }
+
+            std::vector<std::pair<uint32_t, const Function *>> run;
+            auto flushRun = [&]()
+            {
+                if (run.size() >= 2u)
+                {
+                    const bool singleOwner = std::all_of(run.begin(), run.end(),
+                                                         [&](const auto &entry)
+                                                         { return entry.second == run.front().second; });
+                    if (!singleOwner)
+                    {
+                        for (const auto &[target, owner] : run)
+                        {
+                            if (owner->start == target)
+                            {
+                                continue;
+                            }
+                            m_resumeEntryTargetsByOwner[owner->start].push_back(target);
+                            ++dataPointerTargets;
+                        }
+                    }
+                }
+                run.clear();
+            };
+
+            const uint32_t wordCount = section.size / 4u;
+            for (uint32_t i = 0; i < wordCount; ++i)
+            {
+                if (ownerContaining(section.address + i * 4u) != nullptr)
+                {
+                    flushRun();
+                    continue;
+                }
+                uint32_t word = 0u;
+                std::memcpy(&word, section.data + i * 4u, sizeof(word));
+                const Function *owner = ((word & 3u) == 0u) ? ownerDecoding(word) : nullptr;
+                if (owner == nullptr)
+                {
+                    flushRun();
+                    continue;
+                }
+                run.emplace_back(word, owner);
+            }
+            flushRun();
+        }
+
+        if (dataPointerTargets > 0u)
+        {
+            std::ostringstream msg;
+            msg << "collected " << dataPointerTargets << " method-table entry point(s) from data sections";
+            m_reporter.progress(msg.str());
+        }
+
         size_t totalTargets = 0u;
         for (auto it = m_resumeEntryTargetsByOwner.begin(); it != m_resumeEntryTargetsByOwner.end();)
         {

@@ -251,7 +251,12 @@ namespace ps2_syscalls
             DisableCache(rdram, ctx, runtime);
             return true;
         case 0x64:
+        case static_cast<uint32_t>(-0x64):
             FlushCache(rdram, ctx, runtime);
+            return true;
+        case 0x68:
+        case static_cast<uint32_t>(-0x68):
+            iFlushCache(rdram, ctx, runtime);
             return true;
         case 0x6E:
             SetOsdConfigParam2(rdram, ctx, runtime);
