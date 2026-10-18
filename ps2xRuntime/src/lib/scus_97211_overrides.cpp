@@ -29,8 +29,56 @@ extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode); // ps2_vif1_interpreter.cpp
 extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
+void atv2ArmWriteWatch(uint8_t *rdram, uint32_t guestAddr, uint32_t len);
+
 namespace
 {
+    // A scratch-context call cannot be resumed after a scheduler checkpoint: the callee
+    // would be abandoned mid-way (e.g. with the pool allocator's free tree half-updated).
+    struct HoldEeTimeslices
+    {
+        // Counted, not save/restore: holds from different guest threads can interleave.
+        HoldEeTimeslices() { ++g_ps2HoldEeTimeslices; }
+        ~HoldEeTimeslices() { --g_ps2HoldEeTimeslices; }
+    };
+
+    // Guest call from inside an override. If the scheduler can resume at returnPc, behave like
+    // dispatchGuestBranch (false = thread suspended). Overrides of merged functions have no
+    // resume entry at their return addresses, so a suspension there would strand the thread:
+    // run the callee to completion instead.
+    bool callGuestFromOverride(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t targetPc,
+                               uint32_t sourcePc, uint32_t returnPc, PS2Runtime::GuestBranchKind kind,
+                               const char *debugName)
+    {
+        if (runtime->hasFunction(returnPc) || !runtime->hasFunction(targetPc))
+            return runtime->dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, returnPc, kind, debugName);
+
+        HoldEeTimeslices hold;
+        ctx->pc = targetPc;
+        runtime->lookupFunction(targetPc)(rdram, ctx, runtime);
+        if (ctx->pc == targetPc)
+            ctx->pc = returnPc;
+        static int s_continued = 0;
+        if (ctx->pc != returnPc && s_continued < 40)
+        {
+            ++s_continued;
+            std::cerr << std::hex << "[ATV2:OVRCALL] continue target=0x" << targetPc << " ret=0x" << returnPc
+                      << " pc=0x" << ctx->pc << " sp=0x" << getRegU32(ctx, 29) << std::dec << std::endl;
+        }
+        for (uint32_t guard = 0; ctx->pc != returnPc; ++guard)
+        {
+            if (ctx->pc == 0u || guard >= 1000000u || runtime->isStopRequested() ||
+                !runtime->hasFunction(ctx->pc))
+            {
+                std::cerr << "[SCUS_972.11] override call 0x" << std::hex << targetPc << " from 0x" << sourcePc
+                          << " stopped at pc=0x" << ctx->pc << std::dec << std::endl;
+                return false;
+            }
+            runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+        }
+        return true;
+    }
+
     // Screen object configuration parser (0x00204390..0x002043B4 prologue).
     // Rejoin the generated body at 0x002043B8.
     void screenConfig204390(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -49,7 +97,7 @@ namespace
         SET_GPR_U32(ctx, 5, 0x00429E80u);
         SET_GPR_U32(ctx, 31, 0x002043B8u);
         ctx->pc = 0x00141810u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00141810u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00141810u,
                 0x002043B0u, 0x002043B8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002043B8u;
@@ -76,7 +124,7 @@ namespace
         SET_GPR_U64(ctx, 18, GPR_U64(ctx, 6));
         SET_GPR_U32(ctx, 31, 0x002AD6E4u);
         ctx->pc = 0x00234FB0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234FB0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00234FB0u,
                 0x002AD6DCu, 0x002AD6E4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002AD6E4u;
@@ -96,7 +144,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
         SET_GPR_U32(ctx, 31, 0x002AE614u);
         ctx->pc = 0x00239420u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00239420u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00239420u,
                 0x002AE60Cu, 0x002AE614u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002AE614u;
@@ -116,7 +164,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
         SET_GPR_U32(ctx, 31, 0x002AE384u);
         ctx->pc = 0x00235170u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00235170u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00235170u,
                 0x002AE37Cu, 0x002AE384u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002AE384u;
@@ -136,7 +184,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
         SET_GPR_U32(ctx, 31, 0x002AE2A4u);
         ctx->pc = 0x002350D0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002350D0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x002350D0u,
                 0x002AE29Cu, 0x002AE2A4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002AE2A4u;
@@ -172,7 +220,7 @@ namespace
         const uint32_t ret = site + 8u;
         SET_GPR_U32(ctx, 31, ret);
         ctx->pc = 0x002B4BD0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B4BD0u, site, ret,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x002B4BD0u, site, ret,
                 PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = ret;
@@ -291,7 +339,7 @@ namespace
         SET_GPR_S32(ctx, 4, static_cast<int32_t>(READ32(getRegU32(ctx, 16) + 0x189Cu)));
         SET_GPR_U32(ctx, 31, 0x00155AECu);
         ctx->pc = 0x001A8CC0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001A8CC0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x001A8CC0u,
                 0x00155AE4u, 0x00155AECu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x00155AECu;
@@ -327,7 +375,7 @@ namespace
         SET_GPR_U32(ctx, 6, 0x816u);
         SET_GPR_U32(ctx, 31, 0x002D58C8u);
         ctx->pc = 0x00103E30u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E30u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E30u,
                 0x002D58C0u, 0x002D58C8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002D58C8u;
@@ -354,7 +402,7 @@ namespace
         SET_GPR_U64(ctx, 2, 0u);
         SET_GPR_U32(ctx, 31, 0x002343CCu);
         ctx->pc = 0x00105FA0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105FA0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00105FA0u,
                 0x002343C4u, 0x002343CCu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002343CCu;
@@ -419,7 +467,7 @@ namespace
         SET_GPR_U64(ctx, 18, GPR_U64(ctx, 6));
         SET_GPR_U32(ctx, 31, 0x002364E4u);
         ctx->pc = 0x00234FB0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234FB0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00234FB0u,
                 0x002364DCu, 0x002364E4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002364E4u;
@@ -444,7 +492,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
         SET_GPR_U32(ctx, 31, kRejoin);
         ctx->pc = 0x001C7A40u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C7A40u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x001C7A40u,
                 kJal, kRejoin, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = kRejoin;
@@ -467,7 +515,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 6));
         SET_GPR_U32(ctx, 31, 0x002AE96Cu);
         ctx->pc = 0x00239420u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00239420u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00239420u,
                 0x002AE964u, 0x002AE96Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x002AE96Cu;
@@ -607,7 +655,7 @@ namespace
         {
             SET_GPR_U32(ctx, 31, 0x001AE89Cu);
             ctx->pc = 0x001AE4C0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001AE4C0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001AE4C0u,
                     0x001AE894u, 0x001AE89Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
             ctx->pc = 0x001AE89Cu;
@@ -647,7 +695,7 @@ namespace
         SET_GPR_U64(ctx, 16, GPR_U64(ctx, 6));
         SET_GPR_U32(ctx, 31, 0x003425B0u);
         ctx->pc = 0x003423F0u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x003423F0u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x003423F0u,
                 0x003425A8u, 0x003425B0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x003425B0u;
@@ -664,7 +712,7 @@ namespace
         std::memcpy(getMemPtr(rdram, sp), &ra, sizeof(ra));
         SET_GPR_U32(ctx, 31, 0x001BD500u);
         ctx->pc = 0x001C0930u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C0930u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x001C0930u,
                 0x001BD4F8u, 0x001BD500u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x001BD500u;
@@ -695,7 +743,7 @@ namespace
         SET_GPR_U32(ctx, 6, 0x524u);
         SET_GPR_U32(ctx, 31, 0x0014F65Cu);
         ctx->pc = 0x00103C20u;
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103C20u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103C20u,
                 0x0014F654u, 0x0014F65Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
         ctx->pc = 0x0014F65Cu;
@@ -992,17 +1040,292 @@ namespace
         ctx->pc = getRegU32(ctx, 31);
     }
 
+    // Element ctor @ 0x1C5430 (0x34-byte mesh-part entry, JALR target of the array ctor at
+    // 0x34D200): zeroes +0x00..+0x33 and sets +0x10 = -1. Merged into sub_001C5060 without a
+    // table slot, so the array ctor skipped it and left garbage vertex-list counts.
+    void ctor1c5430(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t objAddr = getRegU32(ctx, 4);
+        for (uint32_t off = 0; off < 0x34u; off += 4u)
+            WRITE32(objAddr + off, 0u);
+        WRITE32(objAddr + 0x10u, 0xFFFFFFFFu);
+        SET_GPR_S32(ctx, 3, -1);
+        SET_GPR_U32(ctx, 2, objAddr);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // Element ctor @ 0x1C61E0 (20-byte vertex-list entry built by the array ctor in 0x1C5B50):
+    // zeroes +0x00..+0x13. Merged into sub_001C5B50 without a table slot; the count at +0 is
+    // incremented afterwards, so skipping it left runaway counts that stomped low RAM.
+    void ctor1c61e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t objAddr = getRegU32(ctx, 4);
+        for (uint32_t off = 0; off < 0x14u; off += 4u)
+            WRITE32(objAddr + off, 0u);
+        SET_GPR_U32(ctx, 2, objAddr);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // Array-factory (0x34D288) element ctors merged into neighbouring functions without table slots.
+    void ctor1af900(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t objAddr = getRegU32(ctx, 4);
+        for (uint32_t off = 0; off < 0x0Cu; off += 4u)
+            WRITE32(objAddr + off, 0u);
+        SET_GPR_U32(ctx, 2, objAddr);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void ctor11a3b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t objAddr = getRegU32(ctx, 4);
+        for (uint32_t off = 0x0Cu; off <= 0x20u; off += 4u)
+            WRITE32(objAddr + off, 0u);
+        SET_GPR_U32(ctx, 2, objAddr);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void ctorReturnThis(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        SET_GPR_U32(ctx, 2, getRegU32(ctx, 4));
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // Element ctor @ 0x321BD0 (JALR target of the array ctor at 0x34D138): calls 0x325580(this),
+    // returns this. Merged into sub_00320DB0; frame matches the original.
+    void ctor321bd0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x10u, GPR_U64(ctx, 31));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 4));
+
+        SET_GPR_U32(ctx, 31, 0x00321BE4u);
+        ctx->pc = 0x00325580u;
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00325580u, 0x00321BDCu, 0x00321BE4u,
+                                   PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+
+        SET_GPR_U32(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x10u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x20u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual method @ 0x206690 (JALR from 0x206B7C): calls 0x2064F0, returns 1.
+    // Merged into sub_00206610; frame matches the original.
+    void method206690(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x10u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp, GPR_U64(ctx, 31));
+
+        SET_GPR_U32(ctx, 31, 0x002066A0u);
+        ctx->pc = 0x002064F0u;
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x002064F0u, 0x00206698u, 0x002066A0u,
+                                   PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+
+        const uint64_t retRa = READ64(sp);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_S32(ctx, 2, 1);
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x10u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
+    // Virtual method @ 0x2B4710 (JALR from 0x1BEBC4), merged into sub_002B4680. Leaf.
+    void method2b4710(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t self = getRegU32(ctx, 4);
+        const uint32_t arg = getRegU32(ctx, 5);
+        const uint32_t mode = READ32(self + 0x44u);
+        SET_GPR_U32(ctx, 6, mode);
+        uint32_t result = 1u;
+        if (mode == 2u)
+        {
+            WRITE32(READ32(arg + 0x0Cu) + 0x0Cu, 0u);
+            const uint32_t rec = READ32(arg + 0x0Cu);
+            WRITE8(rec + 4u, static_cast<uint8_t>(READ8(rec + 4u) & 0xF7u));
+            WRITE32(READ32(arg + 0x0Cu) + 0x10u, 0xFFFFFFFFu);
+            WRITE32(self + 0x44u, 0u);
+        }
+        else if (mode == 1u)
+        {
+            const uint32_t value = READ32(READ32(0x00404818u) + 0x234u);
+            WRITE32(READ32(arg + 0x0Cu) + 0x10u, value);
+            result = 0u;
+        }
+        SET_GPR_U32(ctx, 2, result);
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    // Merged functions whose first JAL return address has a re-entry case in the generated host
+    // function: run the prologue here, make the first call, then resume the generated body there.
+    void resumeMergedAfterCall(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t callee,
+                               uint32_t callSite)
+    {
+        const uint32_t returnPc = callSite + 8u;
+        SET_GPR_U32(ctx, 31, returnPc);
+        ctx->pc = callee;
+        if (!callGuestFromOverride(runtime, rdram, ctx, callee, callSite, returnPc,
+                                   PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+        ctx->pc = returnPc;
+        runtime->lookupFunction(returnPc)(rdram, ctx, runtime);
+    }
+
+    // Property-load virtual @ 0x23BFC0 (JALR from 0x23CD94), merged into sub_0023BF80.
+    void loadProps23bfc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x150u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x30u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x20u, GPR_VEC(ctx, 18));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        SET_GPR_U64(ctx, 18, GPR_U64(ctx, 4));
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 5));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+        resumeMergedAfterCall(runtime, rdram, ctx, 0x0023BCC0u, 0x0023BFD8u);
+    }
+
+    // Property-load virtual @ 0x240EB0 (JALR from 0x2410FC), merged into sub_00240DD0.
+    void loadProps240eb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        SET_GPR_U64(ctx, 6, 0u);
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 4));
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 5));
+        SET_GPR_U64(ctx, 7, GPR_U64(ctx, 17));
+        SET_GPR_U64(ctx, 4, GPR_U64(ctx, 16));
+        SET_GPR_U32(ctx, 5, 0x0042EB60u);
+        resumeMergedAfterCall(runtime, rdram, ctx, 0x001421B0u, 0x00240ED8u);
+    }
+
+    // Property-load virtual @ 0x1B8150 (JALR from 0x1BF680), merged into sub_001B7FC0.
+    void loadProps1b8150(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x2A0u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x90u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x80u, GPR_VEC(ctx, 19));
+        WRITE128(sp + 0x70u, GPR_VEC(ctx, 18));
+        SET_GPR_U64(ctx, 19, GPR_U64(ctx, 4));
+        WRITE128(sp + 0x60u, GPR_VEC(ctx, 17));
+        SET_GPR_U64(ctx, 18, GPR_U64(ctx, 5));
+        WRITE128(sp + 0x50u, GPR_VEC(ctx, 16));
+        resumeMergedAfterCall(runtime, rdram, ctx, 0x001BF160u, 0x001B816Cu);
+    }
+
+    // Property-load virtual @ 0x1B8790 (JALR from 0x1BF854), merged into sub_001B86D0.
+    void loadProps1b8790(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0xE0u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x30u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x20u, GPR_VEC(ctx, 18));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        SET_GPR_U64(ctx, 18, GPR_U64(ctx, 4));
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 5));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+        resumeMergedAfterCall(runtime, rdram, ctx, 0x001BF1E0u, 0x001B87A8u);
+    }
+
+    // Array-factory element ctor @ 0x2CA1F0, merged into sub_002C9FF0.
+    void ctor2ca1f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x20u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp, GPR_U64(ctx, 31));
+        WRITE32(sp + 0x1Cu, GPR_U32(ctx, 4));
+        resumeMergedAfterCall(runtime, rdram, ctx, 0x002184B0u, 0x002CA1FCu);
+    }
+
+    // Element dtor @ 0x1C5170 (pair of ctor1c5430): frees +0x14..+0x2C, frees the +0x30 block
+    // (header at -0x10), deletes self when (int16)a1 > 0. Same frame as the original so a
+    // suspension inside a free resumes correctly in sub_001C5060.
+    void dtor1c5170(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t sp = GPR_U32(ctx, 29) - 0x30u;
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp));
+        WRITE64(sp + 0x20u, GPR_U64(ctx, 31));
+        WRITE128(sp + 0x10u, GPR_VEC(ctx, 17));
+        WRITE128(sp, GPR_VEC(ctx, 16));
+
+        const uint32_t thisPtr = GPR_U32(ctx, 4);
+        SET_GPR_U64(ctx, 17, GPR_U64(ctx, 4));
+        SET_GPR_U64(ctx, 16, GPR_U64(ctx, 5));
+        const int16_t delFlag = static_cast<int16_t>(GPR_U32(ctx, 5));
+
+        if (thisPtr != 0u)
+        {
+            static constexpr uint32_t kFreeSites[7] = {0x1C5198u, 0x1C51ACu, 0x1C51C0u, 0x1C51D4u,
+                                                       0x1C51E8u, 0x1C51FCu, 0x1C5210u};
+            for (uint32_t i = 0; i < 7u; ++i)
+            {
+                const uint32_t p = READ32(thisPtr + 0x14u + i * 4u);
+                if (p == 0u)
+                    continue;
+                SET_GPR_U64(ctx, 4, p);
+                SET_GPR_U32(ctx, 31, kFreeSites[i] + 8u);
+                ctx->pc = 0x00103F20u;
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u, kFreeSites[i], kFreeSites[i] + 8u,
+                                           PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            const uint32_t p30 = READ32(thisPtr + 0x30u);
+            if (p30 != 0u)
+            {
+                SET_GPR_U32(ctx, 4, p30 - 0x10u);
+                SET_GPR_U32(ctx, 31, 0x001C5234u);
+                ctx->pc = 0x00103F20u;
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u, 0x001C522Cu, 0x001C5234u,
+                                           PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+
+            if (delFlag > 0)
+            {
+                SET_GPR_U64(ctx, 4, thisPtr);
+                SET_GPR_U32(ctx, 31, 0x001C524Cu);
+                ctx->pc = 0x00103E70u;
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u, 0x001C5244u, 0x001C524Cu,
+                                           PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                    return;
+            }
+        }
+
+        SET_GPR_U64(ctx, 2, thisPtr);
+        const uint64_t retRa = READ64(sp + 0x20u);
+        SET_GPR_U64(ctx, 31, retRa);
+        SET_GPR_VEC(ctx, 17, READ128(sp + 0x10u));
+        SET_GPR_VEC(ctx, 16, READ128(sp));
+        SET_GPR_S32(ctx, 29, static_cast<int32_t>(sp + 0x30u));
+        ctx->pc = static_cast<uint32_t>(retRa);
+    }
+
     using RecompiledFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
     using RecompiledFunction = PS2Runtime::RecompiledFunction;
-
-    // A scratch-context call cannot be resumed after a scheduler checkpoint: the callee
-    // would be abandoned mid-way (e.g. with the pool allocator's free tree half-updated).
-    struct HoldEeTimeslices
-    {
-        uint32_t saved = g_ps2HoldEeTimeslices;
-        HoldEeTimeslices() { g_ps2HoldEeTimeslices = 1u; }
-        ~HoldEeTimeslices() { g_ps2HoldEeTimeslices = saved; }
-    };
 
     // Generated code can still return early with pc at an inner return address (self-recursive
     // JALs are lowered to gotos, so the innermost JR $ra leaves the whole host function).
@@ -2194,7 +2517,7 @@ namespace
         SET_GPR_U32(ctx, 31, 0x0014E244u);    // ra = 0x14E244
         ctx->pc = 0x0036F8B8u;
 
-        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x0036F8B8u,
+        if (!callGuestFromOverride(runtime, rdram, ctx, 0x0036F8B8u,
                 0x0014E23Cu, 0x0014E244u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
             return;
 
@@ -2288,7 +2611,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x00152D80u);
             ctx->pc = 0x0011B2D0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x0011B2D0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x0011B2D0u,
                     0x00152D78u, 0x00152D80u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2297,7 +2620,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x00152D98u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x00152D90u, 0x00152D98u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2333,7 +2656,7 @@ namespace
             SET_GPR_U64(ctx, 4, thisPtr);
             SET_GPR_U32(ctx, 31, 0x0010809Cu);
             ctx->pc = 0x001082C0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001082C0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001082C0u,
                     0x00108094u, 0x0010809Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2341,7 +2664,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x001080A8u);
             ctx->pc = 0x00107410u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00107410u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x00107410u,
                     0x001080A0u, 0x001080A8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2350,7 +2673,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001080C0u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x001080B8u, 0x001080C0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2487,7 +2810,7 @@ namespace
                 SET_GPR_U64(ctx, 5, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x00137F30u);
                 ctx->pc = 0x00139CE0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00139CE0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00139CE0u,
                         0x00137F28u, 0x00137F30u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2499,7 +2822,7 @@ namespace
                 SET_GPR_U64(ctx, 5, 1u);
                 SET_GPR_U32(ctx, 31, 0x00137F44u);
                 ctx->pc = 0x001A4F50u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001A4F50u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x001A4F50u,
                         0x00137F3Cu, 0x00137F44u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2510,7 +2833,7 @@ namespace
                 SET_GPR_U64(ctx, 4, pD8);
                 SET_GPR_U32(ctx, 31, 0x00137F58u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x00137F50u, 0x00137F58u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2519,7 +2842,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x00137F64u);
             ctx->pc = 0x00105C10u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105C10u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x00105C10u,
                     0x00137F5Cu, 0x00137F64u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2528,7 +2851,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x00137F7Cu);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x00137F74u, 0x00137F7Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2568,7 +2891,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x001CE110u);
             ctx->pc = 0x001CDF20u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001CDF20u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001CDF20u,
                     0x001CE108u, 0x001CE110u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2577,7 +2900,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001CE128u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x001CE120u, 0x001CE128u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2617,7 +2940,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x001CE170u);
             ctx->pc = 0x001CDF20u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001CDF20u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001CDF20u,
                     0x001CE168u, 0x001CE170u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2626,7 +2949,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001CE188u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x001CE180u, 0x001CE188u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2675,7 +2998,7 @@ namespace
                     SET_GPR_U64(ctx, 4, ptrVal);
                     SET_GPR_U32(ctx, 31, 0x001CE36Cu);
                     ctx->pc = 0x00103F20u;
-                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                    if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u,
                             0x001CE364u, 0x001CE36Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                         return;
                 }
@@ -2685,7 +3008,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x001CE4F4u);
             ctx->pc = 0x00105C10u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00105C10u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x00105C10u,
                     0x001CE4ECu, 0x001CE4F4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2694,7 +3017,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001CE50Cu);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x001CE504u, 0x001CE50Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2748,14 +3071,14 @@ namespace
                         SET_GPR_U64(ctx, 5, item4);
                         SET_GPR_U32(ctx, 31, 0x001C2AD4u);
                         ctx->pc = 0x00151300u;
-                        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00151300u,
+                        if (!callGuestFromOverride(runtime, rdram, ctx, 0x00151300u,
                                 0x001C2ACCu, 0x001C2AD4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                             return;
                     }
                     SET_GPR_U64(ctx, 4, item);
                     SET_GPR_U32(ctx, 31, 0x001C2AE0u);
                     ctx->pc = 0x00103E70u;
-                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                    if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                             0x001C2AD8u, 0x001C2AE0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                         return;
                 }
@@ -2764,14 +3087,14 @@ namespace
             SET_GPR_U64(ctx, 4, thisPtr + 0x1E4u);
             SET_GPR_U32(ctx, 31, 0x001C2B00u);
             ctx->pc = 0x001C4C50u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C4C50u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001C4C50u,
                     0x001C2AF8u, 0x001C2B00u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
             SET_GPR_U64(ctx, 4, thisPtr + 0x1F8u);
             SET_GPR_U32(ctx, 31, 0x001C2B08u);
             ctx->pc = 0x001C4C50u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C4C50u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001C4C50u,
                     0x001C2B00u, 0x001C2B08u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2784,7 +3107,7 @@ namespace
                 SET_GPR_U64(ctx, 5, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001C2B2Cu);
                 ctx->pc = 0x00173FC0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00173FC0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00173FC0u,
                         0x001C2B20u, 0x001C2B2Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2795,7 +3118,7 @@ namespace
                 SET_GPR_U64(ctx, 4, p200);
                 SET_GPR_U32(ctx, 31, 0x001C2B40u);
                 ctx->pc = 0x00103F20u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u,
                         0x001C2B34u, 0x001C2B40u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2806,7 +3129,7 @@ namespace
                 SET_GPR_U64(ctx, 4, p1ec);
                 SET_GPR_U32(ctx, 31, 0x001C2B54u);
                 ctx->pc = 0x00103F20u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u,
                         0x001C2B48u, 0x001C2B54u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2815,7 +3138,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x001C2B5Cu);
             ctx->pc = 0x001C1110u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001C1110u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001C1110u,
                     0x001C2B54u, 0x001C2B5Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2824,7 +3147,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x001C2B74u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x001C2B6Cu, 0x001C2B74u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2869,7 +3192,7 @@ namespace
                 SET_GPR_U64(ctx, 5, 1u);
                 SET_GPR_U32(ctx, 31, 0x002AD674u);
                 ctx->pc = 0x002B48B0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B48B0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x002B48B0u,
                         0x002AD66Cu, 0x002AD674u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2881,7 +3204,7 @@ namespace
                 SET_GPR_U64(ctx, 5, 1u);
                 SET_GPR_U32(ctx, 31, 0x002AD680u);
                 ctx->pc = 0x002B48B0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002B48B0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x002B48B0u,
                         0x002AD678u, 0x002AD680u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2891,7 +3214,7 @@ namespace
             WRITE32(thisPtr + 0x78u, 0u);
             SET_GPR_U32(ctx, 31, 0x002AD690u);
             ctx->pc = 0x00234F50u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234F50u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x00234F50u,
                     0x002AD688u, 0x002AD690u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2900,7 +3223,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x002AD6A8u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x002AD6A0u, 0x002AD6A8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2940,7 +3263,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x002AE5D0u);
             ctx->pc = 0x002393A0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002393A0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x002393A0u,
                     0x002AE5C8u, 0x002AE5D0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2949,7 +3272,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x002AE5E8u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x002AE5E0u, 0x002AE5E8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -2989,7 +3312,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x002AE920u);
             ctx->pc = 0x002393A0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002393A0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x002393A0u,
                     0x002AE918u, 0x002AE920u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -2998,7 +3321,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x002AE938u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x002AE930u, 0x002AE938u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3042,7 +3365,7 @@ namespace
                 SET_GPR_U64(ctx, 6, 0x318u); // line 792
                 SET_GPR_U32(ctx, 31, 0x00236480u);
                 ctx->pc = 0x00103DF0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103DF0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103DF0u,
                         0x00236478u, 0x00236480u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3051,7 +3374,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x0023648Cu);
             ctx->pc = 0x00234F50u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00234F50u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x00234F50u,
                     0x00236484u, 0x0023648Cu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -3060,7 +3383,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x002364A4u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x0023649Cu, 0x002364A4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3110,7 +3433,7 @@ namespace
                     SET_GPR_U64(ctx, 7, 0u);
                     SET_GPR_U32(ctx, 31, 0x0014E1C8u);
                     ctx->pc = 0x002F3280u;
-                    if (!runtime->dispatchGuestBranch(rdram, ctx, 0x002F3280u,
+                    if (!callGuestFromOverride(runtime, rdram, ctx, 0x002F3280u,
                             0x0014E1C0u, 0x0014E1C8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                         return;
                 }
@@ -3120,7 +3443,7 @@ namespace
             SET_GPR_U64(ctx, 5, 0u);
             SET_GPR_U32(ctx, 31, 0x0014E1D4u);
             ctx->pc = 0x001072C0u;
-            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x001072C0u,
+            if (!callGuestFromOverride(runtime, rdram, ctx, 0x001072C0u,
                     0x0014E1CCu, 0x0014E1D4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                 return;
 
@@ -3129,7 +3452,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x0014E1ECu);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x0014E1E4u, 0x0014E1ECu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3262,7 +3585,7 @@ namespace
                 SET_GPR_U64(ctx, 6, 45u);
                 SET_GPR_U32(ctx, 31, 0x00342094u);
                 ctx->pc = 0x00103DF0u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103DF0u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103DF0u,
                         0x0034208Cu, 0x00342094u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3273,7 +3596,7 @@ namespace
                 SET_GPR_U64(ctx, 4, p18);
                 SET_GPR_U32(ctx, 31, 0x003420ACu);
                 ctx->pc = 0x00103F20u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103F20u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103F20u,
                         0x003420A0u, 0x003420ACu, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -3283,7 +3606,7 @@ namespace
                 SET_GPR_U64(ctx, 4, thisPtr);
                 SET_GPR_U32(ctx, 31, 0x003420C4u);
                 ctx->pc = 0x00103E70u;
-                if (!runtime->dispatchGuestBranch(rdram, ctx, 0x00103E70u,
+                if (!callGuestFromOverride(runtime, rdram, ctx, 0x00103E70u,
                         0x003420B8u, 0x003420C4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
                     return;
             }
@@ -5880,12 +6203,16 @@ namespace
         SET_GPR_U32(&tmp, 5, 0u);
         SET_GPR_U32(&tmp, 31, kTextureSendDonePc);
         tmp.pc = kSendCurrentTransfer;
-        const uint32_t savedHold = g_ps2HoldEeTimeslices;
-        g_ps2HoldEeTimeslices = 1u;
-        s_inHook = true;
-        g_sendCurrentTransfer(rdram, &tmp, g_ibitRuntime);
-        s_inHook = false;
-        g_ps2HoldEeTimeslices = savedHold;
+        {
+            HoldEeTimeslices hold;
+            struct InHookScope
+            {
+                bool &flag;
+                explicit InHookScope(bool &f) : flag(f) { flag = true; }
+                ~InHookScope() { flag = false; }
+            } inHook(s_inHook);
+            g_sendCurrentTransfer(rdram, &tmp, g_ibitRuntime);
+        }
 
         if (s_logs < 24u)
         {
@@ -6022,6 +6349,21 @@ namespace
                       << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
         }
         g_padEvent122930Orig(rdram, ctx, runtime);
+    }
+
+    PS2Runtime::RecompiledFunction g_pageSwitchOrig = nullptr;
+
+    void pageSwitchWatch2d39d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int s_calls = 0;
+        const uint32_t slot = getRegU32(ctx, 29) + 0x50u;
+        uint32_t saved = 0;
+        std::memcpy(&saved, getMemPtr(rdram, slot), 4);
+        std::cerr << std::hex << "[ATV2:PAGESW] #" << std::dec << ++s_calls << std::hex << " a1=0x" << getRegU32(ctx, 5)
+                  << " slot=0x" << slot << " savedRa=0x" << saved << std::dec << std::endl;
+        if (getRegU32(ctx, 31) == 0x002D38C4u)
+            atv2ArmWriteWatch(rdram, slot, 8u);
+        g_pageSwitchOrig(rdram, ctx, runtime);
     }
 
     void registerPadHle(PS2Runtime &runtime)
@@ -6219,6 +6561,21 @@ namespace
 
         // Element ctor @ 0x331690 (stride 0x18, called by __arrctor 0x34d0d0).
         runtime.replaceFunction(0x00331690u, &ctor331690);
+        runtime.replaceFunction(0x001C5430u, &ctor1c5430);
+        runtime.replaceFunction(0x001C5170u, &dtor1c5170);
+        runtime.replaceFunction(0x001C61E0u, &ctor1c61e0);
+        runtime.replaceFunction(0x001AF900u, &ctor1af900);
+        runtime.replaceFunction(0x0011A3B0u, &ctor11a3b0);
+        runtime.replaceFunction(0x0011A3A0u, &ctorReturnThis);
+        runtime.replaceFunction(0x00321BD0u, &ctor321bd0);
+        runtime.replaceFunction(0x00206690u, &method206690);
+        runtime.replaceFunction(0x002B4710u, &method2b4710);
+        runtime.replaceFunction(0x0023BFC0u, &loadProps23bfc0);
+        runtime.replaceFunction(0x00240EB0u, &loadProps240eb0);
+        runtime.replaceFunction(0x001B8150u, &loadProps1b8150);
+        runtime.replaceFunction(0x001B8790u, &loadProps1b8790);
+        runtime.replaceFunction(0x0032D320u, &ctorReturnThis);
+        runtime.replaceFunction(0x002CA1F0u, &ctor2ca1f0);
 
         // No-op accessor @ 0x153970 (returns 3rd arg).
         runtime.replaceFunction(0x00153970u, &noopRetA2_153970);

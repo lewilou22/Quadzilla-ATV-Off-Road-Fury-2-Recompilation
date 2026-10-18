@@ -51,6 +51,20 @@ uint32_t g_ps2IdleResumePc = 0;
 uint32_t g_ps2IdleResumeA0 = 0;
 uint32_t g_ps2HoldEeTimeslices = 0;
 
+// ps2_missing_interp.cpp: interprets guest code at addresses without a recompiled entry.
+bool ps2InterpCanHandle(uint32_t address);
+void ps2InterpretGuest(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx);
+
+static bool missingInterpEnabled()
+{
+    static const bool enabled = []()
+    {
+        const char *v = std::getenv("PS2_MISSING_INTERP");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
@@ -1132,6 +1146,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
     }
 
+    if (missingInterpEnabled() && ps2InterpCanHandle(address))
+    {
+        static RecompiledFunction interpFunction = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ps2InterpretGuest(runtime, rdram, ctx);
+        };
+        return interpFunction;
+    }
+
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
@@ -1307,6 +1330,35 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             std::cerr << oss.str() << std::endl;
         }
     }
+    else
+    {
+        static std::mutex s_missingTargetSeenMutex;
+        static uint32_t s_missingTargetSeen[64] = {};
+        static uint32_t s_missingTargetSeenCount = 0u;
+        std::lock_guard<std::mutex> lock(s_missingTargetSeenMutex);
+        bool seen = false;
+        for (uint32_t i = 0; i < s_missingTargetSeenCount; ++i)
+            seen = seen || s_missingTargetSeen[i] == targetPc;
+        if (!seen && s_missingTargetSeenCount < 64u)
+        {
+            s_missingTargetSeen[s_missingTargetSeenCount++] = targetPc;
+            std::cerr << "[guest-branch:missing-target+] kind=" << describeGuestBranchKind(kind)
+                      << " source=0x" << std::hex << sourcePc << " target=0x" << targetPc
+                      << " ra=0x" << ra << " a0=0x" << a0 << " sp=0x" << sp
+                      << " trace=" << formatDispatchHistory() << std::dec << std::endl;
+            if (!m_memory.isCodeAddress(targetPc) && rdram && sp >= 0x80u && sp < PS2_RAM_SIZE - 0x100u)
+            {
+                std::cerr << "[guest-branch:wild-stack] sp=0x" << std::hex << sp;
+                for (uint32_t off = 0; off < 0x180u; off += 4u)
+                {
+                    uint32_t w = 0u;
+                    std::memcpy(&w, rdram + sp - 0x80u + off, sizeof(w));
+                    std::cerr << ((off % 32u) == 0u ? "\n  " : " ") << (w == targetPc ? "*" : "") << w;
+                }
+                std::cerr << std::dec << std::endl;
+            }
+        }
+    }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
     {
@@ -1347,13 +1399,24 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!isCall)
     {
-        if (!hasFunction(targetPc))
+        if (!hasFunction(targetPc) && !(missingInterpEnabled() && ps2InterpCanHandle(targetPc)))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
         }
 
         ctx->pc = targetPc;
         return false;
+    }
+
+    if (!hasFunction(targetPc) && missingInterpEnabled() && ps2InterpCanHandle(targetPc))
+    {
+        ctx->pc = targetPc;
+        ps2InterpretGuest(this, rdram, ctx);
+        if (isStopRequested() || ctx->pc == 0u)
+        {
+            return false;
+        }
+        return ctx->pc == fallthroughPc;
     }
 
     if (!hasFunction(targetPc))

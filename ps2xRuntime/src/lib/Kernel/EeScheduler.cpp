@@ -20,6 +20,7 @@ extern uint32_t g_ps2Pc0ResumeTarget;
 extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
+bool ps2InterpCanHandle(uint32_t address);
 // Opt-in diagnostic: number of upcoming guest dispatches to log (0 = off).
 uint32_t g_ps2TraceDispatchRemaining = 0;
 uint32_t g_ps2TraceRange0Lo = 0, g_ps2TraceRange0Hi = 0, g_ps2TraceRange1Lo = 0, g_ps2TraceRange1Hi = 0;
@@ -296,7 +297,8 @@ void EeScheduler::run()
             os << "  eeCycle=" << m_eeCycle << "  vsyncTick=" << m_vsyncTick
                << "  threadCount=" << m_threads.size()
                << "  semCount=" << m_semaphores.size()
-               << "  evfCount=" << m_eventFlags.size() << "\n";
+               << "  evfCount=" << m_eventFlags.size()
+               << "  holdTimeslices=" << g_ps2HoldEeTimeslices << "\n";
             const char *statusNames[] = {"Running", "Ready", "Waiting", "WaitingSuspended", "Suspended", "Dormant"};
             const char *waitNames[] = {"None", "Sleep", "Semaphore", "EventFlag", "VSync", "External", "Mpeg"};
             for (const auto &[id, t] : m_threads)
@@ -510,7 +512,7 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_runtime.hasFunction(context.pc))
+        if (!m_runtime.hasFunction(context.pc) && !ps2InterpCanHandle(context.pc))
         {
             if (!running->invocations.empty())
             {
