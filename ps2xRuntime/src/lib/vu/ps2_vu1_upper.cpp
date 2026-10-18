@@ -2,6 +2,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -36,15 +37,15 @@ void VU1Interpreter::execUpper(uint32_t instr)
     float normalizedAcc[4];
     for (uint32_t component = 0; component < 4u; ++component)
     {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        normalizedVs[component] = vuNormalizeOperand(m_state.vf[fs][component]);
+        normalizedVt[component] = vuNormalizeOperand(m_state.vf[ft][component]);
+        normalizedAcc[component] = vuNormalizeOperand(m_state.acc[component]);
     }
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = vuNormalizeOperand(m_state.q);
+    const float i = vuNormalizeOperand(m_state.i);
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)
@@ -55,7 +56,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x02:
     case 0x03: // ADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + bc;
         applyFmacDest(vd, result, dest);
@@ -66,7 +67,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x06:
     case 0x07: // SUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - bc;
         applyFmacDest(vd, result, dest);
@@ -77,7 +78,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0A:
     case 0x0B: // MADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -88,7 +89,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0E:
     case 0x0F: // MSUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -99,7 +100,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = (vs[c] > bc) ? vs[c] : bc;
         applyDest(vd, result, dest);
@@ -110,7 +111,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = (vs[c] < bc) ? vs[c] : bc;
         applyDest(vd, result, dest);
@@ -121,7 +122,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1A:
     case 0x1B: // MULbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vuBroadcast(vt, op & 3);
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -249,7 +250,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x02:
         case 0x03: // ADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vuBroadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + bc;
             applyFmacDestAcc(result, dest);
@@ -260,7 +261,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x06:
         case 0x07: // SUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vuBroadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - bc;
             applyFmacDestAcc(result, dest);
@@ -271,7 +272,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0A:
         case 0x0B: // MADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vuBroadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * bc;
             applyFmacDestAcc(result, dest);
@@ -282,48 +283,45 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0E:
         case 0x0F: // MSUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vuBroadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * bc;
             applyFmacDestAcc(result, dest);
             return;
         }
         case 0x10: // ITOF0
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv);
-            }
-            applyDest(vtDest, result, dest);
-            return;
         case 0x11: // ITOF4
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 16.0f;
-            }
-            applyDest(vtDest, result, dest);
-            return;
         case 0x12: // ITOF12
-            for (int c = 0; c < 4; c++)
-            {
-                int32_t iv;
-                std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 4096.0f;
-            }
-            applyDest(vtDest, result, dest);
-            return;
         case 0x13: // ITOF15
+        {
+            const float scale = (specialOp == 0x10) ? 1.0f
+                : (specialOp == 0x11) ? 16.0f
+                : (specialOp == 0x12) ? 4096.0f
+                                      : 32768.0f;
+            uint32_t inHex[4] = {};
             for (int c = 0; c < 4; c++)
             {
                 int32_t iv;
                 std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 32768.0f;
+                std::memcpy(&inHex[c], &iv, 4);
+                result[c] = static_cast<float>(iv) / scale;
             }
             applyDest(vtDest, result, dest);
+            {
+                static uint32_t s_itofLogs = 0u;
+                if (s_itofLogs < 8u)
+                {
+                    std::fprintf(stderr,
+                                 "[vu1] ITOF%u pc=0x%x fs=%u ft=%u dest=0x%x in=%08x,%08x,%08x,%08x out=%g,%g,%g,%g\n",
+                                 (specialOp == 0x10) ? 0u : (specialOp == 0x11) ? 4u : (specialOp == 0x12) ? 12u : 15u,
+                                 m_state.pc, fs, ft, dest,
+                                 inHex[0], inHex[1], inHex[2], inHex[3],
+                                 result[0], result[1], result[2], result[3]);
+                    ++s_itofLogs;
+                }
+            }
             return;
+        }
         case 0x14: // FTOI0
             for (int c = 0; c < 4; c++)
             {
@@ -361,7 +359,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1A:
         case 0x1B: // MULAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vuBroadcast(vt, specialOp & 3);
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * bc;
             applyFmacDestAcc(result, dest);

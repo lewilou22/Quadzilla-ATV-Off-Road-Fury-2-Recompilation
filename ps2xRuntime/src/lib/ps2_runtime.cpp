@@ -50,10 +50,44 @@ uint32_t g_ps2Pc0ResumeTarget = 0;
 uint32_t g_ps2IdleResumePc = 0;
 uint32_t g_ps2IdleResumeA0 = 0;
 uint32_t g_ps2HoldEeTimeslices = 0;
+// Gates the VU1 race-only diagnostics (ATV_VU_FAST_VERIFY, ATV_TRACE_VU_GEOMETRY).
+bool g_raceLoadStarted = false;
+// VU1 bench (ATV_VU_BENCH) hook; the ATV1 host sampling profiler is not ported.
+void atvStartHostProfiler() {}
 
 // ps2_missing_interp.cpp: interprets guest code at addresses without a recompiled entry.
 bool ps2InterpCanHandle(uint32_t address);
 void ps2InterpretGuest(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx);
+
+// Temporary race diagnostic: VU1 run counts, guest cycles and host time per 2 s window.
+static void noteVu1Run(uint32_t startPc, uint64_t cyclesBefore, uint64_t cyclesAfter,
+                       std::chrono::steady_clock::time_point hostStart)
+{
+    static std::chrono::steady_clock::time_point s_windowStart = std::chrono::steady_clock::now();
+    static uint64_t s_runs = 0, s_cycles = 0, s_budgetHits = 0, s_hostNs = 0;
+    static uint32_t s_maxPc = 0;
+    static uint64_t s_maxCycles = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t used = cyclesAfter - cyclesBefore;
+    ++s_runs;
+    s_cycles += used;
+    s_budgetHits += used >= 65536u ? 1u : 0u;
+    s_hostNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - hostStart).count());
+    if (used > s_maxCycles)
+    {
+        s_maxCycles = used;
+        s_maxPc = startPc;
+    }
+    if (now - s_windowStart >= std::chrono::seconds(2))
+    {
+        std::cerr << "[VU1:STATS] runs=" << s_runs << " cycles=" << s_cycles << " budgetHits=" << s_budgetHits
+                  << " hostMs=" << (s_hostNs / 1000000u) << " maxCycles=" << s_maxCycles << " maxStart=0x"
+                  << std::hex << s_maxPc << std::dec << std::endl;
+        s_windowStart = now;
+        s_runs = s_cycles = s_budgetHits = s_hostNs = s_maxCycles = 0;
+        s_maxPc = 0;
+    }
+}
 
 static bool missingInterpEnabled()
 {
@@ -670,9 +704,12 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const auto vuHostStart = std::chrono::steady_clock::now();
+                                     const uint64_t vuCyclesBefore = m_vu1.state().cycles;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     noteVu1Run(startPC, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -688,9 +725,12 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const auto vuHostStart = std::chrono::steady_clock::now();
+                                     const uint64_t vuCyclesBefore = m_vu1.state().cycles;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     noteVu1Run(0xFFFFu, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |

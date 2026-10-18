@@ -5,6 +5,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -257,7 +258,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     {
         const uint8_t it = VIT(instr);
         if (it != 0)
-            m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0x0FFFu);
+            m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0xFFFFu);
         return;
     }
     case 0x20: // B (unconditional branch)
@@ -276,6 +277,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         uint32_t target = (m_state.pc + 8 + imm * 8) & pcMask;
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+        {
+            static uint32_t s_balLogs = 0u;
+            if (s_balLogs < 4u)
+            {
+                std::fprintf(stderr,
+                             "[vu1] BAL pc=0x%x vi%u target=0x%x imm=%d\n",
+                             m_state.pc, it, target, imm);
+                ++s_balLogs;
+            }
+        }
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -444,11 +455,23 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 uint32_t addr = ((uint32_t)(uint16_t)m_state.vi[viS]) * 16u;
                 addr &= (dataSize - 1);
+                uint32_t word0 = 0u;
                 if (addr + 16 <= dataSize)
                 {
                     float tmp[4];
                     std::memcpy(tmp, vuData + addr, 16);
+                    std::memcpy(&word0, vuData + addr, 4);
                     applyDest(m_state.vf[vfT], tmp, dest);
+                }
+                {
+                    static uint32_t s_lqiLogs = 0u;
+                    if (s_lqiLogs < 8u)
+                    {
+                        std::fprintf(stderr,
+                                     "[vu1] LQI pc=0x%x vt=%u vis=%u dest=0x%x q=0x%x w0=%08x\n",
+                                     m_state.pc, vfT, viS, dest, addr / 16u, word0);
+                        ++s_lqiLogs;
+                    }
                 }
                 if (viS != 0)
                     m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
@@ -500,8 +523,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 int fsf = (instr >> 21) & 0x3;
                 int ftf = (instr >> 23) & 0x3;
-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
-                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
+                const float num = vuNormalizeOperand(m_state.vf[vfS][fsf]);
+                const float den = vuNormalizeOperand(m_state.vf[vfT][ftf]);
                 uint32_t statusDi = 0u;
                 float result = 0.0f;
                 if (den == 0.0f)
@@ -523,7 +546,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x39: // SQRT
             {
                 int ftf = (instr >> 23) & 0x3;
-                const float val = normalizeOperand(m_state.vf[vfT][ftf]);
+                const float val = vuNormalizeOperand(m_state.vf[vfT][ftf]);
                 queueQ(std::sqrt(std::fabs(val)), 7u,
                        val < 0.0f ? 0x10u : 0u);
                 return;
@@ -532,8 +555,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 int fsf = (instr >> 21) & 0x3;
                 int ftf = (instr >> 23) & 0x3;
-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
-                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
+                const float num = vuNormalizeOperand(m_state.vf[vfS][fsf]);
+                const float radicand = vuNormalizeOperand(m_state.vf[vfT][ftf]);
                 const float den = std::sqrt(std::fabs(radicand));
                 uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
                 float result = 0.0f;
@@ -656,6 +679,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 if (viT != 0)
                     m_state.vi[viT] = (int32_t)(m_state.top & 0x3FFu);
+                {
+                    static uint32_t s_xtopLogs = 0u;
+                    if (s_xtopLogs < 4u)
+                    {
+                        std::fprintf(stderr,
+                                     "[vu1] XTOP pc=0x%x vi%u top=0x%x\n",
+                                     m_state.pc, viT, m_state.top);
+                        ++s_xtopLogs;
+                    }
+                }
                 return;
             }
             case 0x69: // XITOP - move current VIF1 ITOP into VI register
@@ -669,49 +702,49 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 return;
             case 0x70: // ESADD
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float y = vuNormalizeOperand(m_state.vf[vfS][1]);
+                const float z = vuNormalizeOperand(m_state.vf[vfS][2]);
                 queueP(x * x + y * y + z * z, 11u);
                 return;
             }
             case 0x71: // ERSADD
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float y = vuNormalizeOperand(m_state.vf[vfS][1]);
+                const float z = vuNormalizeOperand(m_state.vf[vfS][2]);
                 const float sum = x * x + y * y + z * z;
                 queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
                 return;
             }
             case 0x72: // ELENG
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float y = vuNormalizeOperand(m_state.vf[vfS][1]);
+                const float z = vuNormalizeOperand(m_state.vf[vfS][2]);
                 queueP(std::sqrt(x * x + y * y + z * z), 18u);
                 return;
             }
             case 0x73: // ERLENG
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float y = vuNormalizeOperand(m_state.vf[vfS][1]);
+                const float z = vuNormalizeOperand(m_state.vf[vfS][2]);
                 const float len = std::sqrt(x * x + y * y + z * z);
                 queueP(len != 0.0f ? 1.0f / len : len, 24u);
                 return;
             }
             case 0x74: // EATANxy
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float y = vuNormalizeOperand(m_state.vf[vfS][1]);
                 queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
                 return;
             }
             case 0x75: // EATANxz
             {
-                const float x = normalizeOperand(m_state.vf[vfS][0]);
-                const float z = normalizeOperand(m_state.vf[vfS][2]);
+                const float x = vuNormalizeOperand(m_state.vf[vfS][0]);
+                const float z = vuNormalizeOperand(m_state.vf[vfS][2]);
                 queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
                 return;
             }
@@ -719,14 +752,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 float sum = 0.0f;
                 for (uint32_t component = 0; component < 4u; ++component)
-                    sum += normalizeOperand(m_state.vf[vfS][component]);
+                    sum += vuNormalizeOperand(m_state.vf[vfS][component]);
                 queueP(sum, 12u);
                 return;
             }
             case 0x77: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                const float value = vuNormalizeOperand(m_state.vf[vfS][component]);
                 float result = value;
                 if (result >= 0.0f)
                 {
@@ -740,21 +773,21 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x78: // ESQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                const float value = vuNormalizeOperand(m_state.vf[vfS][component]);
                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
                 return;
             }
             case 0x79: // ESIN
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                const float value = vuNormalizeOperand(m_state.vf[vfS][component]);
                 queueP(vuEsin(value), 29u);
                 return;
             }
             case 0x7A: // ERCPR
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                const float value = normalizeOperand(m_state.vf[vfS][component]);
+                const float value = vuNormalizeOperand(m_state.vf[vfS][component]);
                 queueP(value != 0.0f ? 1.0f / value : value, 12u);
                 return;
             }
@@ -763,13 +796,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x7C: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+                queueP(vuEatan(vuNormalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
             case 0x7D: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
+                queueP(vuEexp(vuNormalizeOperand(m_state.vf[vfS][component])), 44u);
                 return;
             }
             default:

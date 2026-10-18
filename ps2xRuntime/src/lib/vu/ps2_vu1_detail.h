@@ -2,6 +2,26 @@
 #define PS2_VU1_DETAIL_H
 
 #include <cstdint>
+#include <cstring>
+
+// VU operand normalization: denormals -> signed zero, Inf/NaN -> signed max.
+static inline float vuNormalizeOperand(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    if (exponent == 0u)
+        bits &= 0x80000000u;
+    else if (exponent == 0xFFu)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static inline float vuBroadcast(const float *vf, uint8_t bc)
+{
+    return vuNormalizeOperand(vf[bc & 3u]);
+}
 
 // Instruction field extraction helpers
 static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
