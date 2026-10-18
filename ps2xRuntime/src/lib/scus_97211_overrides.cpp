@@ -26,6 +26,8 @@ extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
 extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode); // ps2_vif1_interpreter.cpp
+bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width, uint32_t height,
+                              uint8_t *dst); // Kernel/Stubs/IPU.cpp
 extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
@@ -6240,6 +6242,52 @@ namespace
         g_ps2Vif1IbitHook = &onVif1TextureIbit;
     }
 
+    // PSXTextureMapManager IPU decode @ 0x179190: (mgr, dst, src, size, width, height, ?, wait).
+    // It feeds src to IDEC (RGB16 output) over IPU_TO and DMAs the result to dst over IPU_FROM;
+    // the caller then copies dst's macroblocks into the texture cache (0x176260). The runtime's
+    // IPU registers are inert, so dst was never written and race textures sampled stale memory.
+    void ipuDecompress179190(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        static uint32_t s_logs = 0u;
+        static uint32_t s_decoded = 0u;
+        static uint32_t s_failed = 0u;
+        const uint32_t dst = getRegU32(ctx, 5) & 0x1FFFFFFFu;
+        const uint32_t src = getRegU32(ctx, 6) & 0x1FFFFFFFu;
+        const uint32_t size = getRegU32(ctx, 7);
+        const uint32_t width = getRegU32(ctx, 8);
+        const uint32_t height = getRegU32(ctx, 9);
+        const uint64_t outBytes = static_cast<uint64_t>(width) * height * 2u;
+
+        bool ok = false;
+        if (width != 0u && height != 0u && width <= 1024u && height <= 1024u &&
+            static_cast<uint64_t>(src) + size <= PS2_RAM_SIZE && static_cast<uint64_t>(dst) + outBytes <= PS2_RAM_SIZE)
+        {
+            ok = ps2IpuDecodeTextureRgb16(getMemPtr(rdram, src), size, width, height, getMemPtr(rdram, dst));
+        }
+        if (ok)
+            ++s_decoded;
+        else
+            ++s_failed;
+
+        if (s_logs < 12u || (!ok && s_failed <= 32u))
+        {
+            ++s_logs;
+            std::cerr << "[ATV2:IPU] decode dst=0x" << std::hex << dst << " src=0x" << src << " size=0x" << size
+                      << std::dec << " " << width << "x" << height << " ok=" << (ok ? 1 : 0)
+                      << " decoded=" << s_decoded << " failed=" << s_failed << std::endl;
+        }
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void registerIpuTextureDecode(PS2Runtime &runtime)
+    {
+        const char *v = std::getenv("ATV2_IPU_HLE");
+        if (v != nullptr && v[0] == '0')
+            return;
+        runtime.replaceFunction(0x00179190u, &ipuDecompress179190);
+    }
+
     // ATV2 links libpad "PsIIlibpad 2500" without symbols, and nothing on the IOP side services
     // padman's SIF RPC (0x80000100/0x80000101) or fills its DMA buffer. Route the library's entry
     // points to the runtime's HLE pad implementation, which reads the host keyboard/gamepad.
@@ -6918,6 +6966,7 @@ namespace
         registerFeTrace(runtime);
         registerHeapTrace(runtime);
         registerVif1TextureIbit(runtime);
+        registerIpuTextureDecode(runtime);
         registerPadHle(runtime);
     }
 }
