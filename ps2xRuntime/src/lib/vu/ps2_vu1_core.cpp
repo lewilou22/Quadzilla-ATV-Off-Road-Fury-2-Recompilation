@@ -879,13 +879,20 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
-                tagBytes += static_cast<uint64_t>(nloop) * 16u;
             else
             {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
+                // FLG 3 is "disabled": the GIF treats it as IMAGE.
+                tagBytes += static_cast<uint64_t>(nloop) * 16u;
+                static int s_flg3Logged = 0;
+                if (format == 3u && s_flg3Logged < 6)
+                {
+                    ++s_flg3Logged;
+                    uint64_t tagHi = 0;
+                    std::memcpy(&tagHi, m_xgkick.packet.data() + qwordOffset + 8u, sizeof(tagHi));
+                    RUNTIME_ERROR("[VU1 xgkick flg3] pc=0x" << std::hex << m_state.pc << " src=0x" << m_xgkick.sourceAddress
+                                                          << " off=0x" << qwordOffset << " tag=" << tagHi << ":" << tagLo
+                                                          << std::dec << " nloop=" << nloop << std::endl);
+                }
             }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
@@ -1659,6 +1666,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         if (m_cycle >= budgetEnd)
             break;
+        // XGKICK waits for the previous PATH1 transfer, whose end is not a fixed
+        // ready cycle; starting early would discard the packet still in flight.
+        if (decoded.lowerUsage.pipeline == PipelineXgkick)
+        {
+            while (m_xgkick.active && m_cycle < budgetEnd)
+                advanceOneCycle();
+            if (m_xgkick.active)
+                break;
+        }
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;

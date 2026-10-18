@@ -1346,18 +1346,20 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                       << " source=0x" << std::hex << sourcePc << " target=0x" << targetPc
                       << " ra=0x" << ra << " a0=0x" << a0 << " sp=0x" << sp
                       << " trace=" << formatDispatchHistory() << std::dec << std::endl;
-            if (!m_memory.isCodeAddress(targetPc) && rdram && sp >= 0x80u && sp < PS2_RAM_SIZE - 0x100u)
-            {
-                std::cerr << "[guest-branch:wild-stack] sp=0x" << std::hex << sp;
-                for (uint32_t off = 0; off < 0x180u; off += 4u)
-                {
-                    uint32_t w = 0u;
-                    std::memcpy(&w, rdram + sp - 0x80u + off, sizeof(w));
-                    std::cerr << ((off % 32u) == 0u ? "\n  " : " ") << (w == targetPc ? "*" : "") << w;
-                }
-                std::cerr << std::dec << std::endl;
-            }
         }
+    }
+
+    if (targetPc != 0u && !m_memory.isCodeAddress(targetPc) && rdram && sp >= 0x100u && sp < PS2_RAM_SIZE - 0x200u)
+    {
+        std::ostringstream dump;
+        dump << "[guest-branch:wild-stack] sp=0x" << std::hex << sp << " base=0x" << (sp - 0x100u);
+        for (uint32_t off = 0; off < 0x300u; off += 4u)
+        {
+            uint32_t w = 0u;
+            std::memcpy(&w, rdram + sp - 0x100u + off, sizeof(w));
+            dump << ((off % 32u) == 0u ? "\n  " : " ") << (w == targetPc ? "*" : "") << w;
+        }
+        std::cerr << dump.str() << std::dec << std::endl;
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
@@ -1410,11 +1412,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!hasFunction(targetPc) && missingInterpEnabled() && ps2InterpCanHandle(targetPc))
     {
+        const uint32_t interpEntrySp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
         ctx->pc = targetPc;
         ps2InterpretGuest(this, rdram, ctx);
         if (isStopRequested() || ctx->pc == 0u)
         {
             return false;
+        }
+        if (ctx->pc == fallthroughPc &&
+            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) != interpEntrySp)
+        {
+            std::cerr << "[guest-branch:sp-leak] interp target=0x" << std::hex << targetPc << " entrySp=0x"
+                      << interpEntrySp << " exitSp=0x" << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))
+                      << std::dec << std::endl;
         }
         return ctx->pc == fallthroughPc;
     }
@@ -1442,6 +1452,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint32_t entrySp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1451,7 +1462,33 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (ctx->pc == entryPc)
     {
+        // A callee that suspended at a nested call to itself also leaves pc == entryPc,
+        // but with its own frame still on the guest stack; that must unwind to the scheduler.
+        if (static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) != entrySp)
+        {
+            return false;
+        }
         ctx->pc = fallthroughPc;
+    }
+
+    if (isCall && ctx->pc == fallthroughPc)
+    {
+        const uint32_t exitSp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
+        if (exitSp != entrySp)
+        {
+            static uint32_t s_spLeakSeen[32] = {};
+            static uint32_t s_spLeakCount = 0u;
+            bool seen = false;
+            for (uint32_t i = 0; i < s_spLeakCount; ++i)
+                seen = seen || s_spLeakSeen[i] == targetPc;
+            if (!seen && s_spLeakCount < 32u)
+            {
+                s_spLeakSeen[s_spLeakCount++] = targetPc;
+                std::cerr << "[guest-branch:sp-leak] target=0x" << std::hex << targetPc << " source=0x" << sourcePc
+                          << " entrySp=0x" << entrySp << " exitSp=0x" << exitSp
+                          << " trace=" << formatDispatchHistory() << std::dec << std::endl;
+            }
+        }
     }
 
     return ctx->pc == fallthroughPc;

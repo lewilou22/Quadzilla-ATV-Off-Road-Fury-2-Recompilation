@@ -54,9 +54,10 @@ namespace
             return runtime->dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, returnPc, kind, debugName);
 
         HoldEeTimeslices hold;
+        const uint32_t entrySp = getRegU32(ctx, 29);
         ctx->pc = targetPc;
         runtime->lookupFunction(targetPc)(rdram, ctx, runtime);
-        if (ctx->pc == targetPc)
+        if (ctx->pc == targetPc && getRegU32(ctx, 29) == entrySp)
             ctx->pc = returnPc;
         static int s_continued = 0;
         if (ctx->pc != returnPc && s_continued < 40)
@@ -1336,9 +1337,10 @@ namespace
         constexpr uint32_t kScratchReturn = 0x0000FFF0u;
         HoldEeTimeslices hold;
         SET_GPR_U32(scratch, 31, kScratchReturn);
+        const uint32_t entrySp = getRegU32(scratch, 29);
         scratch->pc = fnAddr;
         fn(rdram, scratch, runtime);
-        if (scratch->pc == fnAddr)
+        if (scratch->pc == fnAddr && getRegU32(scratch, 29) == entrySp)
             return;
         for (uint32_t guard = 0; scratch->pc != kScratchReturn; ++guard)
         {
@@ -6351,6 +6353,51 @@ namespace
         g_padEvent122930Orig(rdram, ctx, runtime);
     }
 
+    PS2Runtime::RecompiledFunction g_countdownOrig = nullptr;
+
+    void countdownWatch248020(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int s_calls = 0;
+        const uint32_t self = getRegU32(ctx, 4);
+        if (s_calls < 12 || (s_calls % 120) == 0)
+            ++s_calls;
+        else
+        {
+            ++s_calls;
+            g_countdownOrig(rdram, ctx, runtime);
+            return;
+        }
+            std::cerr << "[ATV2:COUNTDOWN] call=" << (s_calls - 1) << " dt=" << ctx->f[12]
+                      << std::hex << " self=0x" << self << " flags=0x" << READ32(self + 0x5Cu)
+                      << " mode=0x" << READ32(self + 0x64u) << std::dec
+                      << " len=" << std::bit_cast<float>(READ32(self + 0xB4u))
+                      << " step=" << std::bit_cast<float>(READ32(self + 0xB8u))
+                      << " elapsed=" << std::bit_cast<float>(READ32(self + 0xBCu))
+                      << std::hex << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        g_countdownOrig(rdram, ctx, runtime);
+    }
+
+    template <uint32_t Addr>
+    struct CallCounter
+    {
+        static inline PS2Runtime::RecompiledFunction orig = nullptr;
+        static void hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t s_calls = 0;
+            if (++s_calls <= 4u || (s_calls & (s_calls - 1u)) == 0u)
+                std::cerr << "[ATV2:CALLCOUNT] fn=0x" << std::hex << Addr << " n=" << std::dec << s_calls
+                          << std::hex << " a0=0x" << getRegU32(ctx, 4) << " ra=0x" << getRegU32(ctx, 31)
+                          << std::dec << " f12=" << ctx->f[12] << std::endl;
+            orig(rdram, ctx, runtime);
+        }
+        static void install(PS2Runtime &runtime)
+        {
+            orig = runtime.lookupFunction(Addr);
+            if (orig)
+                runtime.replaceFunction(Addr, &hook);
+        }
+    };
+
     PS2Runtime::RecompiledFunction g_pageSwitchOrig = nullptr;
 
     void pageSwitchWatch2d39d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -6377,6 +6424,11 @@ namespace
             g_padEvent122930Orig = runtime.lookupFunction(0x00122930u);
             if (g_padEvent122930Orig)
                 runtime.replaceFunction(0x00122930u, &padEvent122930);
+            g_countdownOrig = runtime.lookupFunction(0x00248020u);
+            if (g_countdownOrig)
+                runtime.replaceFunction(0x00248020u, &countdownWatch248020);
+            CallCounter<0x00157260u>::install(runtime);
+            CallCounter<0x00211490u>::install(runtime);
         }
     }
 
