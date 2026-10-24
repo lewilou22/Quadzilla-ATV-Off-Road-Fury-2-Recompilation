@@ -4114,8 +4114,14 @@ namespace
             {
                 *dot = '\0';
             }
+            // snprintf(eco, 0x104, "%s%s.est", <track dir @0x406360, e.g. "tracks\env05\">, eco).
+            // Hard-coding "tracks\" dropped the track folder, so env05.esb was never found and the
+            // ecosystem (all trees and bushes) was discarded.
+            char trackDir[260];
+            std::strncpy(trackDir, reinterpret_cast<const char *>(getMemPtr(rdram, 0x00406360u)), sizeof(trackDir) - 1);
+            trackDir[sizeof(trackDir) - 1] = '\0';
             char formattedEco[260];
-            std::snprintf(formattedEco, sizeof(formattedEco), "tracks\\%s.est", ecoStr);
+            std::snprintf(formattedEco, sizeof(formattedEco), "%s%s.est", trackDir, ecoStr);
             std::strncpy(ecoStr, formattedEco, 259);
             ecoStr[259] = '\0';
         }
