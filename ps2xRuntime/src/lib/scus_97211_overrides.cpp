@@ -5,6 +5,7 @@
 #include "Kernel/Stubs/Pad.h"
 
 #include <cerrno>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -6611,8 +6612,33 @@ namespace
         }
     }
 
+    // The game's libm cos/sin/floor/fabs (0x3684D0 / 0x368D18 / 0x368650 / 0x3685F8) are the
+    // double-precision versions. The EE has no double FPU, so GCC passes the double as 64-bit bits
+    // in a0 and returns it in v0. The recompiler bound them to the generic float stubs (f12 -> f0),
+    // which left v0 untouched: cos(x) == sin(x) == x. That broke the sin/cos table built at boot
+    // (0x1AACC0), so any camera roll (0x325B90 -> 0x1AB4D0) scaled the view to nearly nothing.
+    double softDoubleArg(R5900Context *ctx)
+    {
+        return std::bit_cast<double>(static_cast<uint64_t>(GPR_U64(ctx, 4)));
+    }
+
+    void softDoubleReturn(R5900Context *ctx, double value)
+    {
+        SET_GPR_U64(ctx, 2, std::bit_cast<uint64_t>(value));
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void libmCos3684d0(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::cos(softDoubleArg(ctx))); }
+    void libmSin368d18(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::sin(softDoubleArg(ctx))); }
+    void libmFloor368650(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::floor(softDoubleArg(ctx))); }
+    void libmFabs3685f8(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::fabs(softDoubleArg(ctx))); }
+
     void registerFadeStepFix(PS2Runtime &runtime)
     {
+        runtime.replaceFunction(0x003684D0u, &libmCos3684d0);
+        runtime.replaceFunction(0x00368D18u, &libmSin368d18);
+        runtime.replaceFunction(0x00368650u, &libmFloor368650);
+        runtime.replaceFunction(0x003685F8u, &libmFabs3685f8);
         g_fadeStep160d10Orig = runtime.lookupFunction(0x00160D10u);
         if (!g_fadeStep160d10Orig)
         {
