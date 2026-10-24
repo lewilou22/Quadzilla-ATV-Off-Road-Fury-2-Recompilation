@@ -6437,8 +6437,15 @@ namespace
             // ATV2_AUTO_CROSS_ONCE=1: repeat presses only while the front end is in state 12
             // (memory card alert), so movies and menus are left alone.
             static const bool s_autoCrossOnce = std::getenv("ATV2_AUTO_CROSS_ONCE") != nullptr;
+            // ATV2_AUTO_CROSS_UNTIL_RACE=1: stop repeating once the race is running (front end state 2
+            // with no parent screen), so the presses don't pause the race.
+            static const bool s_untilRace = std::getenv("ATV2_AUTO_CROSS_UNTIL_RACE") != nullptr;
             static int s_reads = 0;
-            if (s_autoCross > 0 && a0 == 0u)
+            if (s_untilRace && READ32(0x005425E0u + 0xCCu) == 2u && READ32(0x005425E0u + 0x1Cu) == 0u)
+            {
+                // Race running: leave the pad alone.
+            }
+            else if (s_autoCross > 0 && a0 == 0u)
             {
                 ++s_reads;
                 if ((s_reads % 25) == 0)

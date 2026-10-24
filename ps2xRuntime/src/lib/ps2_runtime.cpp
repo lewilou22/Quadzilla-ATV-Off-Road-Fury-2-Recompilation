@@ -2494,6 +2494,9 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // The EE FPU and VU0 flush denormal inputs and results to zero; match that on the host
+        // (FTZ | DAZ) so tiny values don't turn into huge reciprocals.
+        _mm_setcsr(_mm_getcsr() | 0x8040u);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);

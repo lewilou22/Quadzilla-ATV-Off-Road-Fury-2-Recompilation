@@ -141,9 +141,19 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
+// VU floats have no Inf/NaN: exponent 0xFF is just a huge value and results saturate to +/-FLT_MAX.
+// Clamp operands and results so host Inf/NaN never appears (Inf*0 and Inf-Inf would make NaN).
+static inline __m128 ps2_vu_clamp(__m128 v)
+{
+    const __m128i bits = _mm_castps_si128(v);
+    const __m128i expMask = _mm_set1_epi32(0x7F800000);
+    const __m128i special = _mm_cmpeq_epi32(_mm_and_si128(bits, expMask), expMask);
+    const __m128i clamped = _mm_or_si128(_mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))), _mm_set1_epi32(0x7F7FFFFF));
+    return _mm_castsi128_ps(_mm_or_si128(_mm_andnot_si128(special, bits), _mm_and_si128(special, clamped)));
+}
+#define PS2_VADD(a, b) ps2_vu_clamp(_mm_add_ps(ps2_vu_clamp((__m128)(a)), ps2_vu_clamp((__m128)(b))))
+#define PS2_VSUB(a, b) ps2_vu_clamp(_mm_sub_ps(ps2_vu_clamp((__m128)(a)), ps2_vu_clamp((__m128)(b))))
+#define PS2_VMUL(a, b) ps2_vu_clamp(_mm_mul_ps(ps2_vu_clamp((__m128)(a)), ps2_vu_clamp((__m128)(b))))
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
@@ -621,9 +631,18 @@ inline float ps2_fpu_signed_max(bool negative)
 
 #define FPU_DIV_BY_ZERO_S(a, b) ps2_fpu_signed_max(std::signbit((float)(a)) != std::signbit((float)(b)))
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
+// Exponent 0xFF counts as a huge finite value; arithmetic results saturate to +/-FLT_MAX.
+inline float ps2_fpu_clamp(float value)
+{
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    if ((bits & 0x7F800000u) == 0x7F800000u)
+        return std::bit_cast<float>((bits & 0x80000000u) | 0x7F7FFFFFu);
+    return value;
+}
+
+#define FPU_ADD_S(a, b) ps2_fpu_clamp(ps2_fpu_clamp((float)(a)) + ps2_fpu_clamp((float)(b)))
+#define FPU_SUB_S(a, b) ps2_fpu_clamp(ps2_fpu_clamp((float)(a)) - ps2_fpu_clamp((float)(b)))
+#define FPU_MUL_S(a, b) ps2_fpu_clamp(ps2_fpu_clamp((float)(a)) * ps2_fpu_clamp((float)(b)))
 #define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
 #define FPU_SQRT_S(a) sqrtf(fabsf((float)(a)))
 #define FPU_ABS_S(a) fabsf((float)(a))
