@@ -220,6 +220,155 @@ namespace GSMem
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
     }
 
+    u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32:
+            return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y, &cache);
+        case C24:
+            return PixelStorageTraits<C24>::Read(PageTableC32, data, bp, bw, x, y, &cache);
+        case C16:
+            return PixelStorageTraits<C16>::Read(PageTableC16, data, bp, bw, x, y, &cache);
+        case C16S:
+            return PixelStorageTraits<C16S>::Read(PageTableC16S, data, bp, bw, x, y, &cache);
+        case P8:
+            return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y, &cache);
+        case P4:
+            return PixelStorageTraits<P4>::Read(PageTableP4, data, bp, bw, x, y, &cache);
+        case P8H:
+            return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y, &cache);
+        case P4HL:
+            return PixelStorageTraits<P4HL>::Read(PageTableC32, data, bp, bw, x, y, &cache);
+        case P4HH:
+            return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y, &cache);
+        case Z32:
+            return PixelStorageTraits<Z32>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
+        case Z24:
+            return PixelStorageTraits<Z24>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
+        case Z16:
+            return PixelStorageTraits<Z16>::Read(PageTableZ16, data, bp, bw, x, y, &cache);
+        case Z16S:
+            return PixelStorageTraits<Z16S>::Read(PageTableZ16S, data, bp, bw, x, y, &cache);
+        default:
+            return 0u;
+        }
+    }
+
+    void ReadTexture4(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw,
+                      const u32 (&x)[4], const u32 (&y)[4], u32 (&out)[4])
+    {
+        auto readAll = [&]<PixelStorageMode mode>(const auto& table)
+        {
+            using Traits = PixelStorageTraits<mode>;
+            using PackedT = typename Traits::PackedT;
+            constexpr auto pe = Traits::PageExtent();
+            const u32 col = x[0] / pe.x;
+            const u32 row = y[0] / pe.y;
+            if (x[1] / pe.x != col || x[2] / pe.x != col || x[3] / pe.x != col ||
+                y[1] / pe.y != row || y[2] / pe.y != row || y[3] / pe.y != row)
+            {
+                for (int i = 0; i < 4; ++i)
+                    out[i] = Traits::Read(table, data, bp, bw, x[i], y[i], &cache);
+                return;
+            }
+            // All four texels sit in one page: Traits::Read with the page id
+            // and the page-cache lookup shared (the first lookup loads the
+            // page, the others would hit the same slot).
+            const u32 page = static_cast<u32>(Traits::PageId(bp, bw, x[0], y[0]));
+            const u32 block = static_cast<u32>(bp % Traits::BlocksPerPage());
+            const u8 *pageBytes = nullptr;
+            for (int i = 0; i < 4; ++i)
+            {
+                const u32 pixel_addr = static_cast<u32>((page * Traits::PixelsPerPage()) + table[block][y[i] % pe.y][x[i] % pe.x]);
+                const u32 bits = static_cast<u32>(pixel_addr * UnpackedBitWidth(mode) + Traits::BitOffset());
+                const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
+                const u32 shift = bits % 8;
+                const u8 *source;
+                if (i == 0)
+                {
+                    source = cache.Resolve(data, byte_addr);
+                    pageBytes = source - (byte_addr & (TexturePageCache::kPageSize - 1u));
+                }
+                else
+                {
+                    source = pageBytes + (byte_addr & (TexturePageCache::kPageSize - 1u));
+                }
+                PackedT v;
+                std::memcpy(&v, source, sizeof(PackedT));
+                switch (mode)
+                {
+                case C24:
+                case Z24:
+                    out[i] = v & 0x00FFFFFF;
+                    break;
+                case P4:
+                case P4HL:
+                case P4HH:
+                    out[i] = (v >> shift) & 0x0F;
+                    break;
+                default:
+                    out[i] = v;
+                    break;
+                }
+            }
+        };
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: readAll.template operator()<C32>(PageTableC32); break;
+        case C24: readAll.template operator()<C24>(PageTableC32); break;
+        case C16: readAll.template operator()<C16>(PageTableC16); break;
+        case C16S: readAll.template operator()<C16S>(PageTableC16S); break;
+        case P8: readAll.template operator()<P8>(PageTableP8); break;
+        case P4: readAll.template operator()<P4>(PageTableP4); break;
+        case P8H: readAll.template operator()<P8H>(PageTableC32); break;
+        case P4HL: readAll.template operator()<P4HL>(PageTableC32); break;
+        case P4HH: readAll.template operator()<P4HH>(PageTableC32); break;
+        case Z32: readAll.template operator()<Z32>(PageTableZ32); break;
+        case Z24: readAll.template operator()<Z24>(PageTableZ32); break;
+        case Z16: readAll.template operator()<Z16>(PageTableZ16); break;
+        case Z16S: readAll.template operator()<Z16S>(PageTableZ16S); break;
+        default: out[0] = out[1] = out[2] = out[3] = 0u; break;
+        }
+    }
+
+    namespace
+    {
+        template <PixelStorageMode mode, typename Table>
+        u32 pixelByteAddress(const Table& table, u32 bp, u32 bw, u32 x, u32 y)
+        {
+            using Traits = PixelStorageTraits<mode>;
+            const u32 pixel_addr = Traits::Address(table, bp, bw, x, y);
+            const u32 bits = static_cast<u32>(pixel_addr * UnpackedBitWidth(mode) + Traits::BitOffset());
+            return (bits / 8) & (MEMORY_SIZE - sizeof(typename Traits::PackedT));
+        }
+
+        u32 AddressCT32(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<C32>(PageTableC32, bp, bw, x, y); }
+        u32 AddressCT24(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<C24>(PageTableC32, bp, bw, x, y); }
+        u32 AddressCT16(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<C16>(PageTableC16, bp, bw, x, y); }
+        u32 AddressCT16S(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<C16S>(PageTableC16S, bp, bw, x, y); }
+        u32 AddressZ32(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<Z32>(PageTableZ32, bp, bw, x, y); }
+        u32 AddressZ24(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<Z24>(PageTableZ32, bp, bw, x, y); }
+        u32 AddressZ16(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<Z16>(PageTableZ16, bp, bw, x, y); }
+        u32 AddressZ16S(u32 bp, u32 bw, u32 x, u32 y) { return pixelByteAddress<Z16S>(PageTableZ16S, bp, bw, x, y); }
+    }
+
+    PixelAddressFunc GetPixelAddressFunc(u32 psm)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: return AddressCT32;
+        case C24: return AddressCT24;
+        case C16: return AddressCT16;
+        case C16S: return AddressCT16S;
+        case Z32: return AddressZ32;
+        case Z24: return AddressZ24;
+        case Z16: return AddressZ16;
+        case Z16S: return AddressZ16S;
+        default: return nullptr;
+        }
+    }
+
     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);

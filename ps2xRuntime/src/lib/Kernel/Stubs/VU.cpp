@@ -553,7 +553,13 @@ namespace ps2_stubs
         float dot = 0.0f;
         if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
         {
-            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]);
+            // vmul.xyz + vaddy.x + vaddz.x: a 3-component dot. Adding w*w
+            // put +1 on every D3DVECTOR (w=1) product (ATV1: DrawableCube culled the
+            // sky's side faces). ATV_INNER_PRODUCT_W=1 = old.
+            static const bool s_withW = std::getenv("ATV_INNER_PRODUCT_W") != nullptr;
+            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
+            if (s_withW)
+                dot += lhs[3] * rhs[3];
         }
 
         if (ctx)

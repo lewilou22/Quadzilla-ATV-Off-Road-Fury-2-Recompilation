@@ -2,6 +2,15 @@
 #include <algorithm>
 #include <cstring>
 
+namespace
+{
+    // Packet buffers released by drain() and reused by submit() on the same
+    // thread: PATH1 submits and drains one packet per XGKICK, which otherwise
+    // costs a heap allocation and free per packet.
+    thread_local std::vector<std::vector<uint8_t>> t_packetPool;
+    constexpr size_t kPacketPoolMax = 16u;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -15,7 +24,7 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     uint64_t tagLo = 0;
     std::memcpy(&tagLo, data, sizeof(tagLo));
     const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-    return flg >= 2u;
+    return flg == 2u;
 }
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
@@ -27,8 +36,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!t_packetPool.empty())
+    {
+        pkt.data = std::move(t_packetPool.back());
+        t_packetPool.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -37,7 +50,8 @@ void GifArbiter::drain()
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
+    if (m_queue.size() > 1u)
+        std::stable_sort(m_queue.begin(), m_queue.end(),
                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                      {
                          // DIRECTHL cannot preempt PATH3 IMAGE transfers.
@@ -58,6 +72,12 @@ void GifArbiter::drain()
         {
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
+    }
+    for (auto &pkt : m_queue)
+    {
+        if (t_packetPool.size() >= kPacketPoolMax)
+            break;
+        t_packetPool.push_back(std::move(pkt.data));
     }
     m_queue.clear();
 }

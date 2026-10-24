@@ -1548,7 +1548,11 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        const uint32_t firstSource = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+        // VU data memory is a power of two (16 KB); avoid the division per qword.
+        const uint32_t sourceOffset = m_xgkick.sourceAddress + m_xgkick.copiedBytes;
+        const uint32_t firstSource = (m_activeVuDataSize & (m_activeVuDataSize - 1u)) == 0u
+                                         ? sourceOffset & (m_activeVuDataSize - 1u)
+                                         : sourceOffset % m_activeVuDataSize;
         if (firstSource + 16u <= m_activeVuDataSize)
         {
             std::memcpy(m_xgkick.packet.data() + qwordOffset, m_activeVuData + firstSource, 16u);

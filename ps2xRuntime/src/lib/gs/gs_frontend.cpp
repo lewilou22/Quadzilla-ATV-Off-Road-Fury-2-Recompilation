@@ -5,19 +5,156 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <immintrin.h>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <thread>
+#include <variant>
+#include <vector>
+
+extern uint32_t g_ps2XgkickCount;
+bool g_raceLoadStarted = false;
+void atvStartHostProfilerForThisThread();
 
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
 
-    void loadBackendClut(GSRasterBackend *backend, const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+    // Opt-in (ATV_TRACE_GS_VIEWPORT=1): bounded log of XYOFFSET/SCISSOR
+    // changes with the vertex kicks since the previous change, to check the
+    // ordering of viewport packets against the geometry they should clip.
+    // Arms on the first VU1 XGKICK after an in-range sub-viewport XYOFFSET.
+    bool traceGsViewportEnabled()
     {
-        if (auto *cpu = dynamic_cast<GSCpuBackend *>(backend))
-            cpu->LoadClut(tex0, texclut);
+        static const bool s_enabled = std::getenv("ATV_TRACE_GS_VIEWPORT") != nullptr;
+        return s_enabled;
+    }
+    // Opt-in (ATV_TRACE_TEXPOOL=afterSeconds): draws sampling a 32x64 texture
+    // (the off-track HUD arrow) once afterSeconds have passed since race load,
+    // each preceded by the last uploads into the 0x3400..0x3E00 texture pool.
+    // Consecutive identical arrow draws are collapsed.
+    bool texPoolTraceActive()
+    {
+        static const char *s_env = std::getenv("ATV_TRACE_TEXPOOL");
+        if (!s_env || !g_raceLoadStarted)
+            return false;
+        using Clock = std::chrono::steady_clock;
+        static const Clock::time_point s_raceStart = Clock::now();
+        static const double s_after = std::atof(s_env);
+        return std::chrono::duration<double>(Clock::now() - s_raceStart).count() >= s_after;
+    }
+    uint32_t s_texPoolLines = 0u;
+    uint32_t s_texPoolLastArrowTbp = 0xFFFFFFFFu;
+    uint32_t s_texPoolArrowRun = 0u;
+    char s_texPoolUploads[8][96] = {};
+    uint32_t s_texPoolUploadCount = 0u;
+    uint32_t s_texPoolUploadsSinceArrow = 0u;
+    uint64_t s_texPoolUploadSeq = 0u;
+    bool s_vpTraceArmed = false;
+    bool s_vpSubViewportSeen = false;
+    uint32_t s_vpTraceLogs = 0u;
+    uint64_t s_vpTraceKicks = 0u;
+    float s_vpLastX = 0.0f;
+    float s_vpLastY = 0.0f;
+
+    void traceGsViewportKick(float x, float y)
+    {
+        ++s_vpTraceKicks;
+        s_vpLastX = x;
+        s_vpLastY = y;
+    }
+
+    // Consecutive XGKICK packets are collapsed: the first is logged, the
+    // rest are counted and reported before the next logged event.
+    uint32_t s_path1Run = 0u;
+
+    void flushPath1Run()
+    {
+        if (s_path1Run > 1u)
+        {
+            ++s_vpTraceLogs;
+            std::fprintf(stderr, "[gs:vp]   ...GIF-PATH1 run=%u\n", s_path1Run);
+        }
+        s_path1Run = 0u;
+    }
+
+    void traceGsViewportWrite(const char *name, uint64_t oldValue, uint64_t newValue, bool isOffset);
+}
+
+// Marker hook for other TUs (DMA starts, render-queue wrappers) so their
+// events interleave with the [gs:vp] register trace.  No-op until armed.
+void atvTraceGsViewportMarker(const char *label, uint32_t a, uint32_t b)
+{
+    // Arm on the first VU1 XGKICK after a sub-viewport offset: the menu's
+    // slide-in frames before that carry no 3D and would exhaust the budget.
+    const bool isPath1 = std::strcmp(label, "GIF-PATH1") == 0;
+    if (traceGsViewportEnabled() && !s_vpTraceArmed && s_vpSubViewportSeen && isPath1)
+    {
+        s_vpTraceArmed = true;
+    }
+    if (!traceGsViewportEnabled() || !s_vpTraceArmed || s_vpTraceLogs >= 600u)
+    {
+        return;
+    }
+    if (isPath1 && s_path1Run != 0u)
+    {
+        ++s_path1Run;
+        return;
+    }
+    flushPath1Run();
+    s_path1Run = isPath1 ? 1u : 0u;
+    ++s_vpTraceLogs;
+    std::fprintf(stderr, "[gs:vp] %s a=0x%x b=0x%x kicksBefore=%llu\n", label, a, b,
+                 static_cast<unsigned long long>(s_vpTraceKicks));
+    s_vpTraceKicks = 0u;
+}
+
+namespace
+{
+    void traceGsViewportWrite(const char *name, uint64_t oldValue, uint64_t newValue, bool isOffset)
+    {
+        if (isOffset && !s_vpTraceArmed)
+        {
+            // Intro video uses off-screen offsets (OFY > 2048); arm only on an
+            // in-range sub-viewport offset such as RiderMenu's 1583,1805.
+            const uint32_t ofx = static_cast<uint32_t>((newValue & 0xFFFFu) >> 4);
+            const uint32_t ofy = static_cast<uint32_t>(((newValue >> 32) & 0xFFFFu) >> 4);
+            if (ofx != 1728u && ofx >= 1024u && ofx <= 2048u && ofy >= 1024u && ofy <= 2048u)
+            {
+                s_vpSubViewportSeen = true;
+            }
+        }
+        if (!s_vpTraceArmed || oldValue == newValue || s_vpTraceLogs >= 600u)
+        {
+            return;
+        }
+        flushPath1Run();
+        ++s_vpTraceLogs;
+        if (isOffset)
+        {
+            std::fprintf(stderr, "[gs:vp] %s ofx=%u ofy=%u kicksBefore=%llu last=(%.1f,%.1f)\n", name,
+                         static_cast<uint32_t>((newValue & 0xFFFFu) >> 4),
+                         static_cast<uint32_t>(((newValue >> 32) & 0xFFFFu) >> 4),
+                         static_cast<unsigned long long>(s_vpTraceKicks), s_vpLastX, s_vpLastY);
+        }
+        else
+        {
+            std::fprintf(stderr, "[gs:vp] %s x=%u..%u y=%u..%u kicksBefore=%llu last=(%.1f,%.1f)\n", name,
+                         static_cast<uint32_t>(newValue & 0x7FFu),
+                         static_cast<uint32_t>((newValue >> 16) & 0x7FFu),
+                         static_cast<uint32_t>((newValue >> 32) & 0x7FFu),
+                         static_cast<uint32_t>((newValue >> 48) & 0x7FFu),
+                         static_cast<unsigned long long>(s_vpTraceKicks), s_vpLastX, s_vpLastY);
+        }
+        s_vpTraceKicks = 0u;
     }
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -108,28 +245,733 @@ namespace
     std::atomic<uint32_t> s_debugTexaWriteCount{0};
     std::atomic<uint32_t> s_debugCvFontUploadCount{0};
     std::atomic<uint32_t> s_debugLocalCopyCount{0};
+
+    // Runs a raster backend on a worker thread so rasterization overlaps
+    // EE/VU emulation. Calls that only change GS memory are queued in order.
+    // Calls that return data or touch host state wait for the worker to go
+    // idle and then run on the caller's thread while holding the queue lock,
+    // so the wrapped backend never executes on two threads at once.
+    // GetTransferSnapshot is only used for debug views and returns the state
+    // as of the last transfer command the worker processed.
+    class GSThreadedBackend final : public GSRasterBackend
+    {
+    public:
+        explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
+            : m_inner(std::move(inner))
+        {
+            m_worker = std::thread([this]
+                                   { workerLoop(); });
+        }
+
+        ~GSThreadedBackend() override
+        {
+            {
+                std::lock_guard<std::mutex> stageLock(m_stageMutex);
+                flushStagedLocked(nullptr);
+            }
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                waitIdleLocked(lock);
+                m_stop = true;
+            }
+            m_wake.notify_all();
+            m_worker.join();
+        }
+
+        void Initialize(uint8_t *vram, uint32_t vramSize) override
+        {
+            syncCall([&]
+                     { m_inner->Initialize(vram, vramSize); refreshTransfer(); });
+            resetClutMirror();
+        }
+
+        void Reset() override
+        {
+            syncCall([&]
+                     { m_inner->Reset(); refreshTransfer(); });
+            resetClutMirror();
+        }
+
+        void Submit(const GSPrimitiveBatch &batch) override
+        {
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            m_staged.emplace_back(std::in_place_type<GSPrimitiveBatch>, batch);
+            if (m_staged.size() >= kStageBatch)
+                flushStagedLocked(nullptr);
+        }
+
+        void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
+        {
+            // Every TEX0/TEX2 write lands here. Drop the loads GSCpuBackend::
+            // LoadClut returns from before touching any state: non-indexed
+            // PSM, CLD 0/6/7, and CLD 4/5 with CBP equal to the CBP0/CBP1 it
+            // holds (mirrored here; only LoadClut and Reset change it).
+            if (s_noCmdStage)
+            {
+                push(Command{ClutCommand{tex0, texclut}});
+                return;
+            }
+            const uint8_t psm = tex0.psm;
+            if (psm != GS_PSM_T4 && psm != GS_PSM_T4HL && psm != GS_PSM_T4HH &&
+                psm != GS_PSM_T8 && psm != GS_PSM_T8H)
+                return;
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            switch (tex0.cld)
+            {
+            case 1u:
+                break;
+            case 2u:
+            case 3u:
+                m_clutCbpMirror[tex0.cld - 2u] = tex0.cbp;
+                break;
+            case 4u:
+            case 5u:
+                if (m_clutCbpMirror[tex0.cld - 4u] == tex0.cbp)
+                    return;
+                m_clutCbpMirror[tex0.cld - 4u] = tex0.cbp;
+                break;
+            default:
+                return;
+            }
+            stageLocked(Command{ClutCommand{tex0, texclut}});
+        }
+
+        void BeginTransfer(const GSTransferCommand &command) override { push(Command{command}); }
+
+        void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
+        {
+            UploadCommand upload;
+            if (data && sizeBytes != 0u)
+                upload.data.assign(data, data + sizeBytes);
+            push(Command{std::move(upload)});
+        }
+
+        void Flush() override { push(Command{FlushCommand{}}); }
+        void TextureFlush() override { push(Command{TextureFlushCommand{}}); }
+
+        void Sync(GSSyncReason reason) override
+        {
+            // FINISH only latches CSR in the frontend; every VRAM reader
+            // (Present, ReadVram, local->host, snapshots) syncs on its own.
+            if (reason == GSSyncReason::Finish)
+                return;
+            syncCall([&]
+                     { m_inner->Sync(reason); });
+        }
+
+        PresentationFrame Present(const GSPresentationRequest &request) override
+        {
+            PresentationFrame frame;
+            syncCall([&]
+                     { frame = m_inner->Present(request); });
+            return frame;
+        }
+
+        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
+        {
+            bool cleared = false;
+            syncCall([&]
+                     { cleared = m_inner->ClearFramebuffer(context, rgba); });
+            return cleared;
+        }
+
+        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override
+        {
+            uint32_t consumed = 0u;
+            syncCall([&]
+                     { consumed = m_inner->ConsumeLocalToHostBytes(dst, maxBytes); refreshTransfer(); });
+            return consumed;
+        }
+
+        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
+        {
+            uint32_t value = 0u;
+            syncCall([&]
+                     { value = m_inner->ReadVram(psm, base, bw, x, y); });
+            return value;
+        }
+
+        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+        {
+            push(Command{WriteVramCommand{psm, base, bw, x, y, value}});
+        }
+
+        void SnapshotVram(std::vector<uint8_t> &out) const override
+        {
+            syncCall([&]
+                     { m_inner->SnapshotVram(out); });
+        }
+
+        GSTransferSnapshot GetTransferSnapshot() const override
+        {
+            std::lock_guard<std::mutex> lock(m_transferMutex);
+            return m_transfer;
+        }
+
+    private:
+        struct ClutCommand
+        {
+            GSTex0Reg tex0;
+            GSTexClutReg texclut;
+        };
+        struct UploadCommand
+        {
+            std::vector<uint8_t> data;
+        };
+        struct FlushCommand
+        {
+        };
+        struct TextureFlushCommand
+        {
+        };
+        struct WriteVramCommand
+        {
+            uint32_t psm, base, bw, x, y, value;
+        };
+        // Copies local memory at this point of the command stream (see
+        // QueueSnapshot); `out` must stay alive until WaitSnapshot returns.
+        struct SnapshotCommand
+        {
+            std::vector<uint8_t> *out;
+        };
+        using Command = std::variant<GSPrimitiveBatch, ClutCommand, GSTransferCommand, UploadCommand,
+                                     FlushCommand, TextureFlushCommand, WriteVramCommand, SnapshotCommand>;
+
+        static constexpr size_t kMaxQueued = 16384u;
+        // Commands are handed to the worker in groups: one queue lock and at
+        // most one wake per group instead of per triangle or register write.
+        static constexpr size_t kStageBatch = 64u;
+        // ATV_GS_NO_CMD_STAGE=1: non-primitive commands flush the stage and
+        // take the queue lock each (session 31 behaviour, for A/B).
+        inline static const bool s_noCmdStage = []
+        {
+            const char *env = std::getenv("ATV_GS_NO_CMD_STAGE");
+            return env && env[0] != '\0' && env[0] != '0';
+        }();
+
+        void resetClutMirror()
+        {
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            m_clutCbpMirror = {};
+        }
+
+        // Requires m_stageMutex.
+        void stageLocked(Command &&command)
+        {
+            m_staged.push_back(std::move(command));
+            if (m_staged.size() >= kStageBatch)
+                flushStagedLocked(nullptr);
+        }
+
+        // Ordering is all that matters to the worker; every reader of the
+        // worker's results goes through syncCall, which flushes the stage.
+        void push(Command &&command)
+        {
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            if (s_noCmdStage)
+                flushStagedLocked(&command);
+            else
+                stageLocked(std::move(command));
+        }
+
+        // Requires m_stageMutex. Moves staged commands, then `extra`, into
+        // the queue under one m_mutex acquisition, preserving order.
+        void flushStagedLocked(Command *extra) const
+        {
+            if (m_staged.empty() && !extra)
+                return;
+            if (s_queueStats)
+            {
+                flushStagedStatsLocked(extra);
+                return;
+            }
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_queue.size() >= kMaxQueued)
+                m_changed.wait(lock, [&]
+                               { return m_queue.size() < kMaxQueued; });
+            appendStagedLocked(extra);
+        }
+
+        // ATV_GS_QUEUE_STATS=1: every ~5 s, how long producers waited for a
+        // contended queue lock vs a full queue, and how full the queue was.
+        inline static const bool s_queueStats = std::getenv("ATV_GS_QUEUE_STATS") != nullptr;
+        mutable uint64_t m_statFlushes = 0, m_statContended = 0, m_statFull = 0, m_statLockNs = 0,
+                         m_statFullNs = 0, m_statQueuedSum = 0, m_statNonEmpty = 0, m_statStartNs = 0;
+
+        static uint64_t statNowNs()
+        {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count());
+        }
+
+        void flushStagedStatsLocked(Command *extra) const
+        {
+            const uint64_t t0 = statNowNs();
+            if (m_statStartNs == 0)
+                m_statStartNs = t0;
+            std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+            if (!lock.owns_lock())
+            {
+                lock.lock();
+                ++m_statContended;
+                m_statLockNs += statNowNs() - t0;
+            }
+            if (m_queue.size() >= kMaxQueued)
+            {
+                const uint64_t t1 = statNowNs();
+                m_changed.wait(lock, [&]
+                               { return m_queue.size() < kMaxQueued; });
+                ++m_statFull;
+                m_statFullNs += statNowNs() - t1;
+            }
+            ++m_statFlushes;
+            m_statQueuedSum += m_queue.size();
+            m_statNonEmpty += m_queue.empty() ? 0u : 1u;
+            appendStagedLocked(extra);
+            const uint64_t now = statNowNs();
+            if (now - m_statStartNs >= 5000000000ull)
+            {
+                std::fprintf(stderr,
+                             "[gs-queue] wall_ms=%.0f flushes=%llu contended=%llu lock_ms=%.1f full=%llu full_ms=%.1f "
+                             "avg_queued=%.0f nonempty=%llu race=%d\n",
+                             (now - m_statStartNs) / 1e6, static_cast<unsigned long long>(m_statFlushes),
+                             static_cast<unsigned long long>(m_statContended), m_statLockNs / 1e6,
+                             static_cast<unsigned long long>(m_statFull), m_statFullNs / 1e6,
+                             m_statFlushes ? static_cast<double>(m_statQueuedSum) / m_statFlushes : 0.0,
+                             static_cast<unsigned long long>(m_statNonEmpty), g_raceLoadStarted ? 1 : 0);
+                m_statStartNs = now;
+                m_statFlushes = m_statContended = m_statFull = m_statLockNs = m_statFullNs = 0;
+                m_statQueuedSum = m_statNonEmpty = 0;
+            }
+        }
+
+        // Requires m_stageMutex and m_mutex.
+        void appendStagedLocked(Command *extra) const
+        {
+            const bool wasEmpty = m_queue.empty();
+            m_pushedSeq += m_staged.size();
+            if (wasEmpty)
+                m_queue.swap(m_staged); // usual case: no per-command copy
+            else
+                for (Command &staged : m_staged)
+                    m_queue.push_back(std::move(staged));
+            m_staged.clear();
+            if (extra)
+            {
+                m_queue.push_back(std::move(*extra));
+                ++m_pushedSeq;
+            }
+            if (wasEmpty && !m_queue.empty())
+                m_wake.notify_one();
+        }
+
+        void waitIdleLocked(std::unique_lock<std::mutex> &lock) const
+        {
+            m_changed.wait(lock, [&]
+                           { return m_queue.empty() && !m_busy; });
+        }
+
+        // Waits only for the commands queued before the call: a producer that
+        // never lets the queue go idle (FMV macroblock uploads) would otherwise
+        // starve the window thread. Holding m_mutex during fn would block every
+        // push from the EE for the whole call (Present copies and converts all
+        // of VRAM); the inner backend serializes its own calls.
+        template <typename Fn>
+        void syncCall(Fn &&fn) const
+        {
+            {
+                std::lock_guard<std::mutex> stageLock(m_stageMutex);
+                flushStagedLocked(nullptr);
+            }
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                const uint64_t target = m_pushedSeq;
+                m_changed.wait(lock, [&]
+                               { return m_doneSeq >= target; });
+            }
+            fn();
+        }
+
+    public:
+        // Presentation: snapshot local memory after exactly the commands
+        // submitted so far (unlike syncCall + SnapshotVram, which reads VRAM
+        // while the worker may already run newer commands). QueueSnapshot
+        // returns at once; WaitSnapshot waits for that command.
+        uint64_t QueueSnapshot(std::vector<uint8_t> &out)
+        {
+            Command command{SnapshotCommand{&out}};
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            flushStagedLocked(&command);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_pushedSeq;
+        }
+        void WaitSnapshot(uint64_t target) const
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_changed.wait(lock, [&]
+                           { return m_doneSeq >= target; });
+        }
+
+    private:
+        void refreshTransfer() const
+        {
+            const GSTransferSnapshot snapshot = m_inner->GetTransferSnapshot();
+            std::lock_guard<std::mutex> lock(m_transferMutex);
+            m_transfer = snapshot;
+        }
+
+        void execute(Command &command)
+        {
+            if (auto *batch = std::get_if<GSPrimitiveBatch>(&command))
+                m_inner->Submit(*batch);
+            else if (auto *clut = std::get_if<ClutCommand>(&command))
+                m_inner->LoadClut(clut->tex0, clut->texclut);
+            else if (auto *transfer = std::get_if<GSTransferCommand>(&command))
+            {
+                m_inner->BeginTransfer(*transfer);
+                refreshTransfer();
+            }
+            else if (auto *upload = std::get_if<UploadCommand>(&command))
+            {
+                m_inner->UploadImage(upload->data.data(), static_cast<uint32_t>(upload->data.size()));
+                refreshTransfer();
+            }
+            else if (std::holds_alternative<FlushCommand>(command))
+                m_inner->Flush();
+            else if (std::holds_alternative<TextureFlushCommand>(command))
+                m_inner->TextureFlush();
+            else if (auto *write = std::get_if<WriteVramCommand>(&command))
+                m_inner->WriteVram(write->psm, write->base, write->bw, write->x, write->y, write->value);
+            else if (auto *snap = std::get_if<SnapshotCommand>(&command))
+                m_inner->SnapshotVram(*snap->out);
+        }
+
+        void workerLoop()
+        {
+            static const bool s_profileWorker = std::getenv("ATV_HOST_PROFILE_GS") != nullptr;
+            bool profilerStarted = false;
+            std::vector<Command> batch;
+            uint64_t batchEnd = 0;
+            uint64_t workerBusyNs = 0, workerCommands = 0, workerBatches = 0, workerStatStart = 0;
+            for (;;)
+            {
+                // ATV_HOST_PROFILE_GS=1 profiles the race; =2 from boot (menus).
+                static const bool s_profileWorkerAlways = []
+                {
+                    const char *env = std::getenv("ATV_HOST_PROFILE_GS");
+                    return env && env[0] == '2';
+                }();
+                if (s_profileWorker && !profilerStarted && (g_raceLoadStarted || s_profileWorkerAlways))
+                {
+                    profilerStarted = true;
+                    atvStartHostProfilerForThisThread();
+                }
+                {
+                    std::unique_lock<std::mutex> lock(m_mutex);
+                    m_busy = false;
+                    m_doneSeq = batchEnd;
+                    m_changed.notify_all();
+                    m_wake.wait(lock, [&]
+                                { return m_stop || !m_queue.empty(); });
+                    if (m_queue.empty())
+                        return;
+                    batch.swap(m_queue);
+                    batchEnd = m_pushedSeq;
+                    m_busy = true;
+                }
+                m_changed.notify_all();
+                const uint64_t busyStart = s_queueStats ? statNowNs() : 0u;
+                for (Command &command : batch)
+                    execute(command);
+                if (s_queueStats)
+                {
+                    const uint64_t now = statNowNs();
+                    workerBusyNs += now - busyStart;
+                    workerCommands += batch.size();
+                    ++workerBatches;
+                    if (workerStatStart == 0)
+                        workerStatStart = busyStart;
+                    if (now - workerStatStart >= 5000000000ull)
+                    {
+                        std::fprintf(stderr, "[gs-worker] wall_ms=%.0f busy_ms=%.0f batches=%llu commands=%llu\n",
+                                     (now - workerStatStart) / 1e6, workerBusyNs / 1e6,
+                                     static_cast<unsigned long long>(workerBatches),
+                                     static_cast<unsigned long long>(workerCommands));
+                        workerStatStart = now;
+                        workerBusyNs = workerCommands = workerBatches = 0;
+                    }
+                }
+                batch.clear();
+            }
+        }
+
+        std::unique_ptr<GSRasterBackend> m_inner;
+        // Lock order: m_stageMutex before m_mutex. The worker never takes it.
+        mutable std::mutex m_stageMutex;
+        mutable std::vector<Command> m_staged;
+        std::array<uint32_t, 2> m_clutCbpMirror{};
+        mutable std::mutex m_mutex;
+        mutable std::condition_variable m_changed;
+        mutable std::condition_variable m_wake;
+        mutable std::vector<Command> m_queue;
+        mutable uint64_t m_pushedSeq = 0;
+        uint64_t m_doneSeq = 0;
+        bool m_busy = false;
+        bool m_stop = false;
+        mutable std::mutex m_transferMutex;
+        mutable GSTransferSnapshot m_transfer{};
+        std::thread m_worker;
+    };
+
+    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
+    {
+        static const bool s_threaded = std::getenv("ATV_GS_THREAD") != nullptr;
+        auto backend = std::make_unique<GSCpuBackend>();
+        if (!s_threaded)
+            return backend;
+        std::fprintf(stderr, "[gs] threaded raster backend enabled\n");
+        return std::make_unique<GSThreadedBackend>(std::move(backend));
+    }
+
+    // Opt-in (ATV_GS_GIF_THREAD=1, set by play_game.bat and benchmark_game.ps1
+    // since session 32; GS tests observe the backend synchronously and run
+    // without it): GS::processGIFPacket only queues a copy of
+    // the packet and a dedicated thread parses packets in submission order.
+    // Every other public GS entry point (GSApiScope) and the EE GS privileged
+    // register accessors (gsSyncAsyncGif) first complete all queued packets on
+    // the calling thread, so any observer sees the same state as inline parsing.
+    // Lock order: processMutex -> GS::m_stateMutex; queueMutex is a leaf.
+    bool asyncGifEnabled()
+    {
+        static const bool s_enabled = []
+        {
+            const char *env = std::getenv("ATV_GS_GIF_THREAD");
+            return env && env[0] != '\0' && env[0] != '0';
+        }();
+        return s_enabled;
+    }
+
+    struct AsyncGifQueue
+    {
+        GS *gs = nullptr;
+        std::mutex queueMutex;
+        std::condition_variable wake;
+        std::deque<std::vector<uint8_t>> queue;
+        std::vector<std::vector<uint8_t>> pool;
+        bool sleeping = false;
+        std::mutex processMutex;
+        // Queued plus in-flight packets; reaches zero only after the last
+        // packet's GS state changes are complete.
+        std::atomic<uint32_t> pending{0u};
+    };
+
+    std::atomic<AsyncGifQueue *> s_asyncGif{nullptr};
+    std::once_flag s_asyncGifOnce;
+    thread_local bool t_gsGifDirect = false;
+    thread_local uint32_t t_gsApiDepth = 0u;
+
+    constexpr uint32_t kAsyncGifMaxPending = 4096u;
+
+    // Caller holds processMutex and has t_gsGifDirect set.
+    void asyncGifProcessQueued(AsyncGifQueue &q)
+    {
+        std::vector<uint8_t> packet;
+        bool havePacket = false;
+        for (;;)
+        {
+            {
+                std::lock_guard<std::mutex> lock(q.queueMutex);
+                if (havePacket)
+                    q.pool.push_back(std::move(packet));
+                if (q.queue.empty())
+                    return;
+                packet = std::move(q.queue.front());
+                q.queue.pop_front();
+                havePacket = true;
+            }
+            q.gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+            q.pending.fetch_sub(1u, std::memory_order_release);
+        }
+    }
+
+    void asyncGifThreadMain(AsyncGifQueue *q)
+    {
+        atvStartHostProfilerForThisThread();
+        t_gsGifDirect = true;
+        static const uint32_t s_spin = []
+        {
+            const char *env = std::getenv("ATV_GS_GIF_SPIN");
+            return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 2000u;
+        }();
+        for (;;)
+        {
+            for (uint32_t i = 0u; i < s_spin && q->pending.load(std::memory_order_acquire) == 0u; ++i)
+                _mm_pause();
+            if (q->pending.load(std::memory_order_acquire) == 0u)
+            {
+                std::unique_lock<std::mutex> lock(q->queueMutex);
+                q->sleeping = true;
+                q->wake.wait(lock, [q]
+                             { return !q->queue.empty(); });
+                q->sleeping = false;
+            }
+            std::lock_guard<std::mutex> process(q->processMutex);
+            asyncGifProcessQueued(*q);
+        }
+    }
+
+    AsyncGifQueue *asyncGifQueueFor(GS *gs)
+    {
+        std::call_once(s_asyncGifOnce, [gs]
+                       {
+            auto *q = new AsyncGifQueue();
+            q->gs = gs;
+            s_asyncGif.store(q, std::memory_order_release);
+            std::thread(asyncGifThreadMain, q).detach();
+            std::fprintf(stderr, "[gs] async GIF thread enabled\n"); });
+        AsyncGifQueue *q = s_asyncGif.load(std::memory_order_acquire);
+        return (q && q->gs == gs) ? q : nullptr;
+    }
+
+    // ATV_GIF_DRAIN_STATS=1: every ~5 s, per call site, how often a GS
+    // access had to drain queued GIF packets, time spent waiting for the GIF
+    // thread to release processMutex, and packets processed inline.
+    struct GifDrainStat
+    {
+        const char *site;
+        std::thread::id tid;
+        uint64_t drains, waitNs, inlinePackets;
+    };
+    void gifDrainStatRecord(const char *site, uint64_t waitNs, uint64_t packets)
+    {
+        static std::mutex s_m;
+        static std::vector<GifDrainStat> s_stats;
+        static auto s_start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(s_m);
+        GifDrainStat *st = nullptr;
+        const std::thread::id tid = std::this_thread::get_id();
+        for (GifDrainStat &e : s_stats)
+            if (e.site == site && e.tid == tid)
+                st = &e;
+        if (!st)
+        {
+            s_stats.push_back({site, tid, 0, 0, 0});
+            st = &s_stats.back();
+        }
+        ++st->drains;
+        st->waitNs += waitNs;
+        st->inlinePackets += packets;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_start < std::chrono::seconds(5))
+            return;
+        s_start = now;
+        for (GifDrainStat &e : s_stats)
+        {
+            if (e.drains)
+                std::fprintf(stderr, "[gif-drain] tid=%zu %-36s drains=%llu wait_ms=%.1f inline_pkts=%llu\n",
+                             std::hash<std::thread::id>{}(e.tid) % 1000u, e.site,
+                             static_cast<unsigned long long>(e.drains), e.waitNs / 1e6,
+                             static_cast<unsigned long long>(e.inlinePackets));
+            e.drains = e.waitNs = e.inlinePackets = 0;
+        }
+    }
+
+    void asyncGifDrain(const char *site = "gsSyncAsyncGif")
+    {
+        static const bool s_stats = std::getenv("ATV_GIF_DRAIN_STATS") != nullptr;
+        AsyncGifQueue *q = s_asyncGif.load(std::memory_order_acquire);
+        if (!q || t_gsGifDirect)
+            return;
+        const uint32_t pendingBefore = q->pending.load(std::memory_order_acquire);
+        if (pendingBefore == 0u)
+            return;
+        const auto t0 = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        std::lock_guard<std::mutex> process(q->processMutex);
+        const auto t1 = s_stats ? std::chrono::steady_clock::now() : t0;
+        const uint32_t pendingLocked = q->pending.load(std::memory_order_acquire);
+        t_gsGifDirect = true;
+        asyncGifProcessQueued(*q);
+        t_gsGifDirect = false;
+        if (s_stats)
+            gifDrainStatRecord(site, static_cast<uint64_t>(
+                                         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+                               pendingLocked);
+    }
+
+    bool asyncGifEnqueue(GS *gs, const uint8_t *data, uint32_t sizeBytes)
+    {
+        AsyncGifQueue *q = asyncGifQueueFor(gs);
+        if (!q)
+            return false;
+        if (q->pending.load(std::memory_order_relaxed) >= kAsyncGifMaxPending)
+            asyncGifDrain("queueFull");
+
+        std::vector<uint8_t> packet;
+        {
+            std::lock_guard<std::mutex> lock(q->queueMutex);
+            if (!q->pool.empty())
+            {
+                packet = std::move(q->pool.back());
+                q->pool.pop_back();
+            }
+        }
+        packet.assign(data, data + sizeBytes);
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lock(q->queueMutex);
+            q->queue.push_back(std::move(packet));
+            q->pending.fetch_add(1u, std::memory_order_relaxed);
+            notify = q->sleeping;
+        }
+        if (notify)
+            q->wake.notify_one();
+        return true;
+    }
+
+    // Nested GS API calls skip the drain: only the outermost call on a thread
+    // may take processMutex, since inner calls already hold GS::m_stateMutex.
+    struct GSApiScope
+    {
+        explicit GSApiScope(const char *site)
+        {
+            if (t_gsApiDepth++ == 0u)
+                asyncGifDrain(site);
+        }
+        ~GSApiScope() { --t_gsApiDepth; }
+        GSApiScope(const GSApiScope &) = delete;
+        GSApiScope &operator=(const GSApiScope &) = delete;
+    };
+}
+
+void gsSyncAsyncGif()
+{
+    if (t_gsApiDepth == 0u)
+        asyncGifDrain("privReg");
 }
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultRasterBackend())
 {
     reset();
 }
 
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
+    GSApiScope apiScope{__func__};
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = makeDefaultRasterBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
 
 void GS::reset()
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
@@ -154,7 +996,7 @@ void GS::reset()
     m_dimx = 0u;
     m_dthe = 0u;
     m_colclamp = 0u;
-    m_texa = {0u, false, 0u};
+    m_texa = {0u, false, 0x80u};
     m_texclut = {0u, 0u, 0u};
     m_bitbltbuf = {};
     m_trxpos = {};
@@ -231,6 +1073,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 
 GSDebugSnapshot GS::getDebugSnapshot() const
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
     GSDebugSnapshot snapshot{};
@@ -271,6 +1114,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
 
 std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
 
     std::vector<GSDebugHistoryEntry> out;
@@ -285,6 +1129,7 @@ std::vector<GSDebugHistoryEntry> GS::getDebugHistory() const
 
 void GS::clearDebugHistory()
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
@@ -295,12 +1140,14 @@ void GS::clearDebugHistory()
 
 bool GS::isDebugHistoryPaused() const
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_debugHistoryPaused;
 }
 
 void GS::setDebugHistoryPaused(bool paused)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_debugHistoryPaused = paused;
 }
@@ -481,6 +1328,7 @@ void GS::recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp
 
 bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
     {
@@ -501,11 +1349,13 @@ void GS::unlockDisplaySnapshot()
 
 uint32_t GS::getLastDisplayBaseBytes() const
 {
+    GSApiScope apiScope{__func__};
     return m_lastDisplayBaseBytes;
 }
 
 void GS::refreshDisplaySnapshot()
 {
+    GSApiScope apiScope{__func__};
     snapshotVRAM();
 }
 
@@ -532,7 +1382,21 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    GSApiScope apiScope{__func__};
     GSPresentationRequest request{};
+    // The display registers and the local-memory snapshot must describe the
+    // same point of the GS command stream. Taking them in separate steps let
+    // the game flip DISPFB and start its next frame (clear, sky, terrain) in
+    // the buffer the request still named, which showed up as half-drawn
+    // frames without rider or HUD. m_stateMutex keeps GIF parsing (and so
+    // every new draw) out while the request is built and the snapshot is
+    // queued at that point of the backend's command stream; waiting for the
+    // snapshot and the display conversion run without it.
+    thread_local std::vector<uint8_t> snapshot;
+    snapshot.clear();
+    std::unique_lock<std::mutex> backendLock;
+    GSThreadedBackend *threaded = nullptr;
+    uint64_t snapshotSeq = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         if (!m_backend || !m_privRegs)
@@ -544,18 +1408,22 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
-    }
-
-    PresentationFrame frame{};
-    {
-        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
-        if (m_backend)
+        backendLock = std::unique_lock<std::mutex>(m_backendLifetimeMutex);
+        threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get());
+        if (threaded)
+            snapshotSeq = threaded->QueueSnapshot(snapshot);
+        else if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
-            frame = m_backend->Present(request);
+            m_backend->SnapshotVram(snapshot);
         }
     }
+    if (threaded)
+        threaded->WaitSnapshot(snapshotSeq);
+    backendLock = {};
+
+    PresentationFrame frame = GSCpuBackend::PresentSnapshot(snapshot, request);
 
     const bool hasFrame = static_cast<bool>(frame);
     const uint32_t displayFbp = frame.displayFbp;
@@ -646,6 +1514,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (asyncGifEnabled() && !t_gsGifDirect && data && sizeBytes >= 16u && asyncGifEnqueue(this, data, sizeBytes))
+        return;
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
@@ -731,7 +1601,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else // GIF_FMT_IMAGE, or FLG 3 which the GIF treats as IMAGE
+        else if (flg == GIF_FMT_IMAGE)
         {
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
@@ -744,6 +1614,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
@@ -789,6 +1660,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
@@ -914,9 +1786,22 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     {
         uint16_t x = static_cast<uint16_t>(lo & 0xFFFF);
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
+        // GIF PACKED XYZF: Z occupies bits 68..91, F bits 100..107.
+        // Unlike the 64-bit A+D register layout, each starts after 4 padding bits.
         uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
         uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
         bool adk = ((hi >> 47) & 1) != 0;
+        if (g_raceLoadStarted)
+        {
+            static uint32_t s_xyzfLogs = 0u;
+            if (s_xyzfLogs < 32u)
+            {
+                std::fprintf(stderr,
+                    "[gs:xyzf2] n=%u lo=%016llx hi=%016llx x=%u y=%u z=%u fog=%u adk=%d\n",
+                    s_xyzfLogs, lo, hi, x, y, z, static_cast<uint32_t>(f), adk ? 1 : 0);
+                ++s_xyzfLogs;
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -955,6 +1840,17 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
         uint32_t z = static_cast<uint32_t>(hi & 0xFFFFFFFF);
         bool adk = ((hi >> 47) & 1) != 0;
+        if (g_raceLoadStarted)
+        {
+            static uint32_t s_xyz2Logs = 0u;
+            if (s_xyz2Logs < 32u)
+            {
+                std::fprintf(stderr,
+                    "[gs:xyz2] n=%u lo=%016llx hi=%016llx x=%u y=%u z=%u curFog=%u adk=%d\n",
+                    s_xyz2Logs, lo, hi, x, y, z, static_cast<uint32_t>(m_curFog), adk ? 1 : 0);
+                ++s_xyz2Logs;
+            }
+        }
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -987,8 +1883,20 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         break;
     }
     case 0x0A:
+    {
         m_curFog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        if (g_raceLoadStarted)
+        {
+            static uint32_t s_fogLogs = 0u;
+            if (s_fogLogs < 32u)
+            {
+                std::fprintf(stderr, "[gs:fog] n=%u lo=%016llx hi=%016llx newFog=%u\n",
+                    s_fogLogs, lo, hi, static_cast<uint32_t>(m_curFog));
+                ++s_fogLogs;
+            }
+        }
         break;
+    }
     case 0x0C:
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -1017,6 +1925,16 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        if (g_raceLoadStarted)
+        {
+            static uint32_t s_xyzf3Logs = 0u;
+            if (s_xyzf3Logs < 32u)
+            {
+                std::fprintf(stderr, "[gs:xyzf3] n=%u lo=%016llx hi=%016llx fog=%u\n",
+                    s_xyzf3Logs, lo, hi, static_cast<uint32_t>(vtx.fog));
+                ++s_xyzf3Logs;
+            }
+        }
         vertexKick(false);
         break;
     }
@@ -1067,6 +1985,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1196,6 +2115,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
         vtx.fog = static_cast<uint8_t>((value >> 56) & 0xFF);
+        if (traceGsViewportEnabled())
+            traceGsViewportKick(vtx.x, vtx.y);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1215,6 +2136,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFFFF);
+        if (traceGsViewportEnabled())
+            traceGsViewportKick(vtx.x, vtx.y);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1245,7 +2168,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        loadBackendClut(m_backend.get(), t, m_texclut);
+        m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1276,13 +2199,19 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        loadBackendClut(m_backend.get(), t, m_texclut);
+        m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:
     case GS_REG_XYOFFSET_2:
     {
         int ci = (regAddr == GS_REG_XYOFFSET_2) ? 1 : 0;
+        if (traceGsViewportEnabled())
+        {
+            const uint64_t oldValue = static_cast<uint64_t>(m_ctx[ci].xyoffset.ofx) |
+                                      (static_cast<uint64_t>(m_ctx[ci].xyoffset.ofy) << 32);
+            traceGsViewportWrite(ci ? "XYOFFSET_2" : "XYOFFSET_1", oldValue, value & 0x0000FFFF0000FFFFull, true);
+        }
         m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(value & 0xFFFF);
         m_ctx[ci].xyoffset.ofy = static_cast<uint16_t>((value >> 32) & 0xFFFF);
         break;
@@ -1315,6 +2244,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_SCISSOR_2:
     {
         int ci = (regAddr == GS_REG_SCISSOR_2) ? 1 : 0;
+        if (traceGsViewportEnabled())
+        {
+            const uint64_t oldValue = static_cast<uint64_t>(m_ctx[ci].scissor.x0) |
+                                      (static_cast<uint64_t>(m_ctx[ci].scissor.x1) << 16) |
+                                      (static_cast<uint64_t>(m_ctx[ci].scissor.y0) << 32) |
+                                      (static_cast<uint64_t>(m_ctx[ci].scissor.y1) << 48);
+            traceGsViewportWrite(ci ? "SCISSOR_2" : "SCISSOR_1", oldValue, value & 0x07FF07FF07FF07FFull, false);
+        }
         m_ctx[ci].scissor.x0 = static_cast<uint16_t>(value & 0x7FF);
         m_ctx[ci].scissor.x1 = static_cast<uint16_t>((value >> 16) & 0x7FF);
         m_ctx[ci].scissor.y0 = static_cast<uint16_t>((value >> 32) & 0x7FF);
@@ -1340,9 +2277,28 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
         m_ctx[ci].frame.fbp = static_cast<uint32_t>(value & 0x1FF);
-        m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
+        uint32_t fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
+        if (fbw == 0u)
+        {
+            fbw = 10u; // Default to 10 blocks (640 / 64) when FBW is 0
+        }
+        m_ctx[ci].frame.fbw = fbw;
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
         m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+        {
+            static uint32_t s_frameLogs = 0u;
+            if (s_frameLogs < 32u)
+            {
+                std::fprintf(stderr,
+                             "[gs:frame] ctx=%d fbp=%u fbw=%u psm=0x%x fbmsk=0x%x\n",
+                             ci,
+                             m_ctx[ci].frame.fbp,
+                             m_ctx[ci].frame.fbw,
+                             static_cast<uint32_t>(m_ctx[ci].frame.psm),
+                             m_ctx[ci].frame.fbmsk);
+                ++s_frameLogs;
+            }
+        }
         break;
     }
     case GS_REG_ZBUF_1:
@@ -1398,6 +2354,55 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
             m_backend->BeginTransfer(command);
+        }
+        if (m_trxdir == 0u && m_bitbltbuf.dbp >= 0x3400u && m_bitbltbuf.dbp < 0x3E00u &&
+            s_texPoolLines < 800u && texPoolTraceActive())
+        {
+            std::snprintf(s_texPoolUploads[s_texPoolUploadSeq & 7u], sizeof(s_texPoolUploads[0]),
+                          "[texpool] upload #%llu dbp=0x%x dbw=%u dpsm=0x%x rr=%ux%u dsa=(%u,%u)\n",
+                          static_cast<unsigned long long>(s_texPoolUploadSeq), m_bitbltbuf.dbp,
+                          static_cast<uint32_t>(m_bitbltbuf.dbw), static_cast<uint32_t>(m_bitbltbuf.dpsm),
+                          static_cast<uint32_t>(m_trxreg.rrw), static_cast<uint32_t>(m_trxreg.rrh),
+                          static_cast<uint32_t>(m_trxpos.dsax), static_cast<uint32_t>(m_trxpos.dsay));
+            ++s_texPoolUploadSeq;
+            if (s_texPoolUploadCount < 8u)
+                ++s_texPoolUploadCount;
+            ++s_texPoolUploadsSinceArrow;
+        }
+        {
+            static uint32_t s_blits = 0u;
+            static uint32_t s_blitTotal = 0u;
+            static uint32_t s_uniqueHigh = 0u;
+            static uint32_t s_fbBlits = 0u;
+            ++s_blitTotal;
+            const bool highTex = (m_bitbltbuf.dpsm == 0x2u &&
+                                  m_bitbltbuf.dbp >= 0x3400u && m_bitbltbuf.dbp < 0x3C00u);
+            const bool fbBlit = (m_bitbltbuf.dbp < 0x2000u && m_trxdir == 0u);
+            if ((m_bitbltbuf.dbp >= 0x2000u && s_blits < 16u) ||
+                (highTex && s_uniqueHigh < 128u) ||
+                (fbBlit && s_fbBlits < 16u))
+            {
+                std::fprintf(stderr,
+                             "[gs:blit] n=%u total=%u dir=%u dbp=0x%x dbw=%u dpsm=0x%x sbp=0x%x "
+                             "rrw=%u rrh=%u dsax=%u dsay=%u\n",
+                             s_blits,
+                             s_blitTotal,
+                             m_trxdir,
+                             m_bitbltbuf.dbp,
+                             static_cast<uint32_t>(m_bitbltbuf.dbw),
+                             static_cast<uint32_t>(m_bitbltbuf.dpsm),
+                             m_bitbltbuf.sbp,
+                             static_cast<uint32_t>(m_trxreg.rrw),
+                             static_cast<uint32_t>(m_trxreg.rrh),
+                             static_cast<uint32_t>(m_trxpos.dsax),
+                             static_cast<uint32_t>(m_trxpos.dsay));
+                if (m_bitbltbuf.dbp >= 0x2000u && s_blits < 16u)
+                    ++s_blits;
+                if (highTex)
+                    ++s_uniqueHigh;
+                if (fbBlit)
+                    ++s_fbBlits;
+            }
         }
         recordTransferDebugEventUnlocked();
         break;
@@ -1509,7 +2514,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5a:
         if (m_privRegs)
+        {
+            // Repair sign-extended DISPLAY (DW=0xFFF / DH=0x7FF) from GIF PATH3.
+            const uint32_t dw = static_cast<uint32_t>((value >> 32) & 0x0FFFu);
+            const uint32_t dh = static_cast<uint32_t>((value >> 44) & 0x07FFu);
+            if (dw == 0x0FFFu || dh == 0x07FFu)
+            {
+                value = (652ull << 0) | (50ull << 12) | (3ull << 23) | (0ull << 27) |
+                        (2556ull << 32) | (447ull << 44);
+            }
             m_privRegs->display1 = value;
+        }
         break;
     case 0x5b:
         if (m_privRegs)
@@ -1517,7 +2532,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5c:
         if (m_privRegs)
+        {
+            const uint32_t dw = static_cast<uint32_t>((value >> 32) & 0x0FFFu);
+            const uint32_t dh = static_cast<uint32_t>((value >> 44) & 0x07FFu);
+            if (dw == 0x0FFFu || dh == 0x07FFu)
+            {
+                value = (652ull << 0) | (50ull << 12) | (3ull << 23) | (0ull << 27) |
+                        (2556ull << 32) | (447ull << 44);
+            }
             m_privRegs->display2 = value;
+        }
         break;
     case 0x5f:
         if (m_privRegs)
@@ -1581,6 +2605,40 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        if (batch.state.prim.tme && batch.state.context.tex0.tw == 5u && batch.state.context.tex0.th == 6u &&
+            s_texPoolLines < 800u && texPoolTraceActive())
+        {
+            const GSTex0Reg &tex0 = batch.state.context.tex0;
+            if (tex0.tbp0 != s_texPoolLastArrowTbp || s_texPoolUploadsSinceArrow != 0u)
+            {
+                if (s_texPoolArrowRun > 1u)
+                    std::fprintf(stderr, "[texpool]   (+%u more arrow prims)\n", s_texPoolArrowRun - 1u);
+                const uint32_t shown = std::min(s_texPoolUploadsSinceArrow, s_texPoolUploadCount);
+                for (uint32_t i = shown; i > 0u; --i)
+                {
+                    ++s_texPoolLines;
+                    std::fputs(s_texPoolUploads[(s_texPoolUploadSeq - i) & 7u], stderr);
+                }
+                s_texPoolUploadsSinceArrow = 0u;
+                ++s_texPoolLines;
+                std::fprintf(stderr,
+                             "[texpool] draw tbp=0x%x tbw=%u psm=0x%x tcc=%u tfx=%u cbp=0x%x cpsm=0x%x fbp=%u "
+                             "type=%u xy=(%.1f,%.1f) q=%g rgba=(%u,%u,%u,%u)\n",
+                             tex0.tbp0, static_cast<uint32_t>(tex0.tbw), static_cast<uint32_t>(tex0.psm),
+                             static_cast<uint32_t>(tex0.tcc), static_cast<uint32_t>(tex0.tfx), tex0.cbp,
+                             static_cast<uint32_t>(tex0.cpsm), batch.state.context.frame.fbp,
+                             static_cast<uint32_t>(batch.state.prim.type), batch.vertices[0].x,
+                             batch.vertices[0].y, batch.vertices[0].q,
+                             static_cast<uint32_t>(batch.vertices[0].r), static_cast<uint32_t>(batch.vertices[0].g),
+                             static_cast<uint32_t>(batch.vertices[0].b), static_cast<uint32_t>(batch.vertices[0].a));
+                s_texPoolLastArrowTbp = tex0.tbp0;
+                s_texPoolArrowRun = 1u;
+            }
+            else
+            {
+                ++s_texPoolArrowRun;
+            }
+        }
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
@@ -1622,26 +2680,30 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
+    GSApiScope apiScope{__func__};
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = makeDefaultRasterBackend();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
@@ -1669,12 +2731,14 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ReadVram(psm, base, bw, x, y) : 0u;
 }
 
 void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
+    GSApiScope apiScope{__func__};
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend)
         m_backend->WriteVram(psm, base, bw, x, y, value);
@@ -1711,6 +2775,29 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
+    // ATV_TRACE_FLIP=1 (diagnostic): draws into the buffer DISPFB1 currently
+    // shows vs. into other buffers, printed every 20000 draws.
+    static const bool s_traceFlip = std::getenv("ATV_TRACE_FLIP") != nullptr;
+    if (s_traceFlip && m_privRegs)
+    {
+        static uint64_t s_front = 0, s_back = 0, s_frontRuns = 0;
+        static bool s_lastFront = false;
+        const uint32_t shown = static_cast<uint32_t>(m_privRegs->dispfb1 & 0x1FFu);
+        const bool front = ctx.frame.fbp == shown;
+        if (front)
+        {
+            ++s_front;
+            if (!s_lastFront)
+                ++s_frontRuns;
+        }
+        else
+            ++s_back;
+        s_lastFront = front;
+        if ((s_front + s_back) % 20000u == 0u)
+            std::fprintf(stderr, "[flip-trace] draws front=%llu back=%llu frontRuns=%llu shownFbp=%u drawFbp=%u\n",
+                         static_cast<unsigned long long>(s_front), static_cast<unsigned long long>(s_back),
+                         static_cast<unsigned long long>(s_frontRuns), shown, ctx.frame.fbp);
+    }
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
         m_hasPreferredDisplaySource = false;
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)
@@ -1734,6 +2821,19 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
                              x0 <= 0 && y0 <= 0 && xEnd >= 639 && yEnd >= 447;
     if (displayCopy)
     {
+        static uint32_t s_prefLogs = 0u;
+        if (s_prefLogs < 4u)
+        {
+            std::fprintf(stderr,
+                         "[gs:pref] destFbp=%u tbp0=%u tbw=%u psm=0x%x alpha=0x%x fix=0x%x\n",
+                         ctx.frame.fbp,
+                         ctx.tex0.tbp0,
+                         static_cast<uint32_t>(ctx.tex0.tbw),
+                         static_cast<uint32_t>(ctx.tex0.psm),
+                         alphaMode,
+                         alphaFix);
+            ++s_prefLogs;
+        }
         m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;

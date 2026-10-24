@@ -7098,3 +7098,8 @@ PS2_REGISTER_GAME_OVERRIDE(
     0x00100008u,
     0u,
     applyScus97211Overrides);
+
+// The GS worker threads (ported from ATV1) call this to start ATV1's optional host profiler; ATV2 has none.
+void atvStartHostProfilerForThisThread()
+{
+}
