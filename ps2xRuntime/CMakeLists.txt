@@ -578,6 +578,10 @@ endif()
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+    # Guest calls nest as native calls and some recompiled functions have very large frames
+    # (ATV2 0x1148C0 recursing ~5 deep overflowed the 1 MB default). Reserve 64 MB per thread;
+    # only touched pages are committed.
+    target_link_options(ps2EntryRunner PRIVATE "/STACK:67108864")
 endif()
 
 # Vita: Work around for GCC 10's LTO plugin

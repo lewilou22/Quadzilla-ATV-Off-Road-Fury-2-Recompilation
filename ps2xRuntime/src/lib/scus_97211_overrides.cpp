@@ -6443,7 +6443,17 @@ namespace
             static int s_reads = 0;
             if (s_untilRace && READ32(0x005425E0u + 0xCCu) == 2u && READ32(0x005425E0u + 0x1Cu) == 0u)
             {
-                // Race running: leave the pad alone.
+                // Race running: release any held press once, then leave the pad alone.
+                // ATV2_RACE_THROTTLE=1 instead holds Cross (throttle) for the whole race.
+                static const bool s_throttle = std::getenv("ATV2_RACE_THROTTLE") != nullptr;
+                static bool s_released = false;
+                if (s_throttle)
+                    ps2_stubs::setPadOverrideState(0xFFFFu & ~0x4000u, 0x80u, 0x80u, 0x80u, 0x80u);
+                else if (!s_released)
+                {
+                    s_released = true;
+                    ps2_stubs::clearPadOverrideState();
+                }
             }
             else if (s_autoCross > 0 && a0 == 0u)
             {
