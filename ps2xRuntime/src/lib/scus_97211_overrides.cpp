@@ -6109,6 +6109,12 @@ namespace
         {0x00188680u, "WaterBuild(0x188680)", nullptr, 0, 6},
         {0x00186CA0u, "GsStoreImage(0x186CA0)", nullptr, 0, 12},
         {0x00186EA0u, "GsStoreImageB(0x186EA0)", nullptr, 0, 12},
+        {0x0025B7C0u, "MovieStart(0x25B7C0)", nullptr, 0, 8},
+        {0x0018A510u, "MediaStartPlayback(0x18A510)", nullptr, 0, 8},
+        {0x0018AC80u, "MediaIsFinished(0x18AC80)", nullptr, 0, 6},
+        {0x0018AC20u, "MediaStop(0x18AC20)", nullptr, 0, 8},
+        {0x0018C7C0u, "MpegPictureUpdate(0x18C7C0)", nullptr, 0, 4},
+        {0x00256DF0u, "SplashUpdate(0x256DF0)", nullptr, 0, 12},
     };
 
     template <int I>
@@ -6124,6 +6130,7 @@ namespace
             std::cerr << "[ATV2:FETRACE] " << e.name << " call#" << e.calls
                       << " a0=0x" << std::hex << GPR_U32(ctx, 4)
                       << " a1=0x" << GPR_U32(ctx, 5)
+                      << " f12=" << ctx->f[12]
                       << " ra=0x" << GPR_U32(ctx, 31)
                       << " sp=0x" << GPR_U32(ctx, 29);
             const uint32_t a0 = GPR_U32(ctx, 4);
@@ -6427,6 +6434,9 @@ namespace
         {
             // ATV2_AUTO_CROSS=<n>: test aid, holds Cross for 8 port-0 reads starting at read n.
             static const int s_autoCross = []() { const char *s = std::getenv("ATV2_AUTO_CROSS"); return s ? std::atoi(s) : 0; }();
+            // ATV2_AUTO_CROSS_ONCE=1: repeat presses only while the front end is in state 12
+            // (memory card alert), so movies and menus are left alone.
+            static const bool s_autoCrossOnce = std::getenv("ATV2_AUTO_CROSS_ONCE") != nullptr;
             static int s_reads = 0;
             if (s_autoCross > 0 && a0 == 0u)
             {
@@ -6454,7 +6464,7 @@ namespace
                     }
                     ps2_stubs::setPadOverrideState(0xFFFFu & ~0x4000u, 0x80u, 0x80u, 0x80u, 0x80u);
                 }
-                else if (s_reads > s_autoCross && ((s_reads - s_autoCross) % 30) == 0)
+                else if (s_reads > s_autoCross && ((s_reads - s_autoCross) % 30) == 0 && (!s_autoCrossOnce || READ32(0x005425E0u + 0xCCu) == 12u))
                 {
                     const bool start = (((s_reads - s_autoCross) / 30) % 2) == 1;
                     std::cerr << "[ATV2:PAD] auto " << (start ? "Start" : "Cross") << " repeat at read " << s_reads << std::endl;
@@ -6646,7 +6656,7 @@ namespace
         const char *v = std::getenv("ATV2_TRACE_FE");
         if (v == nullptr || v[0] == '\0' || v[0] == '0')
             return;
-        registerFeTraceImpl(runtime, std::make_integer_sequence<int, 21>{});
+        registerFeTraceImpl(runtime, std::make_integer_sequence<int, 27>{});
     }
 
     void applyScus97211Overrides(PS2Runtime &runtime)
@@ -6816,10 +6826,16 @@ namespace
         runtime.replaceFunction(0x00370430u, &strtodR370430);
 
         // Movie & video playback bypass
-        runtime.replaceFunction(0x0025B7C0u, &movieStart25b7c0);
-        runtime.replaceFunction(0x0018AC80u, &mediaIsFinished18ac80);
-        runtime.replaceFunction(0x0018AC20u, &mediaStop18ac20);
-        runtime.replaceFunction(0x0018A510u, &mediaStartPlayback18a510);
+        // Movies are bypassed by default. ATV2_PLAY_MOVIES=1 plays them through the sceMpeg HLE
+        // (Rainbow plays to the end), but the front end then stalls on the title screen: its node
+        // is detached right after being attached (FUN_00256a70 from a resumed FE update) - open.
+        if (const char *play = std::getenv("ATV2_PLAY_MOVIES"); play == nullptr || play[0] == '0')
+        {
+            runtime.replaceFunction(0x0025B7C0u, &movieStart25b7c0);
+            runtime.replaceFunction(0x0018AC80u, &mediaIsFinished18ac80);
+            runtime.replaceFunction(0x0018AC20u, &mediaStop18ac20);
+            runtime.replaceFunction(0x0018A510u, &mediaStartPlayback18a510);
+        }
 
         // Frame limiter: ticks FrontendManager update and draw every frame
         runtime.replaceFunction(0x0015DA90u, &frameLimiter15da90);

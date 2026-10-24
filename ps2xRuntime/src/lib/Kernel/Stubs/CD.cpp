@@ -3,6 +3,8 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
 
 namespace ps2_iso9660
@@ -407,6 +409,51 @@ namespace ps2_stubs
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
         }
 
+        // Disc production clock in NTSC fields. Guest vblanks are gated on
+        // charged EE cycles, and movie playback spends most of its host time
+        // in HLE work (FFmpeg decode, GS) that charges none, so guest vsync
+        // nearly stops during the intro and the stream starved after its first
+        // burst (the movie replayed a few stale frames). Advance by whichever of
+        // guest vsyncs or host fields moved further, so the drive never reads
+        // slower than real time. ATV_CD_GUEST_CLOCK=1 restores guest-only.
+        uint64_t cdStreamClock(PS2Runtime *runtime)
+        {
+            static const bool s_guestOnly = std::getenv("ATV_CD_GUEST_CLOCK") != nullptr;
+            const uint64_t guest = currentCdStreamTick(runtime);
+            if (s_guestOnly || runtime == nullptr)
+            {
+                return guest;
+            }
+
+            using Clock = std::chrono::steady_clock;
+            static bool s_init = false;
+            static uint64_t s_value = 0u;
+            static uint64_t s_lastGuest = 0u;
+            static Clock::time_point s_hostBase;
+            static uint64_t s_hostFields = 0u;
+            const Clock::time_point now = Clock::now();
+            if (!s_init)
+            {
+                s_init = true;
+                s_value = guest;
+                s_lastGuest = guest;
+                s_hostBase = now;
+                return s_value;
+            }
+
+            // Host fields since base: us * 60000 / (1001 * 1e6).
+            const uint64_t us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - s_hostBase).count());
+            const uint64_t hostFields = us * kNtScFieldsPerSecondNumerator /
+                                        (kNtScFieldsPerSecondDenominator * 1000000u);
+            const uint64_t dh = hostFields - s_hostFields;
+            const uint64_t dg = guest > s_lastGuest ? guest - s_lastGuest : 0u;
+            s_hostFields = hostFields;
+            s_lastGuest = guest;
+            s_value += std::max(dg, dh);
+            return s_value;
+        }
+
         uint32_t dvdStreamSectorsPerSecond(uint8_t spindleControl)
         {
             switch (spindleControl)
@@ -431,7 +478,7 @@ namespace ps2_stubs
             g_cdStreamTiming.producedSectors = 0u;
             g_cdStreamTiming.consumedSectors = 0u;
             g_cdStreamTiming.productionRemainder = 0u;
-            g_cdStreamTiming.lastVSyncTick = currentCdStreamTick(runtime);
+            g_cdStreamTiming.lastVSyncTick = cdStreamClock(runtime);
         }
 
         uint64_t totalCdStreamSectors()
@@ -450,7 +497,7 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint64_t tick = currentCdStreamTick(runtime);
+            const uint64_t tick = cdStreamClock(runtime);
             if (tick <= g_cdStreamTiming.lastVSyncTick)
             {
                 return;
@@ -686,17 +733,9 @@ namespace ps2_stubs
 
         if (ok)
         {
-            static uint32_t s_cdReadLogCount = 0;
-            if (++s_cdReadLogCount <= 50 || (s_cdReadLogCount % 200) == 0)
-            {
-                std::cerr << "[CD Read] lbn=0x" << std::hex << selected.lbn << std::dec
-                          << " sectors=" << selected.sectors
-                          << " dst=0x" << std::hex << selected.buf
-                          << " pc=0x" << ctx->pc
-                          << " ra=0x" << getRegU32(ctx, 31) << std::dec
-                          << " count=" << s_cdReadLogCount << std::endl;
-            }
-            g_cdStreamingLbn = selected.lbn + selected.sectors;
+            // Ordinary reads must not move an active sceCdSt* stream (ATV2 loads front-end data during the logo movie).
+            if (!g_cdStreamTiming.active)
+                g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             return;
         }
@@ -882,7 +921,8 @@ namespace ps2_stubs
                 break;
             }
 
-            g_cdStreamingLbn = lbn + sectors;
+            if (!g_cdStreamTiming.active) // see sceCdRead
+                g_cdStreamingLbn = lbn + sectors;
         }
 
         setReturnS32(ctx, ok ? 1 : 0);
@@ -1016,9 +1056,23 @@ namespace ps2_stubs
             return;
         }
 
-        g_cdStreamingLbn = resolvedEntry.baseLbn;
-        g_cdStreamingEndLbn = resolvedEntry.baseLbn + resolvedEntry.sectors;
-        if (shouldTrace)
+        if (!g_cdStreamTiming.active) // see sceCdRead
+        {
+            g_cdStreamingLbn = resolvedEntry.baseLbn;
+            g_cdStreamingEndLbn = resolvedEntry.baseLbn + resolvedEntry.sectors;
+        }
+        static uint32_t okLogs = 0;
+        if (okLogs < 24u)
+        {
+            std::cerr << "[sceCdSearchFile:ok] path=\"" << sanitizeForLog(path)
+                      << "\" lsn=0x" << std::hex << resolvedEntry.baseLbn
+                      << " size=0x" << resolvedEntry.sizeBytes
+                      << " sectors=0x" << resolvedEntry.sectors
+                      << (resolvedEntry.fromIsoImage ? " iso" : " loose")
+                      << std::dec << std::endl;
+            ++okLogs;
+        }
+        else if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile:ok] path=\"" << sanitizeForLog(path)
                                                        << "\" lsn=0x" << std::hex << resolvedEntry.baseLbn
@@ -1074,6 +1128,7 @@ namespace ps2_stubs
 
     void sceCdStPause(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::cerr << "[sceCdStPause]" << std::endl;
         updateCdStreamProduction(runtime);
         g_cdStreamTiming.paused = true;
         setReturnS32(ctx, 1);
@@ -1149,7 +1204,7 @@ namespace ps2_stubs
 
                 if (available == 0u)
                 {
-                    if (!runtime)
+                    if (!runtime || mpegNodataInProgress())
                     {
                         finishCdStRead(rdram, ctx, state, 0);
                         return;
@@ -1237,6 +1292,7 @@ namespace ps2_stubs
         const uint32_t buffer = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
         const uint32_t errorAddress = getRegU32(ctx, 7);
+        mpegTrace(kTraceCdStReadCalls);
 
         CdStReadContinuation state{};
         state.requestedSectors = requestedSectors;
@@ -1294,19 +1350,27 @@ namespace ps2_stubs
     void sceCdStResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdStreamTiming.paused = false;
-        g_cdStreamTiming.lastVSyncTick = currentCdStreamTick(runtime);
+        g_cdStreamTiming.lastVSyncTick = cdStreamClock(runtime);
         setReturnS32(ctx, 1);
     }
 
     void sceCdStSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+        // A seek starts a new movie on the same stream (ATV2 Rainbow -> Intro).
+        if (g_cdStreamTiming.active)
+            notifyMpegCdStreamStart(runtime);
+        std::cerr << "[sceCdStSeek] lbn=0x" << std::hex << g_cdStreamingLbn << std::dec << std::endl;
         setReturnS32(ctx, 1);
     }
 
     void sceCdStSeekF(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+        // A seek starts a new movie on the same stream (ATV2 Rainbow -> Intro).
+        if (g_cdStreamTiming.active)
+            notifyMpegCdStreamStart(runtime);
+        std::cerr << "[sceCdStSeekF] lbn=0x" << std::hex << g_cdStreamingLbn << std::dec << std::endl;
         setReturnS32(ctx, 1);
     }
 
@@ -1339,6 +1403,7 @@ namespace ps2_stubs
 
     void sceCdStStat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        mpegTrace(kTraceCdStStat);
         const uint32_t buffered = bufferedCdStreamSectors(runtime);
         const uint32_t bankSize = std::max(1u, g_cdStreamTiming.sectorsPerBank);
         setReturnS32(ctx, static_cast<int32_t>((buffered / bankSize) * bankSize));
@@ -1346,6 +1411,7 @@ namespace ps2_stubs
 
     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        std::cerr << "[sceCdStStop] lbn=0x" << std::hex << g_cdStreamingLbn << std::dec << std::endl;
         updateCdStreamProduction(runtime);
         g_cdStreamTiming.active = false;
         g_cdStreamTiming.paused = false;

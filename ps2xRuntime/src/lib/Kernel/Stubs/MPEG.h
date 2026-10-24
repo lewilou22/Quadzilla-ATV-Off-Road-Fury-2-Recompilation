@@ -4,6 +4,27 @@
 
 namespace ps2_stubs
 {
+    // ATV_MPEG_TRACE=1: per-second movie pipeline counters on stderr.
+    enum MpegTraceCounter
+    {
+        kTraceCdStReadCalls,
+        kTraceCdStReadSectors,
+        kTraceCdStStat,
+        kTraceDemuxCalls,
+        kTraceDemuxBytes,
+        kTraceDemuxBackpressure,
+        kTraceDecodedFrames,
+        kTraceGetPictureFrame,
+        kTraceGetPictureEmpty,
+        kTraceAddBs,
+        kTraceNodata,
+        kTracePaceRepeat,
+        kTraceCounterCount
+    };
+    void mpegTrace(MpegTraceCounter counter, uint64_t amount = 1u);
+    // True while sceMpegGetPicture runs the game's nodata callback; a
+    // blocking sceCdStRead then returns a short read instead of parking.
+    bool mpegNodataInProgress();
     void resetMpegStubState();
     void enqueueMpegDecodedFrameForTesting(uint32_t mpegAddr);
     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
