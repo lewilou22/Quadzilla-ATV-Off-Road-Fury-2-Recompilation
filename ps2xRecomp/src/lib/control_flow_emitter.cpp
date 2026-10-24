@@ -330,7 +330,11 @@ namespace ps2recomp
         emitDelaySlot("    ");
 
         const uint32_t target = buildAbsoluteJumpTarget(m_branchInst.address, m_branchInst.target);
-        if (isInternalTarget(target))
+        // A JAL to a function entry (including this function's own entry, i.e.
+        // recursion) must be a real call. As a local goto, the callee's `jr $ra`
+        // returned from the whole C++ function and abandoned every outer level.
+        const bool callToFunctionEntry = kind == StaticBranchKind::Call && !m_gen.getFunctionName(target).empty();
+        if (isInternalTarget(target) && !callToFunctionEntry)
         {
             emitInternalTarget(target, branchPc(), "    ");
             return;

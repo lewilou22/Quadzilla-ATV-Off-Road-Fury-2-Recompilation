@@ -1766,6 +1766,13 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
 
 void GSCpuBackend::PerformLocalToHostTransfer()
 {
+    {
+        static uint32_t s_l2hLogs = 0u;
+        if (s_l2hLogs++ < 32u)
+            std::fprintf(stderr, "[GS:L2H] sbp=0x%x sbw=%u spsm=0x%x ssa=%u,%u rr=%ux%u\n",
+                         m_transfer.bitbltbuf.sbp, m_transfer.bitbltbuf.sbw, m_transfer.bitbltbuf.spsm,
+                         m_transfer.trxpos.ssax, m_transfer.trxpos.ssay, m_transfer.trxreg.rrw, m_transfer.trxreg.rrh);
+    }
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0u;
     if (!m_vram)

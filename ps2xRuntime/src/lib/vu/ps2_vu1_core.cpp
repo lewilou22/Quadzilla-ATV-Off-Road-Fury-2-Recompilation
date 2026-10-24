@@ -1510,6 +1510,25 @@ void VU1Interpreter::commitReadyPipelines()
     hint.nextReady = nextReady;
 }
 
+static uint32_t s_xgkickFaultStartPc = 0u;
+
+static void logXgkickFault(const char *reason, uint32_t startPc, uint32_t pc, uint32_t top, uint32_t itop,
+                           uint32_t source, uint32_t offset, const uint8_t *packet)
+{
+    static uint32_t s_logged = 0u;
+    if (s_logged >= 24u)
+        return;
+    ++s_logged;
+    uint32_t q[8]{};
+    std::memcpy(q, packet + offset, 16u);
+    if (offset >= 16u)
+        std::memcpy(q + 4, packet + offset - 16u, 16u);
+    std::fprintf(stderr,
+                 "[VU1:XGKICK-FAULT] %s start=0x%x pc=0x%x top=0x%x itop=0x%x src=0x%x off=0x%x"
+                 " tag=%08x.%08x.%08x.%08x prev=%08x.%08x.%08x.%08x\n",
+                 reason, startPc, pc, top, itop, source, offset, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+}
+
 void VU1Interpreter::progressXgkick()
 {
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
@@ -1521,6 +1540,8 @@ void VU1Interpreter::progressXgkick()
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
+            logXgkickFault("overflow", s_xgkickFaultStartPc, m_state.pc, m_state.top, m_state.itop,
+                           m_xgkick.sourceAddress, m_xgkick.copiedBytes - 16u, m_xgkick.packet.data());
             reportReservedInstruction(false, 0xFFFFFFFBu);
             m_xgkick.active = false;
             return;
@@ -1562,6 +1583,8 @@ void VU1Interpreter::progressXgkick()
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
+                logXgkickFault("tag-too-big", s_xgkickFaultStartPc, m_state.pc, m_state.top, m_state.itop,
+                               m_xgkick.sourceAddress, qwordOffset, m_xgkick.packet.data());
                 reportReservedInstruction(false, 0xFFFFFFFBu);
                 m_xgkick.active = false;
                 return;
@@ -2411,6 +2434,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     resetScheduler();
     m_cycle = 0;
     m_state.pc = startPC & microAddressMask();
+    s_xgkickFaultStartPc = m_state.pc;
     m_state.ebit = false;
     m_state.haltAfterDelaySlot = false;
     m_state.stoppedByD = false;

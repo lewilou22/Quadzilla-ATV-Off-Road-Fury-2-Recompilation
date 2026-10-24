@@ -6,6 +6,9 @@
 // does not deliver the VIF1 INTC interrupt mid-stream, so a game override can do
 // the handler's work inline at the stall point. processVIF1Data only sets STAT.INT.
 void (*g_ps2Vif1IbitHook)(uint32_t vifcode) = nullptr;
+// Set by an I-bit hook when the game abandons the current VIF1 transfer at the stall
+// (e.g. a GS download that restarts VIF1 from another chain); the rest is dropped.
+bool g_ps2Vif1AbortStream = false;
 
 enum VIFCmd : uint8_t
 {
@@ -356,7 +359,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         if (opcode == VIF_NOP)
         {
             if (irq && g_ps2Vif1IbitHook)
+            {
                 g_ps2Vif1IbitHook(cmd);
+                if (g_ps2Vif1AbortStream)
+                {
+                    g_ps2Vif1AbortStream = false;
+                    return;
+                }
+            }
             continue;
         }
         else if (opcode == VIF_STCYCL)
@@ -411,7 +421,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // the flush is complete. An I-bit here is where real VIF1 stalls until
             // the game's INTC handler restarts it (FBRST.STC).
             if (irq && g_ps2Vif1IbitHook)
+            {
                 g_ps2Vif1IbitHook(cmd);
+                if (g_ps2Vif1AbortStream)
+                {
+                    g_ps2Vif1AbortStream = false;
+                    return;
+                }
+            }
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)

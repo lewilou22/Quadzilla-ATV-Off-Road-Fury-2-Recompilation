@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -13,6 +14,10 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+// GS local->host source for VIF1 DMA with CHCR.DIR=0 (game code doing a GS download).
+// Returns bytes copied; installed by a game override that owns the GS.
+uint32_t (*g_ps2Vif1ReadbackHook)(uint8_t *dst, uint32_t maxBytes) = nullptr;
 
 namespace
 {
@@ -1288,6 +1293,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if (channelBase == 0x10009000u && (value & 1u) == 0u && ((value >> 2) & 0x3u) == 0u)
+            {
+                // VIF1 DIR=0: GS -> memory download (BUSDIR=1, TRXDIR=1 already issued).
+                uint32_t copied = 0u;
+                const uint32_t want = qwc * 16u;
+                if (g_ps2Vif1ReadbackHook && want != 0u && !isScratchpad(madr))
+                {
+                    const uint32_t phys = translateAddress(madr);
+                    if (phys + want <= PS2_RAM_SIZE)
+                        copied = g_ps2Vif1ReadbackHook(m_rdram + phys, want);
+                }
+                static uint32_t s_dir0Logs = 0u;
+                if (s_dir0Logs++ < 32u)
+                    std::fprintf(stderr, "[DMA:VIF1-DIR0] madr=0x%x qwc=%u copied=%u\n", madr, qwc, copied);
+                m_ioRegisters[channelBase + 0x10] = madr + want;
+                m_ioRegisters[channelBase + 0x20] = 0u;
+                m_ioRegisters[address] = value & ~0x100u;
+                return true;
+            }
             {
                 // [DIAG] per-channel DMA kick trace (bounded)
                 static std::atomic<uint32_t> s_kickCounts[16]{};
@@ -1368,6 +1392,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    const bool tteEnabled = (chcr & (1u << 6)) != 0u;
                     const int kMaxChainTags = 4096;
                     std::vector<uint8_t> chainBuf;
 
@@ -1530,19 +1555,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        const bool compactVifLocalTag =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
+                        // With CHCR.TTE the VIF receives the tag's upper 64 bits (two VIFcodes)
+                        // ahead of the payload for every tag ID, including REF/REFS/REFE.
+                        const bool vifTagTransfer =
+                            (channelBase == 0x10009000u || channelBase == 0x10008000u) && tteEnabled;
+                        if (vifTagTransfer)
                             appendCompactVif1TagData(currentTagAddr, 0u);
 
                         if (hasPayload)
-                        {
-                            if (compactVifLocalTag)
-                                appendData(currentTagAddr + 16u, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1792,10 +1813,11 @@ void PS2Memory::processPendingTransfers()
                 s_inVif1PendingLoop = false;
         }
     } vif1LoopGuard(hadVif1);
-    for (auto &p : m_pendingVif1Transfers)
+    // Index loop over a moved-out copy: an I-bit hook may kick a new VIF1 chain
+    // (appending here) while this one is processed; it runs after this one.
+    for (size_t vifIdx = 0; hadVif1 && vifIdx < m_pendingVif1Transfers.size(); ++vifIdx)
     {
-        if (!hadVif1)
-            break;
+        PendingTransfer p = std::move(m_pendingVif1Transfers[vifIdx]);
         if (!p.chainData.empty())
         {
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
@@ -2346,6 +2368,12 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         if (address >= 0x10000200 && address < 0x10000300)
         {
             return 0;
+        }
+
+        // VIF1_MARK holds the last MARK VIFcode (or CPU write).
+        if (address == 0x10003C30u)
+        {
+            return vif1_regs.mark;
         }
 
         if (address >= 0x1000F200 && address <= 0x1000F260)

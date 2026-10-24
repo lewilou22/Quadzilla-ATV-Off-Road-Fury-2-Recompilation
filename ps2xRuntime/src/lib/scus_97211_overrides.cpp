@@ -15,6 +15,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdio>
+#include "runtime/gs/ps2_gif_arbiter.h"
+
+extern bool g_ps2Vif1AbortStream;
+extern uint32_t (*g_ps2Vif1ReadbackHook)(uint8_t *dst, uint32_t maxBytes);
 
 extern uint32_t g_ps2GuestVsyncCounterAddr;
 extern uint32_t g_ps2GuestVsyncCounterAddr2;
@@ -6097,6 +6102,13 @@ namespace
         {0x00157A60u, "GsRendererKick(0x157A60)", nullptr, 0, 8},
         {0x00157510u, "GsDmaSend(0x157510)", nullptr, 0, 8},
         {0x0035A420u, "FlushCache(0x35A420)", nullptr, 0, 8},
+        {0x00187B20u, "Water_187B20", nullptr, 0, 6},
+        {0x00187BC4u, "WaterInit(0x187BC4)", nullptr, 0, 6},
+        {0x00188274u, "Water_188274", nullptr, 0, 6},
+        {0x00188390u, "Water_188390", nullptr, 0, 6},
+        {0x00188680u, "WaterBuild(0x188680)", nullptr, 0, 6},
+        {0x00186CA0u, "GsStoreImage(0x186CA0)", nullptr, 0, 12},
+        {0x00186EA0u, "GsStoreImageB(0x186EA0)", nullptr, 0, 12},
     };
 
     template <int I>
@@ -6185,6 +6197,83 @@ namespace
     PS2Runtime *g_ibitRuntime = nullptr;
     PS2Runtime::RecompiledFunction g_sendCurrentTransfer = nullptr;
 
+    // MARK=1 at the FLUSHA+I stall: the INTC handler (0x174AE0) runs a queued GS
+    // download instead of a texture send. Entry = *(mgr+0x144) + *(s16*)(mgr+0x148)*0x20:
+    // +0 width, +2/+4 SSAX/SSAY, +6/+8 RRW/RRH, +A PSM (u8), +C SBP, +10 RAM dst,
+    // +14 callback(+18, +10), +1C continuation chain. 0x186EA0 sends BITBLTBUF/TRXPOS/
+    // TRXREG/TRXDIR=1 and reads the rectangle back over VIF1 (DIR=0); the DMAC1
+    // handler (0x174D40) then clears MARK, runs the callback, restarts VIF1 at the
+    // continuation and advances the index. The rest of the current VIF1 stream is
+    // abandoned. PSXWater builds its VU1 vertex/VIF buffer this way (it draws the
+    // VIFcodes as pixel colours and downloads the rectangle).
+    void textureDownloadAtIbit(uint8_t *rdram, R5900Context *live, uint32_t mgr)
+    {
+        static uint32_t s_logs = 0u;
+        PS2Runtime *runtime = g_ibitRuntime;
+        PS2Memory &mem = runtime->memory();
+        auto rd = [&](uint32_t a) { return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a)); };
+        auto rd16 = [&](uint32_t a) { return *reinterpret_cast<uint16_t *>(getMemPtr(rdram, a)); };
+        const int16_t idx = static_cast<int16_t>(rd16(mgr + 0x148u));
+        const uint32_t entry = rd(mgr + 0x144u) + static_cast<uint32_t>(static_cast<int32_t>(idx)) * 0x20u;
+        const uint32_t width = rd16(entry + 0x0u);
+        const uint32_t ssax = rd16(entry + 0x2u);
+        const uint32_t ssay = rd16(entry + 0x4u);
+        const uint32_t rrw = rd16(entry + 0x6u);
+        const uint32_t rrh = rd16(entry + 0x8u);
+        const uint32_t psm = *getMemPtr(rdram, entry + 0xAu);
+        const uint32_t sbp = rd16(entry + 0xCu);
+        const uint32_t dst = rd(entry + 0x10u);
+        const uint32_t bpp = (psm == 0x3Au || psm == 0x32u || psm == 0x0Au || psm == 0x02u) ? 2u : 4u;
+        const uint32_t bytes = bpp * rrw * rrh;
+
+        uint64_t pkt[10] = {};
+        pkt[0] = 4ull | (1ull << 15) | (1ull << 60); // NLOOP=4, EOP, PACKED, NREG=1
+        pkt[1] = 0xEull;                             // A+D
+        pkt[2] = (static_cast<uint64_t>(psm) << 24) | sbp | (static_cast<uint64_t>(width >> 6) << 16);
+        pkt[3] = 0x50u; // BITBLTBUF
+        pkt[4] = ssax | (static_cast<uint64_t>(ssay) << 16);
+        pkt[5] = 0x51u; // TRXPOS
+        pkt[6] = rrw | (static_cast<uint64_t>(rrh) << 32);
+        pkt[7] = 0x52u; // TRXREG
+        pkt[8] = 1u;    // local -> host
+        pkt[9] = 0x53u; // TRXDIR
+        mem.submitGifPacket(GifPathId::Path2, reinterpret_cast<const uint8_t *>(pkt), sizeof(pkt), true, false);
+        uint32_t copied = 0u;
+        if (dst != 0u && (dst & 0x01FFFFFFu) + bytes <= PS2_RAM_SIZE)
+            copied = runtime->gs().consumeLocalToHostBytes(getMemPtr(rdram, dst), bytes);
+
+        // 0x174D40 completion.
+        mem.vif1_regs.mark = 0u;
+        const uint32_t callback = rd(entry + 0x14u);
+        if (callback != 0u)
+        {
+            R5900Context tmp = *live;
+            SET_GPR_U32(&tmp, 29, (GPR_U32(live, 29) - 0x400u) & ~0xFu);
+            HoldEeTimeslices hold;
+            callRecompiled4(runtime, rdram, &tmp, callback, rd(entry + 0x18u), dst, 0u, 0u);
+        }
+        const uint32_t cont = rd(entry + 0x1Cu);
+        const bool restart = cont != 0u && *getMemPtr(rdram, cont + 3u) != static_cast<uint8_t>('p');
+        *reinterpret_cast<int16_t *>(getMemPtr(rdram, mgr + 0x148u)) = static_cast<int16_t>(idx + 1);
+        if (s_logs < 32u)
+        {
+            ++s_logs;
+            std::cerr << "[ATV2:DOWNLOAD] idx=" << idx << std::hex << " sbp=0x" << sbp << std::dec
+                      << " w=" << width << std::hex << " psm=0x" << psm << std::dec
+                      << " ssa=" << ssax << "," << ssay << " rr=" << rrw << "x" << rrh
+                      << std::hex << " dst=0x" << dst << std::dec << " bytes=" << bytes
+                      << " copied=" << copied << std::hex << " cb=0x" << callback
+                      << " cont=0x" << cont << std::dec << (restart ? "" : " (END)") << std::endl;
+        }
+        if (restart)
+        {
+            mem.writeIORegister(0x10009030u, cont & 0x0FFFFFFFu); // D1_TADR
+            mem.writeIORegister(0x10009020u, 0u);                 // D1_QWC
+            mem.writeIORegister(0x10009000u, 0x1C5u);             // D1_CHCR: chain, TTE, TIE, STR
+        }
+        g_ps2Vif1AbortStream = true;
+    }
+
     void onVif1TextureIbit(uint32_t vifcode)
     {
         static bool s_inHook = false;
@@ -6199,6 +6288,13 @@ namespace
         const uint32_t mgr = rd(kTextureMapManagerPtr);
         if (mgr == 0u)
             return;
+        if (g_ibitRuntime->memory().vif1_regs.mark == 1u)
+        {
+            s_inHook = true;
+            textureDownloadAtIbit(rdram, live, mgr);
+            s_inHook = false;
+            return;
+        }
 
         const uint32_t idxBefore = rd(kTransferListIndex);
         R5900Context tmp = *live;
@@ -6240,6 +6336,8 @@ namespace
         }
         g_ibitRuntime = &runtime;
         g_ps2Vif1IbitHook = &onVif1TextureIbit;
+        g_ps2Vif1ReadbackHook = [](uint8_t *dst, uint32_t maxBytes) -> uint32_t
+        { return g_ibitRuntime ? g_ibitRuntime->gs().consumeLocalToHostBytes(dst, maxBytes) : 0u; };
     }
 
     // PSXTextureMapManager IPU decode @ 0x179190: (mgr, dst, src, size, width, height, ?, wait).
@@ -6548,7 +6646,7 @@ namespace
         const char *v = std::getenv("ATV2_TRACE_FE");
         if (v == nullptr || v[0] == '\0' || v[0] == '0')
             return;
-        registerFeTraceImpl(runtime, std::make_integer_sequence<int, 14>{});
+        registerFeTraceImpl(runtime, std::make_integer_sequence<int, 21>{});
     }
 
     void applyScus97211Overrides(PS2Runtime &runtime)
