@@ -5535,31 +5535,8 @@ namespace
     void libmFloor368650(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::floor(softDoubleArg(ctx))); }
     void libmFabs3685f8(uint8_t *, R5900Context *ctx, PS2Runtime *) { softDoubleReturn(ctx, std::fabs(softDoubleArg(ctx))); }
 
-    // Terrain near patches. Terrain::Render (0x130D40) sends up to 8 patches per frame that the
-    // frustum test (0x16F030) marks as crossing a plane through the clip renderer 0x1315D0, which
-    // uploads VU1 clip microcode (0x3C0600/0x3BFEA0/0x3BB250). Its clipped output never reaches the
-    // screen here (VU1 discrepancy, not yet found), so all ground near the camera was missing and
-    // the water plane showed through. Workaround: draw those patches with the normal terrain
-    // renderer 0x131790 (same arguments; its param_2 re-uploads the normal microcode). Only a
-    // few unclipped edge triangles can be lost. ATV2_TERRAIN_CLIP=1 restores the original path.
-    PS2Runtime::RecompiledFunction g_terrainClipRenderOrig = nullptr;
-    PS2Runtime::RecompiledFunction g_terrainNormalRender = nullptr;
-
-    void terrainNearPatch1315d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        static const bool s_useClip = std::getenv("ATV2_TERRAIN_CLIP") != nullptr;
-        if (s_useClip || g_terrainNormalRender == nullptr)
-            g_terrainClipRenderOrig(rdram, ctx, runtime);
-        else
-            g_terrainNormalRender(rdram, ctx, runtime);
-    }
-
     void registerFadeStepFix(PS2Runtime &runtime)
     {
-        g_terrainClipRenderOrig = runtime.lookupFunction(0x001315D0u);
-        g_terrainNormalRender = runtime.lookupFunction(0x00131790u);
-        if (g_terrainClipRenderOrig)
-            runtime.replaceFunction(0x001315D0u, &terrainNearPatch1315d0);
         runtime.replaceFunction(0x003684D0u, &libmCos3684d0);
         runtime.replaceFunction(0x00368D18u, &libmSin368d18);
         runtime.replaceFunction(0x00368650u, &libmFloor368650);

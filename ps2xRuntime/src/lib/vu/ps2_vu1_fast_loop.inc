@@ -941,7 +941,7 @@
             case kJr:
                 m_state.branchPending = true;
                 m_state.branchTarget =
-                    (static_cast<uint32_t>(static_cast<uint16_t>(readBranchVi(VIS(instr)))) * 8u) & microAddressMask();
+                    (static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[VIS(instr)])) * 8u) & microAddressMask();
                 m_state.branchDelay = 1;
                 return;
             case kIbltz:
