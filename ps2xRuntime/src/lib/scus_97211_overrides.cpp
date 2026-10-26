@@ -3,6 +3,7 @@
 #include "runtime/ee_scheduler.h"
 #include "ps2_recompiled_functions.h"
 #include "Kernel/Stubs/Pad.h"
+#include "ps2_audio_spu2.h"
 
 #include <cerrno>
 #include <bit>
@@ -1952,6 +1953,15 @@ namespace
         }
 
         SET_GPR_U32(ctx, 2, thisObj); // dmove v0, s0
+    }
+
+    // PS2SOUND.IRX (and LIBSD) run on the emulated IOP with its SPU2 (ps2xIOP
+    // profile "atv-offroad-fury-2-us"). ATV2_IOP_SOUND=0 turns that off and
+    // soundRpcCall2f0150 answers the driver calls instead (no sound).
+    bool atv2EmulatedSoundEnabled()
+    {
+        const char *value = std::getenv("ATV2_IOP_SOUND");
+        return !value || value[0] != '0';
     }
 
     // Sound driver RPC dispatcher @ 0x002f0150 (sub_002F0150, PS2SOUND.IRX).
@@ -6372,8 +6382,12 @@ namespace
         // packet codes it writes are truncated; generated code is used whenever it has the entry.
         replaceIfMissing(runtime, 0x00176d60u, &vtableMethod176d60);
 
-        // Sound driver RPC dispatcher (PS2SOUND.IRX, sid=0x34567).
-        runtime.replaceFunction(0x002f0150u, &soundRpcCall2f0150);
+        // Sound driver RPC dispatcher (PS2SOUND.IRX, sid=0x34567): the emulated
+        // IOP serves it; the stub only stands in when that is turned off.
+        if (atv2EmulatedSoundEnabled())
+            (void)ps2_audio_spu2::start();
+        else
+            runtime.replaceFunction(0x002f0150u, &soundRpcCall2f0150);
 
         // Display/engine IOP RPC (sid=0x80000211).
         runtime.replaceFunction(0x001a8cc0u, &displayRpcCall1a8cc0);

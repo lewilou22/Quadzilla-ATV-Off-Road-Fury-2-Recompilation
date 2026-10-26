@@ -19,6 +19,26 @@ add_library(ps2_iop STATIC
     src/modules/sound_update_stub.cpp
     src/modules/sdrdrv.cpp
     src/modules/cdvdman.cpp
+    src/modules/emulated_sound_driver.cpp
+    src/ps2_path.cpp
+    src/emulator/iop_emulator.cpp
+    src/emulator/core/iop_cpu.cpp
+    src/emulator/core/iop_kernel.cpp
+    src/emulator/core/iop_memory.cpp
+    src/emulator/core/iop_spu2.cpp
+    src/emulator/imports/iop_cdvd.cpp
+    src/emulator/imports/iop_heaplib.cpp
+    src/emulator/imports/iop_imports.cpp
+    src/emulator/imports/iop_intrman.cpp
+    src/emulator/imports/iop_ioman.cpp
+    src/emulator/imports/iop_loadcore.cpp
+    src/emulator/imports/iop_stdio.cpp
+    src/emulator/imports/iop_sysclib.cpp
+    src/emulator/imports/iop_sysmem.cpp
+    src/emulator/imports/iop_timrman.cpp
+    src/emulator/imports/iop_vblank.cpp
+    src/emulator/services/iop_module_loader.cpp
+    src/emulator/services/iop_rpc.cpp
 )
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)

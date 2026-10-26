@@ -1,6 +1,8 @@
 #include "iop_service.h"
+#include "emulated_sound_service.h"
 #include "module_factories.h"
 
+#include <cstdlib>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -92,6 +94,27 @@ namespace ps2x::iop::detail
                 .imageBodyUpperName = "IMG_BD.BIN",
             };
         }
+
+        // ATV Offroad Fury 2 plays its sound through Rainbow Studios' own
+        // PS2SOUND.IRX on LIBSD; both run on the IOP emulator.
+        // ATV2_IOP_SOUND=0 leaves them out (silent; the game's 0x2F0150 stub answers).
+        EmulatedSoundDriverBindings atv2SoundBindings()
+        {
+            return {
+                .serviceName = "PS2SOUND (emulated IOP)",
+                .modules = {
+                    "cdrom0:\\MODULES\\LIBSD.IRX;1",
+                    "cdrom0:\\MODULES\\PS2SOUND.IRX;1",
+                },
+                .sids = {0x00012346u, 0x00023456u, 0x00034567u},
+            };
+        }
+
+        bool atv2EmulatedSoundEnabled()
+        {
+            const char *value = std::getenv("ATV2_IOP_SOUND");
+            return !value || value[0] != '0';
+        }
     }
 
     ServiceList createCoreServices(IopHost &host)
@@ -144,6 +167,19 @@ namespace ps2x::iop::detail
             {
                 ServiceList services;
                 services.emplace_back(createSdrdrvService(host, fatalFrameSdrdrvBindings()));
+                return services;
+            },
+        });
+
+        profiles.push_back({
+            "atv-offroad-fury-2-us",
+            "builtin",
+            {.elfName = "SCUS_972.11"},
+            [](IopHost &host, const GameIdentity &)
+            {
+                ServiceList services;
+                if (atv2EmulatedSoundEnabled())
+                    services.emplace_back(createEmulatedSoundDriverService(host, atv2SoundBindings()));
                 return services;
             },
         });
