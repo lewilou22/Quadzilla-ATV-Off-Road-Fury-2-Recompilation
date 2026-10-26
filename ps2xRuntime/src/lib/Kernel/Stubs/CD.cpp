@@ -622,6 +622,28 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    // Serves hostPath as disc file ps2Path at baseLbn: sector reads in that range and sceCdSearchFile
+    // see it instead of the image. Game overrides add or replace disc files this way, with baseLbn
+    // past the end of the image.
+    bool registerCdOverlayFile(const std::string &ps2Path, const std::filesystem::path &hostPath, uint32_t baseLbn)
+    {
+        std::error_code ec;
+        const uint64_t sizeBytes = std::filesystem::file_size(hostPath, ec);
+        const std::string key = cdPathKey(ps2Path);
+        if (ec || key.empty() || sizeBytes > 0xFFFFFFFFu)
+        {
+            return false;
+        }
+
+        CdFileEntry entry;
+        entry.hostPath = hostPath;
+        entry.sizeBytes = static_cast<uint32_t>(sizeBytes);
+        entry.baseLbn = baseLbn;
+        entry.sectors = sectorsForBytes(sizeBytes);
+        g_cdFilesByKey[key] = entry;
+        return true;
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn

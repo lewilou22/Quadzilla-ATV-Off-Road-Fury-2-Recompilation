@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -47,6 +50,14 @@ extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps
 void atv2ArmWriteWatch(uint8_t *rdram, uint32_t guestAddr, uint32_t len);
 void registerAtv2NetworkHle(PS2Runtime &runtime); // atv2_network_hle.cpp
 void atvStartHostProfiler();                       // Kernel/Atv2HostProfiler.cpp
+void atvInstallCrashTrace();                       // Kernel/Atv2HostProfiler.cpp
+bool atv2BuildSuzukiDz400Files(const std::function<bool(const std::string &, std::vector<uint8_t> &)> &readDiscFile,
+                               std::vector<std::pair<std::string, std::vector<uint8_t>>> &out); // Kernel/Atv2SuzukiDz400.cpp
+namespace ps2_stubs
+{
+    bool registerCdOverlayFile(const std::string &ps2Path, const std::filesystem::path &hostPath,
+                               uint32_t baseLbn); // Kernel/Stubs/CD.cpp
+}
 
 namespace
 {
@@ -6014,6 +6025,198 @@ namespace
         registerFeTraceImpl(runtime, std::make_integer_sequence<int, 27>{});
     }
 
+    // ---- Suzuki DZ400 in the menus and races -------------------------------------------------
+    // Kernel/Atv2SuzukiDz400.cpp rebuilds the roster archives (QUADINFO.RES, PAGE07.RES, PAGE20.RES)
+    // with a 26th quad, IngameID 6, and makes its menu model archive UI\RESOURCE\QUAD\ATV06.RES.
+    // The game finds disc files by name in its table at 0x408B80 (742 records: u64 path, lbn, end lbn,
+    // sectors, bytes) through 0x33F510, which returns a new 0x34-byte record filled by 0x33F3D0:
+    // +0 lbn, +4 sectors, +8 leaf name (to the ';', 16 bytes at most), +0x24 lbn, +0x28 sectors,
+    // +0x2C 0, +0x30 bytes. The lookup answers for the rebuilt files with sectors past the end of the
+    // image, which the CD layer serves from .cdcache/atv2_dz400. ATV2_DZ400=0 keeps the retail menus;
+    // a profile saved with the DZ400 selected stores roster index 25, which the retail roster lacks
+    // (empty ATV & Rider Select, race load hangs until another quad is picked).
+    struct DiscOverlay
+    {
+        std::string discPath; // as in the table, e.g. "\\UI\\RESOURCE\\QUADINFO.RES;1"
+        uint32_t lbn = 0u;
+        uint32_t bytes = 0u;
+    };
+    std::vector<DiscOverlay> g_discOverlays;
+    PS2Runtime::RecompiledFunction g_findDiscFile33f510Orig = nullptr;
+    constexpr uint32_t kDiscFileTable = 0x00408B80u;
+    constexpr uint32_t kDiscFileCount = 742u;
+    constexpr uint32_t kDiscOverlayLbn = 0x00300000u; // the image ends at sector 0x216F20
+
+    bool sameDiscPath(const std::string &a, const std::string &b)
+    {
+        return a.size() == b.size() &&
+               std::equal(a.begin(), a.end(), b.begin(), [](char x, char y)
+                          { return std::toupper(static_cast<unsigned char>(x)) == std::toupper(static_cast<unsigned char>(y)); });
+    }
+
+    bool readRetailDiscFile(uint8_t *rdram, const std::string &discPath, std::vector<uint8_t> &data)
+    {
+        for (uint32_t i = 0; i < kDiscFileCount; ++i)
+        {
+            const uint8_t *record = getConstMemPtr(rdram, kDiscFileTable + i * 0x28u);
+            uint32_t path = 0, lbn = 0, bytes = 0;
+            std::memcpy(&path, record, 4u);
+            std::memcpy(&lbn, record + 0x08u, 4u);
+            std::memcpy(&bytes, record + 0x20u, 4u);
+            if (!sameDiscPath(reinterpret_cast<const char *>(getConstMemPtr(rdram, path)), discPath))
+                continue;
+            std::ifstream image(PS2Runtime::getIoPaths().cdImage, std::ios::binary);
+            data.resize(bytes);
+            image.seekg(static_cast<std::streamoff>(lbn) * 2048);
+            image.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(bytes));
+            return image.gcount() == static_cast<std::streamsize>(bytes);
+        }
+        return false;
+    }
+
+    void installDiscOverlays(uint8_t *rdram)
+    {
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> files;
+        if (!atv2BuildSuzukiDz400Files([rdram](const std::string &path, std::vector<uint8_t> &data)
+                                       { return readRetailDiscFile(rdram, path, data); },
+                                       files))
+            return;
+        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        const std::filesystem::path dir =
+            (paths.elfDirectory.empty() ? std::filesystem::path(".cdcache") : paths.elfDirectory / ".cdcache") /
+            "atv2_dz400";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::vector<DiscOverlay> overlays;
+        uint32_t lbn = kDiscOverlayLbn;
+        for (const auto &[discPath, data] : files)
+        {
+            const size_t leaf = discPath.find_last_of('\\') + 1u;
+            const std::filesystem::path host = dir / discPath.substr(leaf, discPath.find(';') - leaf);
+            std::ofstream out(host, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+            out.close();
+            if (!out || !ps2_stubs::registerCdOverlayFile(discPath, host, lbn))
+            {
+                std::cerr << "[ATV2:DZ400] could not serve " << host.string()
+                          << "; the Suzuki DZ400 stays out of the menus" << std::endl;
+                return;
+            }
+            overlays.push_back({discPath, lbn, static_cast<uint32_t>(data.size())});
+            lbn += (static_cast<uint32_t>(data.size()) + 2047u) / 2048u + 16u;
+        }
+        g_discOverlays = std::move(overlays);
+        std::cerr << "[ATV2:DZ400] Suzuki DZ400 added to the quad roster (" << g_discOverlays.size()
+                  << " disc files in " << dir.string() << ")" << std::endl;
+    }
+
+    void findDiscFile33f510(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool s_installed = false;
+        if (!s_installed)
+        {
+            s_installed = true;
+            installDiscOverlays(rdram);
+        }
+        const char *name = reinterpret_cast<const char *>(getConstMemPtr(rdram, getRegU32(ctx, 4)));
+        const std::string discPath = "\\" + std::string(name != nullptr ? name : "") + ";1"; // "\\%s;1"
+        static const bool s_trace = std::getenv("ATV2_TRACE_FILES") != nullptr;
+        if (s_trace)
+            std::cerr << "[ATV2:FILE] " << discPath << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << std::endl;
+        for (const DiscOverlay &overlay : g_discOverlays)
+        {
+            if (!sameDiscPath(overlay.discPath, discPath))
+                continue;
+            const uint32_t record = callRecompiled4(runtime, rdram, ctx, 0x00103E30u, 0x34u, 0x00447328u, 0x5Fu, 0u);
+            if (record != 0u)
+            {
+                const uint32_t sectors = (overlay.bytes + 2047u) / 2048u;
+                WRITE32(record + 0x00u, overlay.lbn);
+                WRITE32(record + 0x04u, sectors);
+                for (size_t i = overlay.discPath.find_last_of('\\') + 1u, n = 0; n < 16u; ++i, ++n)
+                {
+                    const char c = overlay.discPath[i];
+                    WRITE8(record + 0x08u + static_cast<uint32_t>(n), c == ';' ? 0u : static_cast<uint8_t>(c));
+                    if (c == ';')
+                        break;
+                }
+                WRITE32(record + 0x24u, overlay.lbn);
+                WRITE32(record + 0x28u, sectors);
+                WRITE32(record + 0x2Cu, 0u);
+                WRITE32(record + 0x30u, overlay.bytes);
+            }
+            SET_GPR_U32(ctx, 2, record);
+            ctx->pc = getRegU32(ctx, 31);
+            return;
+        }
+        g_findDiscFile33f510Orig(rdram, ctx, runtime);
+    }
+
+    // Opponents come from the human's class in quad\ATVGroups.pb: 0x210D20 looks each human's quad ID
+    // (settings +0x514, settings = *(*0x404818 + 0x298); a0 +0x84 = humans) up in the groups' ATVn
+    // lists. No group lists the DZ400 (ID 6), so the candidate list stays empty and the AI gets a
+    // garbage quad ID. The DZ400 is the KFX400 (ID 7, Sport Series) in Suzuki colours: pick opponents
+    // as for the KFX400. The lookup runs to completion with ID 7 in place; were it ever cut short, the
+    // human keeps ID 7 and races the KFX400.
+    PS2Runtime::RecompiledFunction g_aiOpponents210d20Orig = nullptr;
+
+    void aiOpponents210d20(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t settings = READ32(READ32(0x00404818u) + 0x298u);
+        const uint32_t humans = std::min<uint32_t>(READ32(getRegU32(ctx, 4) + 0x84u), 5u);
+        uint32_t asKfx400 = 0u;
+        for (uint32_t i = 0; i < humans; ++i)
+        {
+            if (READ32(settings + 0x514u + i * 4u) == 6u)
+            {
+                WRITE32(settings + 0x514u + i * 4u, 7u);
+                asKfx400 |= 1u << i;
+            }
+        }
+        if (asKfx400 == 0u)
+        {
+            g_aiOpponents210d20Orig(rdram, ctx, runtime);
+            return;
+        }
+        const uint32_t returnPc = getRegU32(ctx, 31);
+        {
+            HoldEeTimeslices hold;
+            g_aiOpponents210d20Orig(rdram, ctx, runtime);
+            for (uint32_t guard = 0; ctx->pc != returnPc; ++guard)
+            {
+                if (ctx->pc == 0u || guard >= 1000000u || runtime->isStopRequested() || !runtime->hasFunction(ctx->pc))
+                {
+                    std::cerr << "[ATV2:DZ400] AI opponent pick stopped at pc=0x" << std::hex << ctx->pc << std::dec
+                              << "; racing the KFX400" << std::endl;
+                    return;
+                }
+                runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+            }
+        }
+        for (uint32_t i = 0; i < humans; ++i)
+        {
+            if (asKfx400 & (1u << i))
+                WRITE32(settings + 0x514u + i * 4u, 6u);
+        }
+    }
+
+    void registerSuzukiDz400(PS2Runtime &runtime)
+    {
+        const char *env = std::getenv("ATV2_DZ400");
+        if (env != nullptr && env[0] == '0')
+            return;
+        g_findDiscFile33f510Orig = runtime.lookupFunction(0x0033F510u);
+        g_aiOpponents210d20Orig = runtime.lookupFunction(0x00210D20u);
+        if (!g_findDiscFile33f510Orig || !g_aiOpponents210d20Orig)
+        {
+            std::cerr << "[ATV2:DZ400] no generated function at 0x33F510 or 0x210D20; Suzuki DZ400 not added"
+                      << std::endl;
+            return;
+        }
+        runtime.replaceFunction(0x0033F510u, &findDiscFile33f510);
+        runtime.replaceFunction(0x00210D20u, &aiOpponents210d20);
+    }
+
     void applyScus97211Overrides(PS2Runtime &runtime)
     {
         runtime.replaceFunction(0x0014F610u, &resourceInit14f610);
@@ -6411,6 +6614,8 @@ namespace
         registerIpuTextureDecode(runtime);
         registerPadHle(runtime);
         registerAtv2NetworkHle(runtime);
+        registerSuzukiDz400(runtime);
+        atvInstallCrashTrace();
     }
 }
 

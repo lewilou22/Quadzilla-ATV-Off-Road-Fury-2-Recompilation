@@ -19,6 +19,7 @@
 #include <dbghelp.h>
 
 #include <algorithm>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -279,11 +280,95 @@ void atvStartHostProfilerForThisThread()
     startSamplingThisThread();
 }
 
+namespace
+{
+    // First few faults: code, thread, address and host call stack. Generated functions are named
+    // after their guest entry (sub_XXXXXXXX), so the stack is the guest chain. C++ throws are not
+    // faults (the EE scheduler switches threads with them).
+    LONG CALLBACK crashTraceHandler(EXCEPTION_POINTERS *info)
+    {
+        static LONG s_reported = 0;
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        if (code < 0xC0000000u || code == 0xE06D7363u /* C++ */ || code == EXCEPTION_GUARD_PAGE ||
+            InterlockedIncrement(&s_reported) > 4)
+            return EXCEPTION_CONTINUE_SEARCH;
+        static std::mutex s_mutex;
+        std::lock_guard<std::mutex> lock(s_mutex);
+        HANDLE proc = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+        SymInitialize(proc, nullptr, TRUE);
+        std::fprintf(stderr, "[ATV2] crash: exception 0x%08lx (info %llx 0x%llx) on thread %lu\n",
+                     static_cast<unsigned long>(code),
+                     static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[0]),
+                     static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[1]),
+                     static_cast<unsigned long>(GetCurrentThreadId()));
+        CONTEXT c = *info->ContextRecord;
+        for (int depth = 0; depth < 48 && c.Rip != 0u; ++depth)
+        {
+            alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+            auto *si = reinterpret_cast<SYMBOL_INFO *>(buf);
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0u;
+            IMAGEHLP_LINE64 line{};
+            line.SizeOfStruct = sizeof(line);
+            DWORD lineDisp = 0u;
+            const bool named = SymFromAddr(proc, c.Rip, &disp, si) != FALSE;
+            const bool lined = SymGetLineFromAddr64(proc, c.Rip, &lineDisp, &line) != FALSE;
+            std::fprintf(stderr, "[ATV2] crash:   #%d %s+0x%llx %s:%lu\n", depth, named ? si->Name : "?",
+                         static_cast<unsigned long long>(disp), lined ? line.FileName : "",
+                         lined ? static_cast<unsigned long>(line.LineNumber) : 0ul);
+            DWORD64 imageBase = 0u;
+            PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+            if (fe == nullptr)
+                break;
+            PVOID handlerData = nullptr;
+            DWORD64 establisher = 0u;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fe, &c, &handlerData, &establisher, nullptr);
+        }
+        std::fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+// ATV_CRASH_TRACE=1: report host faults (see crashTraceHandler).
+void atvInstallCrashTrace()
+{
+    static std::once_flag s_once;
+    if (std::getenv("ATV_CRASH_TRACE") == nullptr)
+        return;
+    std::call_once(s_once, []
+                   {
+                       AddVectoredExceptionHandler(1, &crashTraceHandler);
+                       std::set_terminate([]
+                                          {
+                                              try
+                                              {
+                                                  if (std::current_exception())
+                                                      std::rethrow_exception(std::current_exception());
+                                                  std::fprintf(stderr, "[ATV2] crash: std::terminate\n");
+                                              }
+                                              catch (const std::exception &e)
+                                              {
+                                                  std::fprintf(stderr, "[ATV2] crash: uncaught exception: %s\n", e.what());
+                                              }
+                                              catch (...)
+                                              {
+                                                  std::fprintf(stderr, "[ATV2] crash: uncaught non-std exception\n");
+                                              }
+                                              std::fflush(stderr);
+                                              std::abort();
+                                          }); });
+}
+
 #else
 void atvStartHostProfiler()
 {
 }
 void atvStartHostProfilerForThisThread()
+{
+}
+void atvInstallCrashTrace()
 {
 }
 #endif
