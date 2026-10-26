@@ -719,7 +719,9 @@ namespace
         }
 
         // CSC is BT.601 studio swing with chroma replicated over each 2x2 pixel quad. OFM=1
-        // output is A1B5G5R5; A is 1 because the game leaves the SETTH thresholds at zero.
+        // output is A1B5G5R5. The game leaves the SETTH thresholds at zero, so every pixel's CSC
+        // alpha is 0x80 and A is 0 (A is 1 only for alpha 0x40, as in PCSX2). Black then comes out
+        // 0x0000, which TEXA AEM=1 makes transparent: the gaps between the slats of race buildings.
         // Each 16x16 macroblock is emitted as one contiguous 512-byte block, in bitstream order.
         bool decodeM2vToMacroblockRgb16(const std::vector<uint8_t> &m2v, uint32_t width, uint32_t height,
                                         uint8_t *dst)
@@ -775,7 +777,7 @@ namespace
                         const int r = clampByte((lum + 204 * cr + 64) >> 7);
                         const int g = clampByte((lum - 104 * cr - 50 * cb + 64) >> 7);
                         const int b = clampByte((lum + 258 * cb + 64) >> 7);
-                        const uint16_t px = static_cast<uint16_t>(0x8000u | ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
+                        const uint16_t px = static_cast<uint16_t>(((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3));
                         const uint32_t mb = (y / 16u) * mbW + (x / 16u);
                         const uint32_t offset = mb * 512u + ((y & 15u) * 16u + (x & 15u)) * 2u;
                         std::memcpy(dst + offset, &px, sizeof(px));
