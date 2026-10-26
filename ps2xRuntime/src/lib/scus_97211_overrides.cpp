@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -38,6 +39,7 @@ extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
 void atv2ArmWriteWatch(uint8_t *rdram, uint32_t guestAddr, uint32_t len);
+void registerAtv2NetworkHle(PS2Runtime &runtime); // atv2_network_hle.cpp
 
 namespace
 {
@@ -4703,6 +4705,17 @@ namespace
                   << " vpAfter=0x" << vpAfter << std::dec << std::endl;
     }
 
+    // ATV2_TIMER0_PER_FRAME=1: old behaviour, the host pump bumps the timer-0 counter 0x488F38
+    // once per host frame instead of at 10 Hz real time.
+    bool timer0CounterPerHostFrame()
+    {
+        static const bool s_perFrame = []() {
+            const char *v = std::getenv("ATV2_TIMER0_PER_FRAME");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return s_perFrame;
+    }
+
     // Frame limiter hook @ 0x0015DA90
     // Runs on the main EE thread every frame.
     // Phase 1: Create viewport by calling func_1DFB00 (skipped because we bypass video).
@@ -4711,13 +4724,36 @@ namespace
     {
         static int s_frameCount = 0;
         static bool s_state5Triggered = false;
-        // ATV2_NATIVE_LOOP=1: skip the hand-driven FrontendManager harness below and let the
-        // game's own main loop run, so we can see what it does without forced state changes.
+        // The game's own main loop drives the front end by default. ATV2_NATIVE_LOOP=0 restores the
+        // hand-driven FrontendManager harness below (bring-up aid): it forces every UI node visible
+        // each frame, which leaves closed dialogs on screen and the profile-save / network-config
+        // pages unusable.
         static const bool s_nativeLoop = []() {
             const char *v = std::getenv("ATV2_NATIVE_LOOP");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
         ++s_frameCount;
+
+        // 0x488F38 counts timer-0 compare interrupts (handler FUN_00156590: RCNT0 %= 0xE100,
+        // counter++), i.e. one per 100 ms at RCNT0's 576 kHz; the game's millisecond clock is
+        // (RCNT0 + counter * 0xE100) / 576. The runtime doesn't dispatch that interrupt, and bumping
+        // the counter once per host frame made the clock run several times too fast (network
+        // timeouts expired before replies were processed). Advance it at the real 10 Hz instead.
+        if (!timer0CounterPerHostFrame())
+        {
+            static const auto s_start = std::chrono::steady_clock::now();
+            static uint64_t s_ticks = 0;
+            const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                             std::chrono::steady_clock::now() - s_start)
+                                                             .count()) /
+                                   100u;
+            if (ticks > s_ticks)
+            {
+                uint32_t *counter = reinterpret_cast<uint32_t *>(getMemPtr(rdram, 0x00488F38u));
+                *counter += static_cast<uint32_t>(ticks - s_ticks);
+                s_ticks = ticks;
+            }
+        }
 
         // ATV2_STACKSCAN=1: at frames 30 and 90, list guest return addresses on the stack
         // (words preceded by jal/jalr) to recover the call chain that reached the limiter.
@@ -5350,7 +5386,52 @@ namespace
             // with no parent screen), so the presses don't pause the race.
             static const bool s_untilRace = std::getenv("ATV2_AUTO_CROSS_UNTIL_RACE") != nullptr;
             static int s_reads = 0;
-            if (s_untilRace && READ32(0x005425E0u + 0xCCu) == 2u && READ32(0x005425E0u + 0x1Cu) == 0u)
+            // ATV2_PAD_SCRIPT=<read>:<button>,...: test aid, presses each button for 6 port-0 reads
+            // starting at that read. Buttons: X O T S U D L R ST SEL L1 R1 L2 R2.
+            static const std::vector<std::pair<int, uint16_t>> s_script = []() {
+                std::vector<std::pair<int, uint16_t>> out;
+                const char *s = std::getenv("ATV2_PAD_SCRIPT");
+                if (s == nullptr)
+                    return out;
+                static const std::pair<const char *, uint16_t> kButtons[] = {
+                    {"X", 0x4000u}, {"O", 0x2000u}, {"T", 0x1000u}, {"S", 0x8000u}, {"U", 0x0010u},
+                    {"D", 0x0040u}, {"L", 0x0080u}, {"R", 0x0020u}, {"ST", 0x0008u}, {"SEL", 0x0001u},
+                    {"L1", 0x0400u}, {"R1", 0x0800u}, {"L2", 0x0100u}, {"R2", 0x0200u}};
+                std::string all(s);
+                size_t pos = 0;
+                while (pos < all.size())
+                {
+                    size_t end = all.find(',', pos);
+                    if (end == std::string::npos)
+                        end = all.size();
+                    const std::string tok = all.substr(pos, end - pos);
+                    const size_t colon = tok.find(':');
+                    if (colon != std::string::npos)
+                        for (const auto &b : kButtons)
+                            if (tok.compare(colon + 1, std::string::npos, b.first) == 0)
+                                out.emplace_back(std::atoi(tok.c_str()), b.second);
+                    pos = end + 1;
+                }
+                return out;
+            }();
+            static int s_scriptReads = 0;
+            if (!s_script.empty() && a0 == 0u)
+            {
+                ++s_scriptReads;
+                uint16_t held = 0;
+                for (const auto &step : s_script)
+                    if (s_scriptReads >= step.first && s_scriptReads < step.first + 6)
+                        held |= step.second;
+                for (const auto &step : s_script)
+                    if (s_scriptReads == step.first)
+                        std::cerr << "[ATV2:PAD] script press 0x" << std::hex << step.second << std::dec << " at read "
+                                  << s_scriptReads << std::endl;
+                if (held != 0)
+                    ps2_stubs::setPadOverrideState(0xFFFFu & ~held, 0x80u, 0x80u, 0x80u, 0x80u);
+                else
+                    ps2_stubs::clearPadOverrideState();
+            }
+            else if (s_untilRace && READ32(0x005425E0u + 0xCCu) == 2u && READ32(0x005425E0u + 0x1Cu) == 0u)
             {
                 // Race running: release any held press once, then leave the pad alone.
                 // ATV2_RACE_THROTTLE=1 instead holds Cross (throttle) for the whole race.
@@ -5675,10 +5756,11 @@ namespace
         // FUN_0015da90: `while (iRam00489008 < param_1)`). Its only in-game writer is the
         // GS-flip tail of sub_0015D4A0 (called from sub_001CD090), which never runs because
         // the game's VBlank INTC handler (FUN_00156590, registered on channel 9) is not
-        // dispatched by the runtime as a frame tick. Host pump bumps this + the VBlank tick
-        // 0x488f38 once per host frame (ps2_runtime.cpp bumpGuestCounter).
+        // dispatched by the runtime as a frame tick. Host pump bumps this once per host frame
+        // (ps2_runtime.cpp bumpGuestCounter). The timer-0 counter 0x488f38 is advanced at 10 Hz
+        // real time by frameLimiter15da90; ATV2_TIMER0_PER_FRAME=1 restores the old per-frame bump.
         g_ps2GuestVsyncCounterAddr = 0x00489008u;
-        g_ps2GuestVsyncCounterAddr2 = 0x00488f38u;
+        g_ps2GuestVsyncCounterAddr2 = timer0CounterPerHostFrame() ? 0x00488f38u : 0u;
 
         // pc=0 resume machinery (ATV1 pattern): when main thread goes Dormant at pc=0,
         // EeScheduler's usableResume() will resume it to the GS flip handler (0x164160)
@@ -5997,6 +6079,7 @@ namespace
         registerVif1TextureIbit(runtime);
         registerIpuTextureDecode(runtime);
         registerPadHle(runtime);
+        registerAtv2NetworkHle(runtime);
     }
 }
 

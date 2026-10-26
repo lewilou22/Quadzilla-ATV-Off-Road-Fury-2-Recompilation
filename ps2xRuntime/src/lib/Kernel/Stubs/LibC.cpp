@@ -209,6 +209,18 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
         size = sanitizeMemTransferSize(size, "memmove");
+        const uint32_t room = std::min(guestContiguousBytes(destAddr), guestContiguousBytes(srcAddr));
+        if (size > room)
+        {
+            static int s_warned = 0;
+            if (s_warned < 16)
+            {
+                ++s_warned;
+                std::cerr << "[memmove] size clamp from 0x" << std::hex << size << " to 0x" << room << " dst=0x"
+                          << destAddr << " src=0x" << srcAddr << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+            }
+            size = room;
+        }
 
         uint32_t copied = 0u;
         std::vector<uint8_t> tmp;
@@ -305,6 +317,20 @@ namespace ps2_stubs
 
         if (hostDest && hostSrc)
         {
+            // strncpy zero-pads to `size`; never let a bogus length run off the guest RAM mapping.
+            const uint32_t room = guestContiguousBytes(destAddr);
+            if (size > room)
+            {
+                static int s_warned = 0;
+                if (s_warned < 16)
+                {
+                    ++s_warned;
+                    std::cerr << "[strncpy] size clamp from 0x" << std::hex << size << " to 0x" << room
+                              << " dst=0x" << destAddr << " src=0x" << srcAddr << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << std::endl;
+                }
+                size = room;
+            }
             ::strncpy(hostDest, hostSrc, size);
             ps2TraceGuestRangeWrite(rdram, destAddr, size, "strncpy", ctx);
         }
@@ -529,6 +555,17 @@ namespace ps2_stubs
 
         if (format_addr != 0)
         {
+            if (formatOwned.find('*') != std::string::npos)
+            {
+                static int s_starLogs = 0;
+                if (s_starLogs < 16)
+                {
+                    ++s_starLogs;
+                    std::cerr << "[printf] '*' format ra=0x" << std::hex << getRegU32(ctx, 31) << " a1=0x"
+                              << getRegU32(ctx, 5) << " a2=0x" << getRegU32(ctx, 6) << " a3=0x" << getRegU32(ctx, 7)
+                              << std::dec << " fmt=\"" << sanitizeForLog(formatOwned.substr(0, 120)) << "\"" << std::endl;
+                }
+            }
             std::string rendered = formatPs2StringWithArgs(rdram, ctx, runtime, formatOwned.c_str(), 1);
             if (rendered.size() > 2048)
             {
@@ -551,6 +588,13 @@ namespace ps2_stubs
                     std::cerr << "PS2 printf logging suppressed after " << kMaxPrintfLogs << " lines" << std::endl;
                 }
             });
+            // PS2_GUEST_PRINTF=1: echo the game's own printf output (library diagnostics).
+            static const bool s_echo = []() {
+                const char *v = std::getenv("PS2_GUEST_PRINTF");
+                return v != nullptr && v[0] != '0';
+            }();
+            if (s_echo)
+                std::cerr << "[guest printf] " << sanitizeForLog(rendered) << std::endl;
             ret = static_cast<int>(rendered.size());
         }
         else

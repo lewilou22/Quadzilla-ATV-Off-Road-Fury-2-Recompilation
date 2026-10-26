@@ -463,6 +463,13 @@ endif()
 
 target_sources(ps2EntryRunner PRIVATE
     src/lib/scus_97211_overrides.cpp
+    src/lib/atv2_network_hle.cpp
+)
+
+# Uses Winsock (windows.h), which conflicts with raylib from the runner PCH.
+set_source_files_properties(src/lib/atv2_network_hle.cpp PROPERTIES
+    SKIP_PRECOMPILE_HEADERS ON
+    SKIP_UNITY_BUILD_INCLUSION ON
 )
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)

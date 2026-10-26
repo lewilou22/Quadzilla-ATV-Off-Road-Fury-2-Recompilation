@@ -52,6 +52,9 @@ uint32_t g_ps2IdleResumeA0 = 0;
 uint32_t g_ps2HoldEeTimeslices = 0;
 // Gates the VU1 race-only diagnostics (ATV_VU_FAST_VERIFY, ATV_TRACE_VU_GEOMETRY).
 bool g_raceLoadStarted = false;
+// FPU_C_* macros (ps2_runtime_macros.h): EE ordering by default, host IEEE
+// compares with ATV_FPU_IEEE_COMPARE=1.
+bool g_ps2FpuIeeeCompare = std::getenv("ATV_FPU_IEEE_COMPARE") != nullptr;
 // VU1 bench (ATV_VU_BENCH) hook; the ATV1 host sampling profiler is not ported.
 void atvStartHostProfiler() {}
 
