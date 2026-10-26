@@ -315,6 +315,13 @@
                              static_cast<unsigned>(s_fastOps.readsFlags));
         }
         g_vuSkippedFlagsReady = 0;
+        // ATV_VU_NO_CLIP_RING=1: CLIP results go through the flag pipeline.
+        static const bool s_noClipRing = std::getenv("ATV_VU_NO_CLIP_RING") != nullptr;
+        g_vuClipRing = !s_noClipRing && !s_keepFlags && !g_vuVerifyFast && !g_vuVerifyTrace;
+        // ATV_VU_NO_LAZY_Q=1: DIV results commit through the pipeline pass.
+        static const bool s_noLazyQ = std::getenv("ATV_VU_NO_LAZY_Q") != nullptr;
+        g_vuLazyQ = !s_noLazyQ && !s_keepFlags && (s_fastOps.readsFlags & kReadsStatus) == 0u && !g_vuVerifyFast &&
+                    !g_vuVerifyTrace;
         g_vuDirectStores = true;
         uint64_t writesReadyAt = 0;
         bool fastLeft = false;
@@ -1429,6 +1436,40 @@
                 break;
             }
         }
+        applyPendingClip(m_state.clip, fastLeft ? m_cycle : std::numeric_limits<uint64_t>::max());
+        for (; g_vuPendingClipCount != 0u; --g_vuPendingClipCount)
+        {
+            const PendingClip &pending = g_vuPendingClip[g_vuPendingClipHead];
+            g_vuPendingClipHead = (g_vuPendingClipHead + 1u) % kPendingClipSlots;
+            for (FlagPipelineEntry &entry : m_flagPipeline)
+            {
+                if (entry.valid)
+                    continue;
+                entry = {};
+                entry.valid = true;
+                entry.issueCycle = pending.readyCycle - kFmacLatency;
+                entry.readyCycle = pending.readyCycle;
+                noteQueued(this, kPipeFlag, m_flagPipeline, entry);
+                entry.clip = pending.clip;
+                entry.writesClip = true;
+                break;
+            }
+        }
+        g_vuClipRing = false;
+        if (g_vuLazyQ && m_fdiv.valid)
+        {
+            // Back on the commit schedule for the interpreter and the drain.
+            if (m_fdiv.readyCycle <= m_cycle)
+            {
+                m_state.q = m_fdiv.value;
+                const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+                m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+                m_fdiv = {};
+            }
+            else
+                noteQueued(this, m_fdiv.readyCycle);
+        }
+        g_vuLazyQ = false;
         g_vuMacOnlyFlags = false;
         g_vuSkipMacFlags = false;
         g_vuFmacLean = false;

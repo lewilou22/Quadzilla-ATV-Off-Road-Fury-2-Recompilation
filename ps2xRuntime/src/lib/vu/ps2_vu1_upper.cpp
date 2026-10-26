@@ -44,6 +44,14 @@ void VU1Interpreter::execUpper(uint32_t instr)
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
+    // A lazily committed DIV result (g_vuLazyQ) whose cycle has come.
+    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+    {
+        m_state.q = m_fdiv.value;
+        const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+        m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+        m_fdiv = {};
+    }
     const float q = vuNormalizeOperand(m_state.q);
     const float i = vuNormalizeOperand(m_state.i);
     float result[4];

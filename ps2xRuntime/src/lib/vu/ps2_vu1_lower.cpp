@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 
+void vu1ApplyPendingClip(uint32_t &clip, uint64_t cycle); // ps2_vu1_core.cpp: clip ring
+
 namespace
 {
     float vuEatan(float value)
@@ -176,6 +178,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x10: // FCEQ
     {
+        vu1ApplyPendingClip(m_state.clip, m_cycle);
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
@@ -188,6 +191,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x12: // FCAND
     {
+        vu1ApplyPendingClip(m_state.clip, m_cycle);
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
@@ -195,6 +199,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x13: // FCOR
     {
+        vu1ApplyPendingClip(m_state.clip, m_cycle);
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
@@ -256,6 +261,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1C: // FCGET
     {
+        vu1ApplyPendingClip(m_state.clip, m_cycle);
         const uint8_t it = VIT(instr);
         if (it != 0)
             m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0xFFFFu);

@@ -44,6 +44,7 @@ extern bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size,
 extern uint64_t (*g_ps2GsCsrReadHook)(uint32_t pc, uint64_t value); // ps2_runtime.cpp
 bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width, uint32_t height,
                               uint8_t *dst); // Kernel/Stubs/IPU.cpp
+extern bool g_raceLoadStarted; // gates the race-only diagnostics (ATV_VU_FAST_VERIFY, GS traces)
 extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
@@ -5059,6 +5060,11 @@ namespace
 
     void videoCardFlip15e370(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (!g_raceLoadStarted)
+        {
+            const uint32_t feState = READ32(0x005425E0u + 0xCCu); // 5 loading an event, 2 racing
+            g_raceLoadStarted = feState == 5u || feState == 2u;
+        }
         static const bool s_traceFps = std::getenv("ATV_TRACE_FPS") != nullptr;
         if (s_traceFps)
         {

@@ -388,7 +388,9 @@ struct VU1Native
 
     // Lean = g_vuFmacLean holds: no status flags (at most MAC), so an FMAC
     // result only needs fmacSlow when a lane is not provably normal or exactly zero.
-    template <bool Lean = false, typename OpArg>
+    // NoMac: merge_blocks.py proved no instruction can read this op's MAC
+    // before a later FMAC replaces it, so the MAC-only push is skipped.
+    template <bool Lean = false, bool NoMac = false, typename OpArg>
     static __forceinline void fastUpper(Interp &vu, const OpArg &opArg, uint32_t upper)
     {
         const FastOp op = asFastOp(opArg);
@@ -491,7 +493,17 @@ struct VU1Native
         case kMul: result = _mm_mul_ps(vs, vt); break;
         case kMax: result = _mm_max_ps(vs, vt); fmac = false; break;
         case kMini: result = _mm_min_ps(vs, vt); fmac = false; break;
-        case kMulQ: right = vuNormalize4(_mm_set1_ps(m_state.q)); result = _mm_mul_ps(vs, right); break;
+        case kMulQ:
+            if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle <= vu.m_cycle) // lazy Q (g_vuLazyQ)
+            {
+                m_state.q = vu.m_fdiv.value;
+                const uint32_t currentDi = vu.m_fdiv.statusDi & 0x30u;
+                m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+                vu.m_fdiv = {};
+            }
+            right = vuNormalize4(_mm_set1_ps(m_state.q));
+            result = _mm_mul_ps(vs, right);
+            break;
         case kMiniI: result = _mm_min_ps(vs, vuNormalize4(_mm_set1_ps(m_state.i))); fmac = false; break;
         case kMulI: right = vuNormalize4(_mm_set1_ps(m_state.i)); result = _mm_mul_ps(vs, right); break;
         case kAddI: right = vuNormalize4(_mm_set1_ps(m_state.i)); result = _mm_add_ps(vs, right); zeroRule = kZeroAdd; break;
@@ -534,7 +546,7 @@ struct VU1Native
                 const __m128i handled = _mm_or_si128(normal, exactZero);
                 if (_mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(handled, destMask))) != 0)
                     result = fmacSlow(vu, upper, op.dest, result, exactZero);
-                else if (g_vuMacOnlyFlags && op.dest != 0u)
+                else if (!NoMac && g_vuMacOnlyFlags && op.dest != 0u)
                 {
                     static constexpr uint8_t kComponentsToLanes[16] = {0, 8, 4, 12, 2, 10, 6, 14,
                                                                        1, 9, 5, 13, 3, 11, 7, 15};
@@ -785,12 +797,18 @@ struct VU1Native
             return;
         }
         case kFcand:
+            if (g_vuPendingClipCount != 0u)
+                applyPendingClip(m_state.clip, vu.m_cycle);
             m_state.vi[1] = (m_state.clip & instr & 0xFFFFFFu) != 0u ? 1 : 0;
             return;
         case kFcor:
+            if (g_vuPendingClipCount != 0u)
+                applyPendingClip(m_state.clip, vu.m_cycle);
             m_state.vi[1] = (m_state.clip | (instr & 0xFFFFFFu)) == 0xFFFFFFu ? 1 : 0;
             return;
         case kFcget:
+            if (g_vuPendingClipCount != 0u)
+                applyPendingClip(m_state.clip, vu.m_cycle);
             if (VIT(instr) != 0)
                 m_state.vi[VIT(instr)] = static_cast<int16_t>(m_state.clip & 0xFFFFu);
             return;
@@ -1029,14 +1047,30 @@ struct VU1Native
                 vu.progressXgkick();
         }
     }
+    // Interpreter state at fixed offsets from `vu`, which merged blocks keep
+    // in a register (reading them through Ctx pointers reloads the pointer
+    // after every call).
+    static __forceinline uint64_t *vfReadyOf(Interp &vu) { return vu.m_vfReady[0].data(); }
+    static __forceinline uint64_t *viReadyOf(Interp &vu) { return vu.m_viReady.data(); }
+    static __forceinline uint64_t *accReadyOf(Interp &vu) { return vu.m_accReady.data(); }
+    static __forceinline uint64_t cycleOf(const Interp &vu) { return vu.m_cycle; }
+    static __forceinline void clearViBackup(Interp &vu) { vu.m_viBranchBackupValid = false; }
+    static __forceinline void recordVi(Interp &vu, uint8_t reg, int32_t oldValue)
+    {
+        vu.recordViWriteForBranch(reg, oldValue);
+    }
+    // Four lanes of a VF or ACC ready entry set to one cycle (merged blocks).
+    static __forceinline void setReady4(uint64_t *slots, uint64_t value)
+    {
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(slots), _mm256_set1_epi64x(static_cast<long long>(value)));
+    }
     // endCycle for merged blocks, which keep the cycle in a local `cyc`:
     // m_cycle is stored on every increment (helpers read it), never reloaded
     // except after advanceTo/waitXgkick, the only calls that move it.
-    static __forceinline void endCycleLocal(Ctx &c, uint64_t &cyc)
+    static __forceinline void endCycleLocal(Interp &vu, uint64_t &cyc, const uint64_t *nextReady)
     {
-        Interp &vu = *c.vu;
         vu.m_cycle = ++cyc;
-        if (cyc >= c.hint->nextReady)
+        if (cyc >= *nextReady)
             vu.commitReadyPipelines();
         if (vu.m_xgkick.active)
         {
@@ -1055,11 +1089,11 @@ struct VU1Native
     }
     // The lean path inline, every other flag mode out of line, so the common
     // case pays one check and needs fewer saved registers.
-    template <uint64_t Packed, uint32_t Upper>
+    template <uint64_t Packed, uint32_t Upper, bool NoMac = false>
     static __declspec(noinline) void upperOp(Interp &vu)
     {
         if (g_vuFmacLean)
-            fastUpper<true>(vu, std::integral_constant<uint64_t, Packed>{}, Upper);
+            fastUpper<true, NoMac>(vu, std::integral_constant<uint64_t, Packed>{}, Upper);
         else
             upperOpGeneral<Packed, Upper>(vu);
     }

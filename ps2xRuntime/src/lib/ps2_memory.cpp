@@ -377,10 +377,12 @@ void PS2Memory::stopGsWorker()
 
 void atvStartHostProfilerForThisThread();
 void gsFlushWorkerGif(); // gs_frontend.cpp: queue this thread's batched GIF packets
+void gsMarkGifBatchingThread(); // gs_frontend.cpp: this thread batches its GIF packets
 
 void PS2Memory::gsWorkerMain()
 {
     t_onGsWorker = true;
+    gsMarkGifBatchingThread();
     // Same float environment as the game thread (FTZ|DAZ from GameThread start), where VU1 ran before.
     _mm_setcsr(_mm_getcsr() | 0x8040u);
     if (std::getenv("ATV_HOST_PROFILE_VU1") != nullptr)

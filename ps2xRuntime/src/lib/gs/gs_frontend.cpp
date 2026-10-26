@@ -257,7 +257,7 @@ namespace
     {
     public:
         explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
-            : m_inner(std::move(inner))
+            : m_inner(std::move(inner)), m_cpu(dynamic_cast<GSCpuBackend *>(m_inner.get()))
         {
             m_worker = std::thread([this]
                                    { workerLoop(); });
@@ -652,6 +652,7 @@ namespace
             static const bool s_profileWorker = std::getenv("ATV_HOST_PROFILE_GS") != nullptr;
             bool profilerStarted = false;
             std::vector<Command> batch;
+            std::vector<const GSPrimitiveBatch *> primitives;
             uint64_t batchEnd = 0;
             uint64_t workerBusyNs = 0, workerCommands = 0, workerBatches = 0, workerStatStart = 0;
             for (;;)
@@ -682,8 +683,27 @@ namespace
                 }
                 m_changed.notify_all();
                 const uint64_t busyStart = s_queueStats ? statNowNs() : 0u;
-                for (Command &command : batch)
-                    execute(command);
+                // Consecutive primitives go to the CPU backend under one lock.
+                // ATV_GS_NO_SUBMIT_MANY=1: one Submit (and lock) per primitive.
+                static const bool s_noSubmitMany = std::getenv("ATV_GS_NO_SUBMIT_MANY") != nullptr;
+                for (size_t i = 0; i < batch.size();)
+                {
+                    if (m_cpu && !s_noSubmitMany && std::holds_alternative<GSPrimitiveBatch>(batch[i]))
+                    {
+                        primitives.clear();
+                        for (; i < batch.size(); ++i)
+                        {
+                            const GSPrimitiveBatch *primitive = std::get_if<GSPrimitiveBatch>(&batch[i]);
+                            if (!primitive)
+                                break;
+                            primitives.push_back(primitive);
+                        }
+                        m_cpu->SubmitMany(primitives.data(), primitives.size());
+                        continue;
+                    }
+                    execute(batch[i]);
+                    ++i;
+                }
                 if (s_queueStats)
                 {
                     const uint64_t now = statNowNs();
@@ -707,6 +727,7 @@ namespace
         }
 
         std::unique_ptr<GSRasterBackend> m_inner;
+        GSCpuBackend *m_cpu = nullptr; // m_inner when it is the CPU backend
         // Lock order: m_stageMutex before m_mutex. The worker never takes it.
         mutable std::mutex m_stageMutex;
         mutable std::vector<Command> m_staged;
@@ -890,6 +911,7 @@ namespace
     // fencing the idle worker, so they never miss a batched packet.
     // ATV_GS_GIF_NO_BATCH=1 queues every packet at once.
     constexpr size_t kGifBatchMax = 64u;
+    thread_local bool t_gifBatching = false; // set by gsMarkGifBatchingThread
     thread_local std::vector<std::vector<uint8_t>> t_gifBatch;
     thread_local std::vector<std::vector<uint8_t>> t_gifFree;
 
@@ -947,7 +969,7 @@ namespace
             asyncGifDrain("queueFull");
 
         static const bool s_noBatch = std::getenv("ATV_GS_GIF_NO_BATCH") != nullptr;
-        if (!s_noBatch && PS2Memory::onGsWorker())
+        if (!s_noBatch && t_gifBatching)
         {
             std::vector<uint8_t> packet;
             if (!t_gifFree.empty())
@@ -997,6 +1019,11 @@ namespace
         GSApiScope(const GSApiScope &) = delete;
         GSApiScope &operator=(const GSApiScope &) = delete;
     };
+}
+
+void gsMarkGifBatchingThread()
+{
+    t_gifBatching = true;
 }
 
 void gsFlushWorkerGif()

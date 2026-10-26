@@ -43,6 +43,9 @@ public:
     void Reset() override;
 
     void Submit(const GSPrimitiveBatch &batch) override;
+    // Submit for a run of primitives under one lock (the threaded backend's
+    // worker hands over consecutive primitive commands this way).
+    void SubmitMany(const GSPrimitiveBatch *const *batches, size_t count);
     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
     void BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
@@ -124,6 +127,7 @@ private:
     };
     void StartBandThreads();
     void QueueBandedPrimitive(const GSPrimitiveBatch &batch);
+    void SubmitUnlocked(const GSPrimitiveBatch &batch);
     enum class BandFlushReason : uint8_t
     {
         Other, Alias, Batch, Hazard, Clut, Texture, Sync, Read, Write, Upload, Clear, Count
@@ -156,6 +160,27 @@ private:
     mutable std::vector<std::pair<size_t, ClutTable>> m_bandClutChanges;
     mutable ClutTable m_bandInFlightClutStart{};
     mutable std::vector<std::pair<size_t, ClutTable>> m_bandInFlightClutChanges;
+    bool PendingWritesTouch(const BandWrite &range) const;
+    bool PendingReadsTouch(const BandWrite &range) const;
+    // The upload must flush queued draws: they write its pages, or freezing
+    // is off and they read them, or its range is unbounded or too large.
+    bool UploadNeedsFlush() const;
+    // An upload over pages queued draws only read keeps the old page bytes
+    // for those draws instead of flushing them (FreezePendingPages): span
+    // [from, to) of the pending batch's primitives reads `buffer`.
+    struct FrozenSpan
+    {
+        uint32_t pageBase, from, to, buffer;
+    };
+    void FreezePendingPages(const BandWrite &range);
+    bool m_freezeUploads = true;
+    mutable std::vector<FrozenSpan> m_bandFrozen;
+    mutable std::vector<std::vector<uint8_t>> m_bandFrozenBytes;
+    mutable std::vector<std::vector<uint8_t>> m_bandInFlightFrozenBytes;
+    mutable std::vector<std::vector<uint8_t>> m_frozenPool;
+    mutable std::vector<std::pair<uint32_t, uint32_t>> m_pageVersionStart; // page -> first primitive of its contents
+    // Per texture-flush segment of the in-flight batch: frozen pages it reads.
+    mutable std::vector<std::vector<GSMem::FrozenPage>> m_bandInFlightSegments;
     // Everything QueueBandedPrimitive's ranges depend on. A primitive with the
     // key of the last one queued since the last flush adds no ranges and hits
     // no alias or hazard (that one passed the same checks), so it is appended.

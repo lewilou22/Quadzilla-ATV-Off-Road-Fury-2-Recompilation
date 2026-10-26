@@ -111,6 +111,35 @@ namespace
         ++g_vuPendingMacCount;
         g_vuSkippedFlagsReady = std::max(g_vuSkippedFlagsReady, readyCycle);
     }
+    // Set while the fast loop runs: CLIP and FCSET queue their clip flag here
+    // (issue order, at most one per cycle) instead of a flag
+    // pipeline entry, and clip readers apply the ones visible by their cycle
+    // (applyPendingClip). Saves the commit pass a pipeline entry costs.
+    bool g_vuClipRing = false;
+    // Set while the fast loop runs a code image without status-flag reads: a
+    // DIV/SQRT/RSQRT result schedules no commit pass; Q readers (execUpper,
+    // the fast MULq) commit it once its cycle has come. A new FDIV op commits
+    // the previous result first (it stalled until that result was ready).
+    bool g_vuLazyQ = false;
+    struct PendingClip
+    {
+        uint64_t readyCycle;
+        uint32_t clip;
+    };
+    constexpr uint32_t kPendingClipSlots = 8u; // > FMAC latency, like the MAC ring
+    PendingClip g_vuPendingClip[kPendingClipSlots];
+    uint32_t g_vuPendingClipHead = 0;
+    uint32_t g_vuPendingClipCount = 0;
+
+    void applyPendingClip(uint32_t &clip, uint64_t cycle)
+    {
+        while (g_vuPendingClipCount != 0u && g_vuPendingClip[g_vuPendingClipHead].readyCycle <= cycle)
+        {
+            clip = g_vuPendingClip[g_vuPendingClipHead].clip;
+            g_vuPendingClipHead = (g_vuPendingClipHead + 1u) % kPendingClipSlots;
+            --g_vuPendingClipCount;
+        }
+    }
     // Set while the fast loop runs: stores write VU memory at issue. A queued
     // store would land at the next cycle boundary, before the next pair and
     // before PATH1 reads that cycle's qword, and a pair holds at most one
@@ -1186,9 +1215,25 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
 // commitReadyPipelines calls that found a due entry (ATV_VU_NATIVE_STATS).
 static uint64_t g_vuCommitPasses = 0;
 
+void vu1ApplyPendingClip(uint32_t &clip, uint64_t cycle)
+{
+    if (g_vuPendingClipCount != 0u)
+        applyPendingClip(clip, cycle);
+}
+
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
+    if (g_vuClipRing)
+    {
+        if (g_vuPendingClipCount == kPendingClipSlots)
+            applyPendingClip(m_state.clip, g_vuPendingClip[g_vuPendingClipHead].readyCycle);
+        const uint64_t ready = m_cycle + kFmacLatency;
+        g_vuPendingClip[(g_vuPendingClipHead + g_vuPendingClipCount) % kPendingClipSlots] = {ready, m_workingClip};
+        ++g_vuPendingClipCount;
+        g_vuSkippedFlagsReady = std::max(g_vuSkippedFlagsReady, ready);
+        return;
+    }
     for (FlagPipelineEntry &entry : m_flagPipeline)
     {
         if (!entry.valid)
@@ -1209,6 +1254,24 @@ void VU1Interpreter::queueClip(uint32_t clip)
 void VU1Interpreter::queueFcset(uint32_t clip)
 {
     m_workingClip = clip & 0xFFFFFFu;
+    if (g_vuClipRing)
+    {
+        // Replaces a CLIP issued this cycle (the only clip entries are in the
+        // ring), else queues its own entry with the same latency.
+        const uint64_t ready = m_cycle + kFmacLatency;
+        const uint32_t last = (g_vuPendingClipHead + g_vuPendingClipCount + kPendingClipSlots - 1u) % kPendingClipSlots;
+        if (g_vuPendingClipCount != 0u && g_vuPendingClip[last].readyCycle == ready)
+        {
+            g_vuPendingClip[last].clip = m_workingClip;
+            return;
+        }
+        if (g_vuPendingClipCount == kPendingClipSlots)
+            applyPendingClip(m_state.clip, g_vuPendingClip[g_vuPendingClipHead].readyCycle);
+        g_vuPendingClip[(g_vuPendingClipHead + g_vuPendingClipCount) % kPendingClipSlots] = {ready, m_workingClip};
+        ++g_vuPendingClipCount;
+        g_vuSkippedFlagsReady = std::max(g_vuSkippedFlagsReady, ready);
+        return;
+    }
     for (FlagPipelineEntry &entry : m_flagPipeline)
     {
         if (entry.valid && entry.issueCycle == m_cycle)
@@ -1235,9 +1298,20 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
 {
     uint32_t ignoredFlags = 0u;
     value = normalizeResult(value, ignoredFlags);
+    if (g_vuLazyQ)
+    {
+        if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+        {
+            m_state.q = m_fdiv.value;
+            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+            m_fdiv = {};
+        }
+    }
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
-    noteQueued(this, m_fdiv.readyCycle);
+    if (!g_vuLazyQ)
+        noteQueued(this, m_fdiv.readyCycle);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }

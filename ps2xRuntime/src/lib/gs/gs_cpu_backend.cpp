@@ -1299,6 +1299,12 @@ GSCpuBackend::GSCpuBackend()
 
     m_legacyTextureFlush = std::getenv("ATV_GS_LEGACY_TEXFLUSH") != nullptr;
     m_uploadNoFlush = std::getenv("ATV_GS_UPLOAD_FLUSH") == nullptr;
+    // ATV_GS_UPLOAD_FLUSH_READS=1: an upload over pages queued draws read
+    // flushes them (as before) instead of freezing the old page bytes.
+    // Frozen spans end at the upload's texture-flush marker, which
+    // ATV_GS_UPLOAD_NO_TEXFLUSH drops.
+    m_freezeUploads = std::getenv("ATV_GS_UPLOAD_FLUSH_READS") == nullptr &&
+                      std::getenv("ATV_GS_UPLOAD_NO_TEXFLUSH") == nullptr;
     m_profileBands = std::getenv("ATV_GS_PROFILE_BANDS") != nullptr;
     m_bandPipeline = std::getenv("ATV_GS_BAND_PIPELINE") != nullptr;
     // ATV2 default (ATV1 sets ATV_GS_BANDS=12 in play_game.bat): up to 12 raster bands, half the
@@ -1366,6 +1372,13 @@ void GSCpuBackend::DrawBand(uint32_t band)
     t_ownedBandRow = -1;
     const uint64_t start = m_profileBands ? bandClockNs() : 0;
     auto &cache = band == 0u ? m_texturePageCache : *m_bandCaches[band - 1u];
+    const bool frozen = !m_bandInFlightSegments.empty();
+    const auto useSegment = [&](size_t segment) {
+        const std::vector<GSMem::FrozenPage> &pages = m_bandInFlightSegments[segment];
+        cache.SetOverrides(pages.data(), static_cast<uint32_t>(pages.size()));
+    };
+    if (frozen)
+        useSegment(0);
     size_t index = 0, nextFlush = 0, nextClut = 0;
     t_drawClut = m_bandInFlightClutStart.data();
     for (const GSPrimitiveBatch &batch : m_bandInFlight)
@@ -1374,6 +1387,8 @@ void GSCpuBackend::DrawBand(uint32_t band)
         {
             cache.Invalidate();
             ++nextFlush;
+            if (frozen)
+                useSegment(nextFlush);
         }
         while (nextClut < m_bandInFlightClutChanges.size() && m_bandInFlightClutChanges[nextClut].first == index)
             t_drawClut = m_bandInFlightClutChanges[nextClut++].second.data();
@@ -1384,6 +1399,8 @@ void GSCpuBackend::DrawBand(uint32_t band)
     t_drawClut = nullptr;
     if (nextFlush < m_bandInFlightTextureFlushes.size())
         cache.Invalidate(); // TEXFLUSH after the final queued primitive.
+    if (frozen)
+        cache.SetOverrides(nullptr, 0u);
     if (m_profileBands)
         m_bandDrawNs[band] = bandClockNs() - start;
 }
@@ -1425,6 +1442,27 @@ void GSCpuBackend::FlushBands(BandFlushReason reason) const
     m_lastBandKeyValid = false;
     m_bandInFlightReads.swap(m_bandReads);
     m_bandReads.clear();
+    // The previous in-flight batch is done (WaitBandsIdle above): recycle its
+    // frozen pages, then give this batch its own, per texture-flush segment.
+    for (std::vector<uint8_t> &bytes : m_bandInFlightFrozenBytes)
+        m_frozenPool.push_back(std::move(bytes));
+    m_bandInFlightFrozenBytes.clear();
+    m_bandInFlightSegments.clear();
+    if (!m_bandFrozen.empty())
+    {
+        m_bandInFlightFrozenBytes.swap(m_bandFrozenBytes);
+        const size_t segments = m_bandInFlightTextureFlushes.size() + 1u;
+        m_bandInFlightSegments.resize(segments);
+        for (size_t s = 0; s < segments; ++s)
+        {
+            const uint32_t segmentStart = s == 0u ? 0u : static_cast<uint32_t>(m_bandInFlightTextureFlushes[s - 1u]);
+            for (const FrozenSpan &span : m_bandFrozen)
+                if (span.from <= segmentStart && segmentStart < span.to)
+                    m_bandInFlightSegments[s].push_back({span.pageBase, m_bandInFlightFrozenBytes[span.buffer].data()});
+        }
+        m_bandFrozen.clear();
+    }
+    m_pageVersionStart.clear();
     {
         std::lock_guard<std::mutex> lock(m_bandMutex);
         m_bandRemaining = m_bandPipeline ? m_bandCount : m_bandCount - 1u;
@@ -1618,6 +1656,67 @@ bool GSCpuBackend::InFlightTouches(const BandWrite &range) const
     return false;
 }
 
+bool GSCpuBackend::PendingWritesTouch(const BandWrite &range) const
+{
+    for (const BandWrite &write : m_bandWrites)
+        if (overlaps(range, write))
+            return true;
+    return false;
+}
+
+bool GSCpuBackend::PendingReadsTouch(const BandWrite &range) const
+{
+    for (const BandWrite &read : m_bandReads)
+        if (overlaps(range, read))
+            return true;
+    return false;
+}
+
+bool GSCpuBackend::UploadNeedsFlush() const
+{
+    if (PendingWritesTouch(m_uploadRange))
+        return true;
+    if (!PendingReadsTouch(m_uploadRange))
+        return false;
+    // 64 pages = 512 KB, larger than any texture slot the game streams.
+    constexpr uint32_t kMaxFrozenPages = 64u;
+    return !m_freezeUploads || m_uploadRange.end == UINT32_MAX || m_uploadRange.end > m_vramSize ||
+           m_uploadRange.end - m_uploadRange.begin > kMaxFrozenPages * kVramPageBytes;
+}
+
+void GSCpuBackend::FreezePendingPages(const BandWrite &range)
+{
+    // Queued primitives [version start, now) of each page read its current
+    // bytes; keep a copy before the upload changes them.
+    const uint32_t now = static_cast<uint32_t>(m_bandPending.size());
+    for (uint32_t page = range.begin; page < range.end; page += kVramPageBytes)
+    {
+        const BandWrite one{page, page + kVramPageBytes, 0u};
+        if (!PendingReadsTouch(one))
+            continue;
+        uint32_t versionStart = 0u;
+        auto it = std::find_if(m_pageVersionStart.begin(), m_pageVersionStart.end(),
+                               [page](const std::pair<uint32_t, uint32_t> &e) { return e.first == page; });
+        if (it != m_pageVersionStart.end())
+            versionStart = it->second;
+        if (versionStart >= now)
+            continue; // already frozen for this upload (an earlier chunk)
+        std::vector<uint8_t> bytes;
+        if (!m_frozenPool.empty())
+        {
+            bytes = std::move(m_frozenPool.back());
+            m_frozenPool.pop_back();
+        }
+        bytes.assign(m_vram + page, m_vram + page + kVramPageBytes);
+        m_bandFrozen.push_back({page, versionStart, now, static_cast<uint32_t>(m_bandFrozenBytes.size())});
+        m_bandFrozenBytes.push_back(std::move(bytes));
+        if (it != m_pageVersionStart.end())
+            it->second = now;
+        else
+            m_pageVersionStart.emplace_back(page, now);
+    }
+}
+
 bool GSCpuBackend::PendingTouches(const BandWrite &range) const
 {
     for (const BandWrite &write : m_bandWrites)
@@ -1797,6 +1896,18 @@ namespace
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    SubmitUnlocked(batch);
+}
+
+void GSCpuBackend::SubmitMany(const GSPrimitiveBatch *const *batches, size_t count)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (size_t i = 0; i < count; ++i)
+        SubmitUnlocked(*batches[i]);
+}
+
+void GSCpuBackend::SubmitUnlocked(const GSPrimitiveBatch &batch)
+{
     tracePrimStats(batch);
     if (gsCapture().enabled)
     {
@@ -3942,7 +4053,9 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
         // Bands still drawing the previous batch never touch these pages.
         if (InFlightTouches(m_uploadRange))
             WaitBandsIdle();
-        if (PendingTouches(m_uploadRange))
+        // Queued draws that only read these pages keep their bytes: UploadImage
+        // freezes them right before writing.
+        if (UploadNeedsFlush())
             FlushBands(BandFlushReason::Upload);
     }
     else
@@ -3974,8 +4087,10 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     {
         if (InFlightTouches(m_uploadRange))
             WaitBandsIdle();
-        if (PendingTouches(m_uploadRange))
+        if (UploadNeedsFlush())
             FlushBands(BandFlushReason::Upload);
+        else if (m_freezeUploads && data && sizeBytes != 0u && PendingReadsTouch(m_uploadRange))
+            FreezePendingPages(m_uploadRange);
     }
     else
     {
