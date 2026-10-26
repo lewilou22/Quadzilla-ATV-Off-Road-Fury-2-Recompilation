@@ -10,6 +10,7 @@
 #include <optional>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -247,14 +248,297 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
     return basePage * 2048 + y * strideBytes + x * 4;
 }
 
+extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode);
+// Game hooks for the GS worker (ATV_VU1_THREAD).
+// g_ps2Vif1PrecaptureHook runs on the EE right before a VIF1 chain is queued and fills `capture`
+// with the texture uploads its I-bits would send, and `tail` with what an I-bit past the end of
+// the send list sends (ATV2: SendCurrentTransfer's fallback GIF chain).
+void (*g_ps2Vif1PrecaptureHook)(PS2Memory::GifCapture &capture, std::vector<std::vector<uint8_t>> &tail) = nullptr;
+// GS downloads at VIF1_MARK=1 I-bits (ATV2 PSXWater) on the worker. g_ps2Vif1DownloadCaptureHook
+// runs on the EE when a chain with a MARK 1 VIFcode is queued: it appends one record per pending
+// download ([u32 size][size bytes], game-defined; it must capture whatever the EE may reuse) and
+// marks them consumed. g_ps2Vif1WorkerDownloadHook runs on the worker at each MARK=1 I-bit with the
+// next record: it reads the GS rectangle back into RAM and fills `continuation` with the VIF1
+// stream to run next (empty = none).
+bool (*g_ps2Vif1DownloadCaptureHook)(std::vector<uint8_t> &records) = nullptr;
+bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation) = nullptr;
+extern bool g_ps2Vif1AbortStream; // ps2_vif1_interpreter.cpp
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
     ps2SetScratchpadHostPtr(nullptr);
+    // VIF1/VU1 on its own thread by default; ATV_VU1_THREAD=0 runs it inline.
+    const char *vu1Thread = std::getenv("ATV_VU1_THREAD");
+    if (vu1Thread == nullptr || vu1Thread[0] != '0')
+        startGsWorker();
+}
+
+namespace
+{
+    thread_local bool t_onGsWorker = false;
+    // The EE runs a VIF1 chain itself (g_ps2Vif1NeedsEeHook) after draining the worker: like the
+    // worker it submits GIF packets directly and runs queued work inline.
+    thread_local bool t_gsDirectOnEe = false;
+    thread_local uint32_t t_gsWorkerFbrst = 0u;
+    inline bool gsDirectHere() { return t_onGsWorker || t_gsDirectOnEe; }
+    // I-bit texture uploads of the VIF1 chain the worker is processing.
+    struct IbitReplay
+    {
+        PS2Memory::GifCapture *capture = nullptr;
+        size_t next = 0u;
+        const std::vector<std::vector<uint8_t>> *tail = nullptr;
+        const std::vector<uint8_t> *downloads = nullptr; // captured download records
+        size_t nextDownload = 0u;                        // byte offset of the next record
+        std::vector<std::vector<uint8_t>> *continuations = nullptr; // chains to run after this one
+    };
+    thread_local IbitReplay *t_ibitReplay = nullptr;
+
+    // True when the VIF stream holds a MARK 1 VIFcode (0x07000001, or 0x87000001 with the I-bit).
+    // A data word with the same value only costs a chain that runs on the EE.
+    bool vif1StreamHasMark1(const uint8_t *data, size_t size)
+    {
+        for (size_t i = 0; i + 4u <= size; i += 4u)
+        {
+            uint32_t w;
+            std::memcpy(&w, data + i, sizeof(w));
+            if ((w & 0x7FFFFFFFu) == 0x07000001u)
+                return true;
+        }
+        return false;
+    }
+}
+
+namespace
+{
+    // ATV_TRACE_GS_WORKER=1: every 5 s, fences (count, EE wait), worker busy/idle time and
+    // VIF1 chains run on the worker vs on the EE.
+    std::atomic<uint64_t> g_gsFences{0}, g_gsFenceWaits{0}, g_gsFenceWaitNs{0}, g_gsWorkerBusyNs{0}, g_gsWorkItems{0}, g_gsWorkerIdleNs{0};
+    std::atomic<uint64_t> g_gsSiteWaits[6]{};
+    std::atomic<uint64_t> g_gsEeChains{0}, g_gsWorkerChains{0};
+    void gsWorkerStatsMaybeReport()
+    {
+        static const bool s_on = std::getenv("ATV_TRACE_GS_WORKER") != nullptr;
+        if (!s_on)
+            return;
+        static std::atomic<int64_t> s_last{0};
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        int64_t last = s_last.load();
+        if (last == 0)
+        {
+            s_last.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < 5000 || !s_last.compare_exchange_strong(last, now))
+            return;
+        const double secs = (now - last) / 1000.0;
+        std::fprintf(stderr, "[gs-worker] waits by site: other=%llu vifRead=%llu vifWrite=%llu vu1Mem=%llu flip=%llu gsStub=%llu\n",
+                     (unsigned long long)g_gsSiteWaits[0].exchange(0), (unsigned long long)g_gsSiteWaits[1].exchange(0),
+                     (unsigned long long)g_gsSiteWaits[2].exchange(0), (unsigned long long)g_gsSiteWaits[3].exchange(0),
+                     (unsigned long long)g_gsSiteWaits[4].exchange(0), (unsigned long long)g_gsSiteWaits[5].exchange(0));
+        std::fprintf(stderr, "[gs-worker] fences/s=%.0f waited/s=%.0f eeWait=%.1f%% workerBusy=%.1f%% workerIdle=%.1f%% items/s=%.0f vif1 chains: worker=%llu ee=%llu\n",
+                     g_gsFences.exchange(0) / secs, g_gsFenceWaits.exchange(0) / secs,
+                     g_gsFenceWaitNs.exchange(0) / (secs * 1e7), g_gsWorkerBusyNs.exchange(0) / (secs * 1e7),
+                     g_gsWorkerIdleNs.exchange(0) / (secs * 1e7), g_gsWorkItems.exchange(0) / secs,
+                     (unsigned long long)g_gsWorkerChains.exchange(0), (unsigned long long)g_gsEeChains.exchange(0));
+    }
+}
+
+bool PS2Memory::onGsWorker()
+{
+    return t_onGsWorker;
+}
+
+uint32_t PS2Memory::gsWorkerVu0Fbrst()
+{
+    return t_gsWorkerFbrst;
+}
+
+void PS2Memory::startGsWorker()
+{
+    m_gsWorkerEnabled = true;
+    m_gsWorker = std::thread([this] { gsWorkerMain(); });
+    std::cerr << "[gs-worker] VIF1/VU1 worker thread started (ATV_VU1_THREAD)" << std::endl;
+}
+
+void PS2Memory::stopGsWorker()
+{
+    if (!m_gsWorker.joinable())
+        return;
+    {
+        std::lock_guard<std::mutex> lock(m_gsWorkMutex);
+        m_gsWorkerStop = true;
+    }
+    m_gsWorkCv.notify_all();
+    m_gsWorker.join();
+}
+
+void atvStartHostProfilerForThisThread();
+void gsFlushWorkerGif(); // gs_frontend.cpp: queue this thread's batched GIF packets
+
+void PS2Memory::gsWorkerMain()
+{
+    t_onGsWorker = true;
+    // Same float environment as the game thread (FTZ|DAZ from GameThread start), where VU1 ran before.
+    _mm_setcsr(_mm_getcsr() | 0x8040u);
+    if (std::getenv("ATV_HOST_PROFILE_VU1") != nullptr)
+        atvStartHostProfilerForThisThread(); // samples VIF1/VU1 on this worker
+    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
+    for (;;)
+    {
+        if (m_gsWork.empty() && !m_gsWorkerStop)
+        {
+            const auto idleStart = std::chrono::steady_clock::now();
+            m_gsWorkCv.wait(lock, [this] { return m_gsWorkerStop || !m_gsWork.empty(); });
+            g_gsWorkerIdleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::steady_clock::now() - idleStart)
+                                                                 .count()),
+                                       std::memory_order_relaxed);
+        }
+        if (m_gsWork.empty())
+            return;
+        std::function<void()> fn = std::move(m_gsWork.front());
+        m_gsWork.pop_front();
+        m_gsWorkerBusy = true;
+        lock.unlock();
+        m_gsWorkCv.notify_all(); // a producer may wait for queue space
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        gsFlushWorkerGif();
+        g_gsWorkerBusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                              std::chrono::steady_clock::now() - t0)
+                                                              .count()),
+                                   std::memory_order_relaxed);
+        g_gsWorkItems.fetch_add(1, std::memory_order_relaxed);
+        lock.lock();
+        m_gsWorkerBusy = false;
+        ++m_gsWorkDoneSeq;
+        m_gsIdleCv.notify_all();
+    }
+}
+
+void PS2Memory::enqueueGsWork(std::function<void()> fn)
+{
+    if (!m_gsWorkerEnabled || gsDirectHere())
+    {
+        fn();
+        return;
+    }
+    // Bounded so a fast EE cannot queue unbounded copies of DMA chains.
+    constexpr size_t kMaxQueued = 4096u;
+    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
+    m_gsWorkCv.wait(lock, [this] { return m_gsWork.size() < kMaxQueued; });
+    m_gsWork.push_back(std::move(fn));
+    ++m_gsWorkQueuedSeq;
+    lock.unlock();
+    m_gsWorkCv.notify_all();
+}
+
+uint64_t PS2Memory::gsWorkMark() const
+{
+    if (!m_gsWorkerEnabled)
+        return 0;
+    std::lock_guard<std::mutex> lock(m_gsWorkMutex);
+    return m_gsWorkQueuedSeq;
+}
+
+void PS2Memory::fenceGsWorkUpTo(uint64_t mark, int site) const
+{
+    if (!m_gsWorkerEnabled || gsDirectHere())
+        return;
+    g_gsFences.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
+    if (m_gsWorkDoneSeq < mark)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        m_gsIdleCv.wait(lock, [this, mark] { return m_gsWorkDoneSeq >= mark; });
+        g_gsFenceWaits.fetch_add(1, std::memory_order_relaxed);
+        g_gsSiteWaits[(site >= 0 && site < 6) ? site : 0].fetch_add(1, std::memory_order_relaxed);
+        g_gsFenceWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now() - t0)
+                                                            .count()),
+                                  std::memory_order_relaxed);
+    }
+    lock.unlock();
+    gsWorkerStatsMaybeReport();
+}
+
+bool PS2Memory::gsPrivWriteDeferred(uint32_t regOff)
+{
+    // ATV_GS_PRIV_IMMEDIATE=1: EE display register writes apply at once.
+    static const bool s_immediate = std::getenv("ATV_GS_PRIV_IMMEDIATE") != nullptr;
+    return !s_immediate && regOff != kGsCsrRegOffset && regOff != 0x1010u && regOff != 0x1080u;
+}
+
+void PS2Memory::fenceGsWork(int site) const
+{
+    if (!m_gsWorkerEnabled || gsDirectHere())
+        return;
+    g_gsFences.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
+    if (!(m_gsWork.empty() && !m_gsWorkerBusy))
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        m_gsIdleCv.wait(lock, [this] { return m_gsWork.empty() && !m_gsWorkerBusy; });
+        g_gsFenceWaits.fetch_add(1, std::memory_order_relaxed);
+        g_gsSiteWaits[(site >= 0 && site < 6) ? site : 0].fetch_add(1, std::memory_order_relaxed);
+        g_gsFenceWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now() - t0)
+                                                            .count()),
+                                  std::memory_order_relaxed);
+    }
+    lock.unlock();
+    gsWorkerStatsMaybeReport();
+}
+
+void PS2Memory::handleVif1Ibit(uint32_t vifcode)
+{
+    if (t_ibitReplay != nullptr)
+    {
+        IbitReplay &r = *t_ibitReplay;
+        if (vif1_regs.mark == 1u)
+        {
+            // GS download (ATV2 PSXWater) with the next entry captured when the chain was queued.
+            // As the game's DMAC1 handler: MARK=0, the continuation chain runs next, and the rest
+            // of this VIF1 stream is abandoned.
+            uint32_t recordSize = 0u;
+            if (g_ps2Vif1WorkerDownloadHook && r.downloads && r.continuations && r.nextDownload + 4u <= r.downloads->size())
+                std::memcpy(&recordSize, r.downloads->data() + r.nextDownload, sizeof(recordSize));
+            if (recordSize != 0u && r.nextDownload + 4u + recordSize <= r.downloads->size())
+            {
+                std::vector<uint8_t> continuation;
+                g_ps2Vif1WorkerDownloadHook(r.downloads->data() + r.nextDownload + 4u, recordSize, continuation);
+                r.nextDownload += 4u + recordSize;
+                vif1_regs.mark = 0u;
+                if (!continuation.empty())
+                    r.continuations->push_back(std::move(continuation));
+                g_ps2Vif1AbortStream = true;
+                return;
+            }
+            static std::atomic<uint32_t> s_logs{0};
+            if (s_logs.fetch_add(1u) < 8u)
+                std::fprintf(stderr, "[gs-worker] VIF1 MARK=1 I-bit without a captured download entry; skipped\n");
+            return;
+        }
+        const std::vector<std::vector<uint8_t>> *packets = nullptr;
+        if (r.capture != nullptr && r.next < r.capture->size())
+            packets = &(*r.capture)[r.next++];
+        else if (r.tail != nullptr && !r.tail->empty())
+            packets = r.tail; // past the end of the send list
+        if (packets != nullptr)
+            for (const std::vector<uint8_t> &packet : *packets)
+                submitGifPacket(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
+        return;
+    }
+    if (g_ps2Vif1IbitHook)
+        g_ps2Vif1IbitHook(vifcode);
 }
 
 PS2Memory::~PS2Memory()
 {
+    stopGsWorker();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -537,6 +821,9 @@ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offs
 
 const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const
 {
+    // EE access to VU1 memory sees the worker's results only once it is idle.
+    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
+        fenceGsWork(3);
     auto mapRange = [&](uint32_t base, uint32_t rangeSize, const uint8_t *ptr) -> const uint8_t *
     {
         if (!ptr || physAddr < base)
@@ -958,6 +1245,11 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (m_gsWorkerEnabled && !gsDirectHere() && gsPrivWriteDeferred(regOff))
+        {
+            enqueueGsWork([this, address, value] { write32(address, value); });
+            return;
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1017,6 +1309,11 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (m_gsWorkerEnabled && !gsDirectHere() && gsPrivWriteDeferred(regOff))
+        {
+            enqueueGsWork([this, address, value] { write64(address, value); });
+            return;
+        }
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1209,6 +1506,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        fenceGsWork(2); // VIF1 state belongs to the worker while it runs
 
         switch (address)
         {
@@ -1300,6 +1598,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 const uint32_t want = qwc * 16u;
                 if (g_ps2Vif1ReadbackHook && want != 0u && !isScratchpad(madr))
                 {
+                    fenceGsWork(5); // everything queued before the download must reach the GS
                     const uint32_t phys = translateAddress(madr);
                     if (phys + want <= PS2_RAM_SIZE)
                         copied = g_ps2Vif1ReadbackHook(m_rdram + phys, want);
@@ -1813,6 +2112,97 @@ void PS2Memory::processPendingTransfers()
                 s_inVif1PendingLoop = false;
         }
     } vif1LoopGuard(hadVif1);
+    if (hadVif1 && m_gsWorkerEnabled && !gsDirectHere())
+    {
+        // Queue each chain for the worker with a copy of its data (the EE may reuse the buffers once
+        // the DMA looks complete). Guest code (the I-bit texture sends) runs only here on the EE,
+        // before the chain is queued; the worker replays the captured uploads at the I-bits.
+        // A chain with a MARK 1 VIFcode reaches a GS download I-bit (ATV2 PSXWater; the game never
+        // writes VIF1_MARK=1 itself): it runs here on the EE once the worker is idle, and the
+        // continuation chain its I-bit hook kicks is appended and handled by this loop.
+        const uint32_t fbrst = m_vu0FbrstProvider ? m_vu0FbrstProvider() : 0u;
+        for (size_t vifIdx = 0; vifIdx < m_pendingVif1Transfers.size(); ++vifIdx)
+        {
+            PendingTransfer p = std::move(m_pendingVif1Transfers[vifIdx]);
+            std::vector<uint8_t> data;
+            if (!p.chainData.empty())
+            {
+                data = std::move(p.chainData);
+            }
+            else if (p.qwc > 0)
+            {
+                uint32_t srcPhys = 0;
+                try
+                {
+                    srcPhys = translateAddress(p.srcAddr);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                const uint8_t *base = p.fromScratchpad ? m_scratchpad : m_rdram;
+                const uint32_t span = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                uint32_t bytesLeft = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(p.qwc) * 16ull, 0xFFFFFFFFull));
+                data.reserve(bytesLeft);
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= span)
+                        srcPhys = 0;
+                    const uint32_t chunk = std::min(bytesLeft, span - srcPhys);
+                    data.insert(data.end(), base + srcPhys, base + srcPhys + chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
+            }
+            if (data.empty())
+                continue;
+            auto downloads = std::make_shared<std::vector<uint8_t>>();
+            const bool hasMark1 = vif1StreamHasMark1(data.data(), data.size());
+            if (hasMark1 && g_ps2Vif1DownloadCaptureHook && g_ps2Vif1WorkerDownloadHook)
+                g_ps2Vif1DownloadCaptureHook(*downloads);
+            else if (hasMark1)
+            {
+                g_gsEeChains.fetch_add(1, std::memory_order_relaxed);
+                fenceGsWork(0);
+                struct DirectOnEe
+                {
+                    DirectOnEe() { t_gsDirectOnEe = true; }
+                    ~DirectOnEe() { t_gsDirectOnEe = false; }
+                } direct;
+                processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
+                if (m_gifArbiter)
+                    m_gifArbiter->drain();
+                continue;
+            }
+            g_gsWorkerChains.fetch_add(1, std::memory_order_relaxed);
+            auto capture = std::make_shared<GifCapture>();
+            auto tail = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            if (g_ps2Vif1PrecaptureHook)
+                g_ps2Vif1PrecaptureHook(*capture, *tail);
+            enqueueGsWork([this, data = std::move(data), capture, tail, downloads, fbrst]
+                          {
+                              t_gsWorkerFbrst = fbrst;
+                              std::vector<std::vector<uint8_t>> continuations;
+                              IbitReplay replay{capture.get(), 0u, tail.get(), downloads.get(), 0u, &continuations};
+                              t_ibitReplay = &replay;
+                              processVIF1Data(data.data(), static_cast<uint32_t>(data.size()));
+                              // Continuation chains of the GS downloads (they may hold more).
+                              for (size_t c = 0; c < continuations.size(); ++c)
+                              {
+                                  const std::vector<uint8_t> chain = std::move(continuations[c]);
+                                  processVIF1Data(chain.data(), static_cast<uint32_t>(chain.size()));
+                              }
+                              t_ibitReplay = nullptr;
+                              // Sends the chain had no I-bit for.
+                              for (size_t i = replay.next; i < capture->size(); ++i)
+                                  for (const std::vector<uint8_t> &packet : (*capture)[i])
+                                      submitGifPacket(GifPathId::Path3, packet.data(), static_cast<uint32_t>(packet.size()), false);
+                              if (m_gifArbiter)
+                                  m_gifArbiter->drain();
+                          });
+        }
+        m_pendingVif1Transfers.clear();
+    }
     // Index loop over a moved-out copy: an I-bit hook may kick a new VIF1 chain
     // (appending here) while this one is processed; it runs after this one.
     for (size_t vifIdx = 0; hadVif1 && vifIdx < m_pendingVif1Transfers.size(); ++vifIdx)
@@ -1874,7 +2264,9 @@ void PS2Memory::processPendingTransfers()
     if (hadVif1)
         m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    // With the GS worker the arbiter is only touched on the worker (queued
+    // items drain it themselves) or by the EE while it runs a chain itself.
+    if (m_gifArbiter && (!m_gsWorkerEnabled || gsDirectHere()))
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -1958,10 +2350,33 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// Set by PS2Runtime to the arbiter's GS packet handler (ATV1 5d451ba).
+std::function<void(const uint8_t *, uint32_t)> g_ps2GifDirectProcess;
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)
         return;
+    if (m_gifCapture != nullptr && !gsDirectHere())
+    {
+        // EE pre-run of the I-bit texture sends: keep the packets for the worker.
+        if (m_gifCapture->empty())
+            m_gifCapture->emplace_back();
+        m_gifCapture->back().emplace_back(data, data + sizeBytes);
+        return;
+    }
+    if (m_gsWorkerEnabled && !gsDirectHere())
+    {
+        // Keep EE packets in order behind queued VIF1/VU1 output.
+        std::vector<uint8_t> copy(data, data + sizeBytes);
+        enqueueGsWork([this, pathId, copy = std::move(copy), path2DirectHl]
+                      {
+                          submitGifPacket(pathId, copy.data(), static_cast<uint32_t>(copy.size()), false, path2DirectHl);
+                          if (m_gifArbiter)
+                              m_gifArbiter->drain();
+                      });
+        return;
+    }
 
     if (pathId == GifPathId::Path3)
     {
@@ -1973,6 +2388,13 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
+    // A lone packet drained at once needs no arbiter ordering: hand it to the
+    // GS without the arbiter's copy (PATH1 does this once per XGKICK).
+    if (m_gifArbiter && drainImmediately && g_ps2GifDirectProcess && m_gifArbiter->empty())
+    {
+        g_ps2GifDirectProcess(data, sizeBytes);
+        return;
+    }
     if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
@@ -2295,6 +2717,11 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    // VIF1 registers reflect the worker's progress. Not VIF1_STAT: it reads the stored register
+    // (VIF1 is always idle to the EE), and the engine's DMA sync (0x156760) polls it after every
+    // kick, which would wait for the worker each time.
+    if (address > 0x10003C00u && address < 0x10003E00u)
+        fenceGsWork(1);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

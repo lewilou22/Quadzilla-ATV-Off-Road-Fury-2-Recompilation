@@ -33,6 +33,12 @@ extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
 extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode); // ps2_vif1_interpreter.cpp
+// ps2_memory.cpp, GS worker (ATV_VU1_THREAD): I-bit texture sends and GS downloads captured on
+// the EE, and the worker's download handler.
+extern void (*g_ps2Vif1PrecaptureHook)(PS2Memory::GifCapture &capture, std::vector<std::vector<uint8_t>> &tail);
+extern bool (*g_ps2Vif1DownloadCaptureHook)(std::vector<uint8_t> &records);
+extern bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation);
+extern uint64_t (*g_ps2GsCsrReadHook)(uint32_t pc, uint64_t value); // ps2_runtime.cpp
 bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width, uint32_t height,
                               uint8_t *dst); // Kernel/Stubs/IPU.cpp
 extern uint32_t g_ps2TraceDispatchRemaining;
@@ -40,6 +46,7 @@ extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps
 
 void atv2ArmWriteWatch(uint8_t *rdram, uint32_t guestAddr, uint32_t len);
 void registerAtv2NetworkHle(PS2Runtime &runtime); // atv2_network_hle.cpp
+void atvStartHostProfiler();                       // Kernel/Atv2HostProfiler.cpp
 
 namespace
 {
@@ -5019,6 +5026,62 @@ namespace
         sub_0015DA90_0x15da90(rdram, ctx, runtime);
     }
 
+    // PSXVideoCard::Flip @ 0x0015E370: DMA sync, then CSR FINISH handshake (clears FINISH, kicks a
+    // GIF FINISH packet, spins on CSR), frame timing, the limiter 0x15DA90 (only when the frame took
+    // under 2 vsyncs), display registers (0x15E8E0), DMA sync. With the GS worker (ATV_VU1_THREAD)
+    // the FINISH packet sits behind the whole frame's VIF1/VU1 work, so the spin made the EE wait
+    // for the worker every frame. As ATV1 (a4248f2), Flip now waits only for the work queued before
+    // the previous Flip, and its FINISH poll (ld CSR at 0x15E4A0) reads FINISH at once; its display
+    // register writes are queued behind the frame's drawing, so the buffers still swap only after
+    // the frame is drawn. ATV_FLIP_FENCE_NOW=1 waits for this frame's work instead.
+    // ATV_TRACE_FPS=1: game frames (Flips) per wall second, every 5 s.
+    PS2Runtime::RecompiledFunction g_videoCardFlipOrig = nullptr;
+    PS2Runtime *g_flipRuntime = nullptr;
+    bool g_flipFenceNow = false;
+
+    uint64_t csrReadForFlip(uint32_t pc, uint64_t value)
+    {
+        if (pc == 0x0015E4A0u && !g_flipFenceNow && g_flipRuntime && g_flipRuntime->memory().gsWorkerEnabled())
+            return value | 2u; // FINISH
+        return value;
+    }
+
+    void videoCardFlip15e370(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_traceFps = std::getenv("ATV_TRACE_FPS") != nullptr;
+        if (s_traceFps)
+        {
+            static auto s_fpsStart = std::chrono::steady_clock::now();
+            static uint32_t s_fpsFrames = 0u;
+            ++s_fpsFrames;
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_fpsStart).count();
+            if (secs >= 5.0)
+            {
+                std::fprintf(stderr, "[fps] game frames/s=%.1f\n", s_fpsFrames / secs);
+                s_fpsStart = std::chrono::steady_clock::now();
+                s_fpsFrames = 0u;
+            }
+        }
+        PS2Memory &mem = runtime->memory();
+        if (!mem.gsWorkerEnabled())
+        {
+            g_videoCardFlipOrig(rdram, ctx, runtime);
+            return;
+        }
+        static uint64_t s_prevFlipMark = 0;
+        if (g_flipFenceNow)
+        {
+            mem.fenceGsWork(4);
+            g_videoCardFlipOrig(rdram, ctx, runtime);
+            return;
+        }
+        // Flip may yield at a checkpoint and resume without this wrapper; the mark then lands a
+        // little earlier, which only shortens the next wait.
+        mem.fenceGsWorkUpTo(s_prevFlipMark, 4);
+        g_videoCardFlipOrig(rdram, ctx, runtime);
+        s_prevFlipMark = mem.gsWorkMark();
+    }
+
     // ---- Opt-in front-end trace (ATV2_TRACE_FE=1) -------------------------------------
     // Wraps a few functions of the front-end start-up path. Each wrapper logs its arguments
     // and return address for a bounded number of calls, then runs the original generated
@@ -5275,6 +5338,262 @@ namespace
         }
     }
 
+    // ---- GS worker (ATV_VU1_THREAD): I-bit texture sends -----------------------------------------
+    // The worker cannot run guest code. Right before a VIF1 chain is queued, run every remaining
+    // SendCurrentTransfer of the send list on the EE (same calls, same order as the I-bits would
+    // make them) and capture each one's GIF upload; the worker replays one capture per I-bit and
+    // sends what is left after the chain (as ATV1). Send list: index 0x48A390, entries at 0x48A394
+    // (count 0x48F394) when *(*0x489038+0x54) == 1, else 0x48F398 (count 0x494398).
+    // `tail` is what an I-bit past the end of the list sends: SendCurrentTransfer then runs the
+    // manager's fixed GIF chain (0x187650 with *(mgr+0x88)). It is captured once per chain address.
+    constexpr uint32_t kRenderEnginePtr = 0x00489038u;
+
+    void precaptureIbitTextures(PS2Memory::GifCapture &capture, std::vector<std::vector<uint8_t>> &tail)
+    {
+        if (g_ibitRuntime == nullptr || g_sendCurrentTransfer == nullptr)
+            return;
+        PS2Memory &mem = g_ibitRuntime->memory();
+        uint8_t *rdram = mem.getRDRAM();
+        R5900Context *live = g_ibitRuntime->eeScheduler().currentContext();
+        if (rdram == nullptr || live == nullptr)
+            return;
+        auto rd = [&](uint32_t a) { return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a)); };
+        const uint32_t mgr = rd(kTextureMapManagerPtr);
+        const uint32_t engine = rd(kRenderEnginePtr);
+        if (mgr == 0u || engine == 0u)
+            return;
+        auto sendOne = [&]
+        {
+            R5900Context tmp = *live;
+            SET_GPR_U32(&tmp, 29, (GPR_U32(live, 29) - 0x400u) & ~0xFu);
+            SET_GPR_U32(&tmp, 4, mgr);
+            SET_GPR_U32(&tmp, 5, 0u);
+            SET_GPR_U32(&tmp, 31, kTextureSendDonePc);
+            tmp.pc = kSendCurrentTransfer;
+            HoldEeTimeslices hold;
+            g_sendCurrentTransfer(rdram, &tmp, g_ibitRuntime);
+        };
+        const uint32_t countAddr = rd(engine + 0x54u) == 1u ? 0x0048F394u : 0x00494398u;
+        int32_t idx = static_cast<int32_t>(rd(kTransferListIndex));
+        const int32_t total = static_cast<int32_t>(rd(countAddr));
+        mem.beginGifCapture(&capture);
+        while (idx < total && capture.size() < 0x400u)
+        {
+            capture.emplace_back();
+            sendOne();
+            const int32_t next = static_cast<int32_t>(rd(kTransferListIndex));
+            if (next <= idx)
+                break;
+            idx = next;
+        }
+        mem.endGifCapture();
+
+        static std::vector<std::vector<uint8_t>> s_tail;
+        static uint32_t s_tailKey = 0u, s_tailTadr = 0u;
+        const uint32_t key = rd(mgr + 0x88u);
+        const uint32_t tadr = key != 0u ? rd(key) : 0u;
+        if (key != 0u && (key != s_tailKey || tadr != s_tailTadr) && static_cast<int32_t>(rd(kTransferListIndex)) >= total)
+        {
+            PS2Memory::GifCapture tailCapture;
+            mem.beginGifCapture(&tailCapture);
+            sendOne(); // index == count: SendCurrentTransfer's fixed-chain branch
+            mem.endGifCapture();
+            s_tail.clear();
+            for (auto &send : tailCapture)
+                for (auto &packet : send)
+                    s_tail.push_back(std::move(packet));
+            s_tailKey = key;
+            s_tailTadr = tadr;
+        }
+        tail = s_tail;
+    }
+
+    // GS worker: the PSXWater downloads run on the worker. When a chain with a MARK 1 VIFcode is
+    // queued, record each pending download (index *(s16*)(mgr+0x148) up to the count
+    // *(s16*)(mgr+0x14A); entries at *(mgr+0x144), 0x20 bytes) and mark them consumed. The game
+    // reuses its DMA buffers once the transfer looks done, so each record also carries the entry's
+    // continuation chain (as CHCR 0x1C5 would send it: tag VIFcodes, then payload) captured now,
+    // except REF payloads inside a download destination: those are read on the worker after the
+    // download wrote them. Record: entry (0x20) + ops: [0, u32 len, bytes] literal, [1, u32 addr,
+    // u32 len] read later, [0xFF] end.
+    bool captureDownloads(std::vector<uint8_t> &records)
+    {
+        if (g_ibitRuntime == nullptr)
+            return false;
+        uint8_t *rdram = g_ibitRuntime->memory().getRDRAM();
+        auto rd = [&](uint32_t a) { return *reinterpret_cast<uint32_t *>(getMemPtr(rdram, a)); };
+        const uint32_t mgr = rd(kTextureMapManagerPtr);
+        if (mgr == 0u)
+            return false;
+        int16_t &idx = *reinterpret_cast<int16_t *>(getMemPtr(rdram, mgr + 0x148u));
+        const int16_t count = *reinterpret_cast<int16_t *>(getMemPtr(rdram, mgr + 0x14Au));
+        const uint32_t list = rd(mgr + 0x144u);
+        if (idx < 0 || idx >= count || list == 0u)
+            return false;
+        auto entryDst = [&](uint32_t e, uint32_t &dst, uint32_t &bytes)
+        {
+            const uint32_t psm = *getMemPtr(rdram, e + 0xAu);
+            const uint32_t bpp = (psm == 0x3Au || psm == 0x32u || psm == 0x0Au || psm == 0x02u) ? 2u : 4u;
+            dst = rd(e + 0x10u) & 0x01FFFFFFu;
+            bytes = bpp * (rd(e + 0x6u) & 0xFFFFu) * (rd(e + 0x8u) & 0xFFFFu);
+        };
+        std::vector<std::pair<uint32_t, uint32_t>> dstRanges;
+        for (int16_t i = idx; i < count; ++i)
+        {
+            uint32_t dst = 0u, bytes = 0u;
+            entryDst(list + static_cast<uint32_t>(i) * 0x20u, dst, bytes);
+            dstRanges.emplace_back(dst, dst + bytes);
+        }
+        auto put32 = [](std::vector<uint8_t> &v, uint32_t x) { v.insert(v.end(), reinterpret_cast<uint8_t *>(&x), reinterpret_cast<uint8_t *>(&x) + 4); };
+        for (int16_t i = idx; i < count; ++i)
+        {
+            const uint32_t e = list + static_cast<uint32_t>(i) * 0x20u;
+            std::vector<uint8_t> rec(getMemPtr(rdram, e), getMemPtr(rdram, e) + 0x20u);
+            const uint32_t cont = rd(e + 0x1Cu);
+            if (cont != 0u && *getMemPtr(rdram, cont + 3u) != static_cast<uint8_t>('p'))
+            {
+                uint32_t tadr = cont & 0x0FFFFFF0u;
+                uint32_t asr[2] = {0u, 0u};
+                uint32_t asp = 0u;
+                for (int tags = 0; tags < 1024; ++tags)
+                {
+                    if ((tadr & 0x80000000u) != 0u || (tadr & 0x01FFFFFFu) + 16u > PS2_RAM_SIZE)
+                        break; // scratchpad chains are not expected here
+                    const uint8_t *tp = getMemPtr(rdram, tadr);
+                    uint64_t tag;
+                    std::memcpy(&tag, tp, sizeof(tag));
+                    const uint32_t qwc = static_cast<uint32_t>(tag & 0xFFFFu);
+                    const uint32_t id = static_cast<uint32_t>((tag >> 28) & 7u);
+                    const bool irq = ((tag >> 31) & 1u) != 0u;
+                    const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+                    uint32_t data = 0u;
+                    bool ref = false, end = false;
+                    switch (id)
+                    {
+                    case 0: data = addr; ref = true; end = true; break;                     // refe
+                    case 1: data = tadr + 16u; tadr = data + qwc * 16u; break;             // cnt
+                    case 2: data = tadr + 16u; tadr = addr; break;                         // next
+                    case 3: case 4: data = addr; ref = true; tadr += 16u; break;           // ref, refs
+                    case 5:                                                                 // call
+                        data = tadr + 16u;
+                        if (asp < 2u)
+                            asr[asp++] = data + qwc * 16u;
+                        tadr = addr;
+                        break;
+                    case 6:                                                                 // ret
+                        data = tadr + 16u;
+                        if (asp > 0u)
+                            tadr = asr[--asp];
+                        else
+                            end = true;
+                        break;
+                    default: data = tadr + 16u; end = true; break;                         // end
+                    }
+                    rec.push_back(0u);
+                    put32(rec, 8u);
+                    rec.insert(rec.end(), tp + 8, tp + 16);
+                    const uint32_t len = qwc * 16u;
+                    const uint32_t d = data & 0x01FFFFFFu;
+                    if (len != 0u && d + len <= PS2_RAM_SIZE)
+                    {
+                        bool deferred = false;
+                        if (ref)
+                            for (const auto &range : dstRanges)
+                                deferred |= d < range.second && range.first < d + len;
+                        if (deferred)
+                        {
+                            rec.push_back(1u);
+                            put32(rec, d);
+                            put32(rec, len);
+                        }
+                        else
+                        {
+                            rec.push_back(0u);
+                            put32(rec, len);
+                            rec.insert(rec.end(), getMemPtr(rdram, d), getMemPtr(rdram, d) + len);
+                        }
+                    }
+                    if (end || irq)
+                        break;
+                }
+            }
+            rec.push_back(0xFFu);
+            put32(records, static_cast<uint32_t>(rec.size()));
+            records.insert(records.end(), rec.begin(), rec.end());
+        }
+        idx = count;
+        return true;
+    }
+
+    bool workerDownload(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation)
+    {
+        static std::atomic<uint32_t> s_logs{0};
+        if (size < 0x21u)
+            return false;
+        PS2Runtime *runtime = g_ibitRuntime;
+        uint8_t *rdram = runtime->memory().getRDRAM();
+        const uint8_t *entry = record;
+        auto e16 = [&](uint32_t o) { uint16_t v; std::memcpy(&v, entry + o, 2); return static_cast<uint32_t>(v); };
+        auto e32 = [&](uint32_t o) { uint32_t v; std::memcpy(&v, entry + o, 4); return v; };
+        const uint32_t width = e16(0x0u), ssax = e16(0x2u), ssay = e16(0x4u), rrw = e16(0x6u), rrh = e16(0x8u);
+        const uint32_t psm = entry[0xAu];
+        const uint32_t sbp = e16(0xCu);
+        const uint32_t dst = e32(0x10u);
+        const uint32_t callback = e32(0x14u);
+        const uint32_t bpp = (psm == 0x3Au || psm == 0x32u || psm == 0x0Au || psm == 0x02u) ? 2u : 4u;
+        const uint32_t bytes = bpp * rrw * rrh;
+        uint64_t pkt[10] = {};
+        pkt[0] = 4ull | (1ull << 15) | (1ull << 60); // NLOOP=4, EOP, PACKED, NREG=1
+        pkt[1] = 0xEull;                             // A+D
+        pkt[2] = (static_cast<uint64_t>(psm) << 24) | sbp | (static_cast<uint64_t>(width >> 6) << 16);
+        pkt[3] = 0x50u; // BITBLTBUF
+        pkt[4] = ssax | (static_cast<uint64_t>(ssay) << 16);
+        pkt[5] = 0x51u; // TRXPOS
+        pkt[6] = rrw | (static_cast<uint64_t>(rrh) << 32);
+        pkt[7] = 0x52u; // TRXREG
+        pkt[8] = 1u;    // local -> host
+        pkt[9] = 0x53u; // TRXDIR
+        runtime->memory().submitGifPacket(GifPathId::Path2, reinterpret_cast<const uint8_t *>(pkt), sizeof(pkt), true, false);
+        uint32_t copied = 0u;
+        if (dst != 0u && (dst & 0x01FFFFFFu) + bytes <= PS2_RAM_SIZE)
+            copied = runtime->gs().consumeLocalToHostBytes(getMemPtr(rdram, dst), bytes);
+        if (callback != 0u)
+        {
+            static std::atomic<uint32_t> s_cbLogs{0};
+            if (s_cbLogs.fetch_add(1u) < 4u)
+                std::fprintf(stderr, "[ATV2:DOWNLOAD] callback 0x%x not run on the GS worker\n", callback);
+        }
+        // Continuation stream from the captured plan.
+        size_t pos = 0x20u;
+        auto get32 = [&](uint32_t &v) { if (pos + 4u > size) return false; std::memcpy(&v, record + pos, 4); pos += 4u; return true; };
+        while (pos < size)
+        {
+            const uint8_t op = record[pos++];
+            if (op == 0xFFu)
+                break;
+            uint32_t a = 0u, len = 0u;
+            if (op == 0u)
+            {
+                if (!get32(len) || pos + len > size)
+                    break;
+                continuation.insert(continuation.end(), record + pos, record + pos + len);
+                pos += len;
+            }
+            else if (op == 1u)
+            {
+                if (!get32(a) || !get32(len) || a + len > PS2_RAM_SIZE)
+                    break;
+                continuation.insert(continuation.end(), getMemPtr(rdram, a), getMemPtr(rdram, a) + len);
+            }
+            else
+                break;
+        }
+        if (s_logs.fetch_add(1u) < 8u)
+            std::fprintf(stderr, "[ATV2:DOWNLOAD] worker sbp=0x%x rr=%ux%u dst=0x%x bytes=%u copied=%u cb=0x%x continuation=%zu bytes\n",
+                         sbp, rrw, rrh, dst, bytes, copied, callback, continuation.size());
+        return true;
+    }
+
     void registerVif1TextureIbit(PS2Runtime &runtime)
     {
         const char *v = std::getenv("ATV2_IBIT_TEX_SYNC");
@@ -5288,6 +5607,9 @@ namespace
         }
         g_ibitRuntime = &runtime;
         g_ps2Vif1IbitHook = &onVif1TextureIbit;
+        g_ps2Vif1PrecaptureHook = &precaptureIbitTextures;
+        g_ps2Vif1DownloadCaptureHook = &captureDownloads;
+        g_ps2Vif1WorkerDownloadHook = &workerDownload;
         g_ps2Vif1ReadbackHook = [](uint8_t *dst, uint32_t maxBytes) -> uint32_t
         { return g_ibitRuntime ? g_ibitRuntime->gs().consumeLocalToHostBytes(dst, maxBytes) : 0u; };
     }
@@ -5520,6 +5842,7 @@ namespace
 
     void countdownWatch248020(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        atvStartHostProfiler(); // ATV_HOST_PROFILE=1: sample the game thread from the race countdown on
         static int s_calls = 0;
         const uint32_t self = getRegU32(ctx, 4);
         if (s_calls < 12 || (s_calls % 120) == 0)
@@ -5872,6 +6195,14 @@ namespace
 
         // Frame limiter: ticks FrontendManager update and draw every frame
         runtime.replaceFunction(0x0015DA90u, &frameLimiter15da90);
+        g_videoCardFlipOrig = runtime.lookupFunction(0x0015E370u);
+        if (g_videoCardFlipOrig)
+        {
+            g_flipRuntime = &runtime;
+            g_flipFenceNow = std::getenv("ATV_FLIP_FENCE_NOW") != nullptr;
+            runtime.replaceFunction(0x0015E370u, &videoCardFlip15e370);
+            g_ps2GsCsrReadHook = &csrReadForFlip;
+        }
 
         // Diagnostics wrapper for func_1DFB00
         runtime.replaceFunction(0x001DFB00u, &func1dfb00_wrapper);
@@ -6089,8 +6420,3 @@ PS2_REGISTER_GAME_OVERRIDE(
     0x00100008u,
     0u,
     applyScus97211Overrides);
-
-// The GS worker threads (ported from ATV1) call this to start ATV1's optional host profiler; ATV2 has none.
-void atvStartHostProfilerForThisThread()
-{
-}

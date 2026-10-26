@@ -111,6 +111,7 @@ namespace ps2_stubs
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
         {
+            runtime->memory().fenceGsWork(5); // GS worker (ATV_VU1_THREAD) must be idle
             if (!runtime->syncCoreSubsystems() || !hasSeededGsClearPacket(clear))
             {
                 return;
@@ -671,6 +672,7 @@ namespace ps2_stubs
 
     void sceGsExecStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        runtime->memory().fenceGsWork(5); // GS worker (ATV_VU1_THREAD) must be idle
         uint32_t imgAddr = getRegU32(ctx, 4);
         uint32_t dstAddr = getRegU32(ctx, 5);
 
@@ -1132,6 +1134,7 @@ namespace ps2_stubs
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        runtime->memory().fenceGsWork(5); // GS worker (ATV_VU1_THREAD) must be idle
         const uint32_t envAddr = getRegU32(ctx, 4);
         const uint32_t which = getRegU32(ctx, 5) & 1u;
 
@@ -1215,6 +1218,8 @@ namespace ps2_stubs
 
     void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // No GS-worker fence here: games call this to reuse their DMA buffers,
+        // and the worker (ATV_VU1_THREAD) runs on its own copies.
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
 

@@ -4,7 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <atomic>
@@ -334,6 +337,34 @@ public:
     bool isPath3Masked() const { return m_path3Masked; }
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
+    // GS worker (default on; ATV_VU1_THREAD=0 = inline): VIF1/VU1 processing,
+    // and every GIF packet the EE sends behind it, runs in order on one worker
+    // thread so it overlaps EE code (as VU1 does on hardware). EE-side readers
+    // of VU1/GS results call fenceGsWork() first.
+    bool gsWorkerEnabled() const { return m_gsWorkerEnabled; }
+    static bool onGsWorker();
+    void enqueueGsWork(std::function<void()> fn);
+    // site: 0 other, 1 VIF1 reg read, 2 VIF1 reg write, 3 VU1 memory, 4 flip, 5 GS stub
+    void fenceGsWork(int site = 0) const;
+    // Items queued so far; fenceGsWorkUpTo waits until the worker has finished
+    // the items queued before that mark (later ones may still run).
+    uint64_t gsWorkMark() const;
+    void fenceGsWorkUpTo(uint64_t mark, int site = 0) const;
+    // Display registers (all GS privileged registers but CSR, IMR, SIGLBLID)
+    // written by the EE are applied by the worker in order with the drawing
+    // queued before them. They are write-only on hardware, so the EE cannot tell.
+    static bool gsPrivWriteDeferred(uint32_t regOff);
+    // VU0 FBRST (VU1 D/T-bit enables) captured when the work was queued.
+    static uint32_t gsWorkerVu0Fbrst();
+    using Vu0FbrstProvider = std::function<uint32_t()>;
+    void setVu0FbrstProvider(Vu0FbrstProvider fn) { m_vu0FbrstProvider = std::move(fn); }
+    // Texture uploads for VIF1 I-bits, captured on the EE before a VIF1 chain
+    // is queued: one entry per I-bit send, each a list of PATH3 GIF packets.
+    using GifCapture = std::vector<std::vector<std::vector<uint8_t>>>;
+    void beginGifCapture(GifCapture *capture) { m_gifCapture = capture; }
+    void endGifCapture() { m_gifCapture = nullptr; }
+    void handleVif1Ibit(uint32_t vifcode);
+
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -423,6 +454,23 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+
+    // GS worker (ATV_VU1_THREAD). Mutable so const readers can fence.
+    bool m_gsWorkerEnabled = false;
+    mutable std::mutex m_gsWorkMutex;
+    mutable std::condition_variable m_gsWorkCv;
+    mutable std::condition_variable m_gsIdleCv;
+    std::deque<std::function<void()>> m_gsWork;
+    bool m_gsWorkerBusy = false;
+    bool m_gsWorkerStop = false;
+    uint64_t m_gsWorkQueuedSeq = 0; // items queued (under m_gsWorkMutex)
+    uint64_t m_gsWorkDoneSeq = 0;   // items finished (under m_gsWorkMutex)
+    std::thread m_gsWorker;
+    GifCapture *m_gifCapture = nullptr;
+    Vu0FbrstProvider m_vu0FbrstProvider;
+    void gsWorkerMain();
+    void startGsWorker();
+    void stopGsWorker();
 
     struct CodeRegion
     {

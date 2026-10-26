@@ -358,9 +358,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
         if (opcode == VIF_NOP)
         {
-            if (irq && g_ps2Vif1IbitHook)
+            if (irq)
             {
-                g_ps2Vif1IbitHook(cmd);
+                handleVif1Ibit(cmd); // game hook, or the worker's captured texture sends
                 if (g_ps2Vif1AbortStream)
                 {
                     g_ps2Vif1AbortStream = false;
@@ -420,9 +420,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // Earlier MSCAL/XGKICK work has already been emitted synchronously, so
             // the flush is complete. An I-bit here is where real VIF1 stalls until
             // the game's INTC handler restarts it (FBRST.STC).
-            if (irq && g_ps2Vif1IbitHook)
+            if (irq)
             {
-                g_ps2Vif1IbitHook(cmd);
+                handleVif1Ibit(cmd); // game hook, or the worker's captured texture sends
                 if (g_ps2Vif1AbortStream)
                 {
                     g_ps2Vif1AbortStream = false;

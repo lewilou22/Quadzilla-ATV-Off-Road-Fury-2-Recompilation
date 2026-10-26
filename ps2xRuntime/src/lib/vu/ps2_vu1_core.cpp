@@ -58,6 +58,9 @@ namespace
     // MAC/status flag pipeline; CLIP/Q/P keep their own queues. The fast loop
     // still waits for g_vuSkippedFlagsReady so run() ends on the same cycle.
     bool g_vuSkipMacFlags = false;
+    // g_vuSkipMacFlags or g_vuMacOnlyFlags without approx, verify or FMAC stats: native upper ops
+    // take VU1Native::fastUpper's lean FMAC path (one check per op).
+    bool g_vuFmacLean = false;
     uint64_t g_vuSkippedFlagsReady = 0;
     // ATV_VU_FMAC_STATS=1: why fast FMAC ops leave the all-lanes-normal path
     // (printed by the VU workload replay). Indices: see kFmacStat*.
@@ -119,6 +122,13 @@ namespace
     // reads, final state, data memory and XGKICK packets, and keeps the
     // interpreted result.
     bool g_vuForceInterp = false;
+    // ATV_VU_APPROX=1: approximate VU1 timing (not bit-exact against the
+    // interpreter; validated by gameplay). Never applied to interpreter runs.
+    const bool g_vuApprox = []
+    {
+        const char *env = std::getenv("ATV_VU_APPROX");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
     uint64_t g_vuRecompRuns = 0;
     struct VuVerifyRecord
     {
@@ -522,6 +532,8 @@ namespace
         xgkick.currentTagEop = false;
     }
 }
+
+#include "ps2_vu1_native.inc"
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
 {
@@ -1738,6 +1750,17 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
     m_xgkick.issueCycle = m_cycle;
+    // ATV_VU_APPROX: transfer the whole packet now instead of one qword every
+    // second VU cycle (PCSX2's default). Differs only if the program rewrites
+    // the packet while it is still being sent; the VU no longer waits on PATH1.
+    if (g_vuApprox && !g_vuForceInterp)
+    {
+        while (m_xgkick.active)
+        {
+            m_xgkick.cycleCredit = 1u;
+            progressXgkick();
+        }
+    }
 }
 
 void VU1Interpreter::advanceOneCycle()
@@ -2508,7 +2531,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    static const bool s_vuFast = std::getenv("ATV_VU_FAST") != nullptr;
+    // Fast loop (exact against the per-pair interpreter) on by default in ATV2; ATV_VU_FAST=0 = interpreter.
+    static const bool s_vuFast = []
+    {
+        const char *env = std::getenv("ATV_VU_FAST");
+        return env == nullptr || env[0] != '0';
+    }();
     static const char *s_vuFastVerifyEnv = std::getenv("ATV_VU_FAST_VERIFY");
     static const bool s_vuRecompVerify = s_vuFastVerifyEnv != nullptr;
     // ATV_VU_FAST_VERIFY=N verifies the first N in-race runs; 1 means every run.
@@ -2574,6 +2602,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // ATV_VU_APPROX: flush denormal operands and results to zero in hardware
+    // (FTZ|DAZ), as the approximate FMAC path relies on.
+    const bool approxCsr = g_vuApprox && !g_vuForceInterp;
+    const unsigned int savedCsr = _mm_getcsr();
+    if (approxCsr)
+        _mm_setcsr(savedCsr | 0x8040u);
     const uint64_t budgetEnd = m_cycle + maxCycles;
     const uint32_t censusStartPc = m_state.pc;
     bool programEnded = false;
@@ -2902,6 +2936,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (approxCsr)
+        _mm_setcsr(savedCsr);
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }
+
+#include "ps2_vu1_native_blocks.inc"

@@ -63,6 +63,9 @@ public:
     const VU1State &state() const { return m_state; }
 
 private:
+    // Fast-path ops and natively compiled blocks (ps2_vu1_native.inc).
+    friend struct VU1Native;
+
     enum Pipeline : uint8_t
     {
         PipelineNone = 0,

@@ -223,7 +223,10 @@
                 mix(&m_state.clip, sizeof(m_state.clip));
                 mix(&m_state.pc, sizeof(m_state.pc));
                 mix(&m_state.ebit, sizeof(m_state.ebit));
-                mix(&m_cycle, sizeof(m_cycle));
+                // ATV_VU_BENCH_NO_CYCLE=1: compare state only (approximate timing).
+                static const bool s_noCycle = std::getenv("ATV_VU_BENCH_NO_CYCLE") != nullptr;
+                if (!s_noCycle)
+                    mix(&m_cycle, sizeof(m_cycle));
                 mix(vuData, dataSize);
                 for (const std::vector<uint8_t> &k : kicks)
                 {
@@ -242,6 +245,7 @@
             uint64_t interpCycles = 0;
             uint32_t mismatches = 0;
             uint64_t passPairs = 0;
+            const uint64_t nativeBefore = g_vu1NativePairs;
             for (size_t n = 0; n < count; ++n)
             {
                 const uint64_t pairsBefore = g_vu1PairTotal;
@@ -261,6 +265,8 @@
                                        fastData, vuData, dataSize, fastKicks, kicks);
                 }
             }
+            std::fprintf(stderr, "[vu-bench] native blocks ran %llu pairs/pass\n",
+                         static_cast<unsigned long long>(g_vu1NativePairs - nativeBefore));
             std::fprintf(stderr, "[vu-bench] samples=%zu codeImages=%zu pairs/pass=%llu interpMismatch=%u\n", count,
                          codes.size(), static_cast<unsigned long long>(passPairs), mismatches);
             if (g_vuFmacStats)

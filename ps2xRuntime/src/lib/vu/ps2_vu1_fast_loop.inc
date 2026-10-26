@@ -21,109 +21,15 @@
 // link to their successors and only re-check the entries left open.
 // ATV_VU_FAST_VERIFY cross-checks this loop against the interpreter.
 {
-    struct FastOp
-    {
-        uint8_t kind, fd, fs, ft, dest, bc;
-        uint8_t lowerKind;
-    };
-    // Common lower ops handled inline; everything else goes to execLower.
-    enum : uint8_t
-    {
-        kLowerExec = 0,
-        kLowerNop,
-        kLq, kSq, kIaddiu, kLqi, kSqi, kIbeq, kIbne, kMr32, kMove,
-        kIlw, kIsw, kIsubiu, kFcand, kFcor, kFcget, kB, kJr, kIbltz, kIbgtz, kIblez, kIbgez,
-        kIadd, kIsub, kIaddi, kIand, kIor, kWaitq, kMtir, kMfir, kMfp,
-        kDiv, kEleng,
-    };
-    static constexpr auto classifyLowerWord = [](uint32_t lower) -> uint8_t {
-        if (lower == 0x8000033Cu || lower == 0u)
-            return kLowerNop;
-        switch ((lower >> 25) & 0x7Fu)
-        {
-        case 0x00: return kLq;
-        case 0x01: return kSq;
-        case 0x04: return kIlw;
-        case 0x05: return kIsw;
-        case 0x08: return kIaddiu;
-        case 0x09: return kIsubiu;
-        case 0x12: return kFcand;
-        case 0x13: return kFcor;
-        case 0x1C: return kFcget;
-        case 0x20: return kB;
-        case 0x24: return kJr;
-        case 0x28: return kIbeq;
-        case 0x29: return kIbne;
-        case 0x2C: return kIbltz;
-        case 0x2D: return kIbgtz;
-        case 0x2E: return kIblez;
-        case 0x2F: return kIbgez;
-        case 0x40:
-            if ((lower & 0x3Cu) == 0x3Cu)
-            {
-                switch ((lower & 0x3u) | ((lower >> 4) & 0x7Cu))
-                {
-                case 0x30: return kMove;
-                case 0x31: return kMr32;
-                case 0x34: return kLqi;
-                case 0x35: return kSqi;
-                case 0x38: return kDiv;
-                case 0x3B: return kWaitq;
-                case 0x3C: return kMtir;
-                case 0x3D: return kMfir;
-                case 0x64: return kMfp;
-                case 0x72: return kEleng;
-                default: break;
-                }
-                return kLowerExec;
-            }
-            switch (lower & 0x3Fu)
-            {
-            case 0x30: return kIadd;
-            case 0x31: return kIsub;
-            case 0x32: return kIaddi;
-            case 0x34: return kIand;
-            case 0x35: return kIor;
-            default: break;
-            }
-            return kLowerExec;
-        default:
-            return kLowerExec;
-        }
-    };
-    auto classifyLower = [](const DecodedInstructionPair &pair) -> uint8_t {
-        return pair.iBit ? kLowerExec : classifyLowerWord(pair.lower);
-    };
-    enum : uint8_t
-    {
-        kExec = 0,
-        kNop,
-        kAddBc, kSubBc, kMaddBc, kMsubBc, kMaxBc, kMiniBc, kMulBc,
-        kAdd, kSub, kMul, kMax, kMini,
-        kMulQ, kMiniI,
-        kMulaBc, kMaddaBc,
-        kMulI, kAddI,
-        kClip, kFtoi0, kFtoi4, kItof0,
-    };
-    struct FastReads
-    {
-        // At most two VF operands in each half, with four lanes each. Unused
-        // vf/vi slots stay 0 (vf0.x / vi0, never written, so never stall),
-        // which lets the ready check scan fixed-length lists without branches.
-        uint8_t vf[16]{}, vi[15]{}, acc[4]{};
-        uint8_t vfCount = 0, viCount = 0, accCount = 0;
-        // Pair waits on FDIV, EFU, P or a PATH1 transfer.
-        bool scalarWait = false;
-    };
-    // markPairWrites and the drain-cycle bookkeeping, precomputed per pair.
-    // Absent writes use register 0 with no lanes, which leaves the ready
-    // tables unchanged.
-    struct FastWrites
-    {
-        uint32_t upperLat = 0, lowerLat = 0, viLat = 0, readyOffset = 0;
-        uint8_t upperReg = 0, upperLanes = 0, lowerReg = 0, lowerLanes = 0, viReg = 0, accLanes = 0;
-        bool multiVi = false;
-    };
+    // Op classification and the fast halves live in VU1Native
+    // (ps2_vu1_native.inc) so natively compiled blocks can share them.
+    using FastOp = VU1Native::FastOp;
+    using FastReads = VU1Native::FastReads;
+    using FastWrites = VU1Native::FastWrites;
+    using enum VU1Native::LowerKind;
+    using enum VU1Native::UpperKind;
+    static constexpr auto classifyLowerWord = [](uint32_t lower) { return VU1Native::classifyLowerWord(lower); };
+    auto classifyLower = [](const DecodedInstructionPair &pair) { return VU1Native::classifyLower(pair); };
     // Ready-table slots used by block replay: VF lane reg*4+bit (the
     // m_vfReady[reg][bit] indexing), then VI, then ACC lanes.
     enum : uint32_t
@@ -233,59 +139,13 @@
         // never lowered, since earlier code images may have set them.
         uint32_t maxWriteLatency = 0;
     };
-    auto classifyWrites = [](const DecodedInstructionPair &pair) {
-        FastWrites w{};
-        const VfAccess upper = pair.upperUsage.vfWrite;
-        const VfAccess lower = pair.lowerUsage.vfWrite;
-        const bool hasUpper = upper.reg != 0u;
-        const bool hasLower = lower.reg != 0u && pair.suppressedLowerVf != lower.reg;
-        const bool distinctLower = hasLower && (!hasUpper || lower.reg != upper.reg);
-        w.upperLat = pair.upperUsage.vfLatency != 0u ? pair.upperUsage.vfLatency : pair.upperUsage.latency;
-        w.lowerLat = pair.lowerUsage.vfLatency != 0u ? pair.lowerUsage.vfLatency : pair.lowerUsage.latency;
-        w.viLat = pair.lowerUsage.viLatency != 0u ? pair.lowerUsage.viLatency : pair.lowerUsage.latency;
-        if (hasUpper)
-        {
-            w.upperReg = upper.reg;
-            w.upperLanes = upper.lanes;
-        }
-        if (hasLower)
-        {
-            w.lowerReg = lower.reg;
-            w.lowerLanes = lower.lanes;
-        }
-        const uint32_t viBits = pair.lowerUsage.viWrite & 0xFFFEu;
-        if (viBits != 0u)
-            w.viReg = static_cast<uint8_t>(std::countr_zero(viBits));
-        w.multiVi = std::popcount(viBits) > 1;
-        w.accLanes = pair.upperUsage.accWrite;
-        if (hasUpper)
-            w.readyOffset = std::max(w.readyOffset, w.upperLat);
-        if (distinctLower)
-            w.readyOffset = std::max(w.readyOffset, w.lowerLat);
-        if (w.accLanes != 0u)
-            w.readyOffset = std::max<uint32_t>(w.readyOffset, kAccForwardLatency);
-        if (w.viReg != 0u)
-            w.readyOffset = std::max(w.readyOffset, w.viLat);
-        return w;
-    };
+    auto classifyWrites = [](const DecodedInstructionPair &pair) { return VU1Native::classifyWrites(pair); };
     enum : uint8_t
     {
-        kReadsStatus = 1,
-        kReadsMac = 2,
+        kReadsStatus = VU1Native::kReadsStatus,
+        kReadsMac = VU1Native::kReadsMac,
     };
-    auto lowerReadsFlags = [](const DecodedInstructionPair &pair) -> uint8_t {
-        if (pair.iBit)
-            return 0u;
-        switch ((pair.lower >> 25) & 0x7Fu)
-        {
-        case 0x14: case 0x16: case 0x17: // FSEQ, FSAND, FSOR
-            return kReadsStatus;
-        case 0x18: case 0x1A: case 0x1B: // FMEQ, FMAND, FMOR
-            return kReadsMac;
-        default:
-            return 0u;
-        }
-    };
+    auto lowerReadsFlags = [](const DecodedInstructionPair &pair) { return VU1Native::lowerReadsFlags(pair); };
     static FastOpTable s_fastOps;
     static const bool s_cachedReads = std::getenv("ATV_VU_NO_CACHED_READS") == nullptr;
     // Diagnostic only: aggregate by actual instructions across MPG replacements.
@@ -301,116 +161,10 @@
     static std::vector<BlockCensus> s_blockCensusEntries;
     static uint64_t s_blockCensusCalls = 0;
 
-    auto classifyReads = [](const DecodedInstructionPair &pair) {
-        FastReads result{};
-        uint8_t vfLanes[32]{};
-        uint16_t viMask = 0;
-        uint8_t accMask = 0;
-        for (const InstructionUsage *usage : {&pair.upperUsage, &pair.lowerUsage})
-        {
-            for (uint32_t i = 0; i < usage->vfReadCount; ++i)
-                vfLanes[usage->vfRead[i].reg] |= usage->vfRead[i].lanes;
-            viMask |= usage->viRead;
-            accMask |= usage->accRead;
-        }
-        // Preserve the reference scheduler's ready-lane indexing exactly.
-        for (uint32_t reg = 0; reg < 32; ++reg)
-            for (uint32_t lane = 0; lane < 4; ++lane)
-                if (vfLanes[reg] & (1u << lane))
-                    result.vf[result.vfCount++] = static_cast<uint8_t>(reg * 4 + lane);
-        for (uint32_t reg = 1; reg < 16; ++reg)
-            if (viMask & (1u << reg))
-                result.vi[result.viCount++] = static_cast<uint8_t>(reg);
-        for (uint32_t lane = 0; lane < 4; ++lane)
-            if (accMask & (1u << lane))
-                result.acc[result.accCount++] = static_cast<uint8_t>(lane);
-        for (uint32_t i = result.accCount; i < 4u; ++i)
-            result.acc[i] = result.acc[0];
-        const InstructionUsage &lower = pair.lowerUsage;
-        result.scalarWait = lower.pipeline == PipelineFdiv || lower.waitQ || lower.pipeline == PipelineEfu ||
-                            lower.waitP || lower.pipeline == PipelineXgkick;
-        return result;
-    };
-
-    static constexpr auto classifyUpper = [](uint32_t up) {
-        FastOp op{};
-        op.dest = static_cast<uint8_t>((up >> 21) & 0xFu);
-        op.ft = static_cast<uint8_t>((up >> 16) & 0x1Fu);
-        op.fs = static_cast<uint8_t>((up >> 11) & 0x1Fu);
-        op.fd = static_cast<uint8_t>((up >> 6) & 0x1Fu);
-        const uint32_t low = up & 0x3Fu;
-        op.bc = static_cast<uint8_t>(low & 3u);
-        if (low <= 0x1Bu)
-        {
-            constexpr uint8_t kBcKinds[7] = {kAddBc, kSubBc, kMaddBc, kMsubBc, kMaxBc, kMiniBc, kMulBc};
-            op.kind = kBcKinds[low >> 2];
-        }
-        else if (low == 0x1Cu)
-            op.kind = kMulQ;
-        else if (low == 0x1Eu)
-            op.kind = kMulI;
-        else if (low == 0x1Fu)
-            op.kind = kMiniI;
-        else if (low == 0x22u)
-            op.kind = kAddI;
-        else if (low == 0x28u)
-            op.kind = kAdd;
-        else if (low == 0x2Au)
-            op.kind = kMul;
-        else if (low == 0x2Bu)
-            op.kind = kMax;
-        else if (low == 0x2Cu)
-            op.kind = kSub;
-        else if (low == 0x2Fu)
-            op.kind = kMini;
-        else if (low >= 0x3Cu)
-        {
-            const uint32_t spec = (up & 3u) | ((up >> 4) & 0x7Cu);
-            op.bc = static_cast<uint8_t>(spec & 3u);
-            if (spec >= 0x18u && spec <= 0x1Bu)
-                op.kind = kMulaBc;
-            else if (spec >= 0x08u && spec <= 0x0Bu)
-                op.kind = kMaddaBc;
-            else if (spec == 0x2Fu)
-                op.kind = kNop;
-            else if (spec == 0x1Fu)
-                op.kind = kClip;
-            else if (spec == 0x14u)
-                op.kind = kFtoi0;
-            else if (spec == 0x15u)
-                op.kind = kFtoi4;
-            else if (spec == 0x10u)
-                op.kind = kItof0;
-        }
-        return op;
-    };
-    static constexpr auto packFastOp = [](const FastOp &op) -> uint64_t {
-        return uint64_t{op.kind} | uint64_t{op.fd} << 8 | uint64_t{op.fs} << 16 | uint64_t{op.ft} << 24 |
-               uint64_t{op.dest} << 32 | uint64_t{op.bc} << 40 | uint64_t{op.lowerKind} << 48;
-    };
-    static constexpr auto unpackFastOp = [](uint64_t packed) {
-        FastOp op{};
-        op.kind = static_cast<uint8_t>(packed);
-        op.fd = static_cast<uint8_t>(packed >> 8);
-        op.fs = static_cast<uint8_t>(packed >> 16);
-        op.ft = static_cast<uint8_t>(packed >> 24);
-        op.dest = static_cast<uint8_t>(packed >> 32);
-        op.bc = static_cast<uint8_t>(packed >> 40);
-        op.lowerKind = static_cast<uint8_t>(packed >> 48);
-        return op;
-    };
-    // fastUpper takes a runtime FastOp or std::integral_constant<uint64_t,
-    // packFastOp(op)>; the latter makes every field a compile-time constant.
-    static constexpr auto asFastOp = [](const auto &arg) -> FastOp {
-        using Arg = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<Arg, FastOp>)
-            return arg;
-        else
-        {
-            constexpr FastOp op = unpackFastOp(Arg::value);
-            return op;
-        }
-    };
+    auto classifyReads = [](const DecodedInstructionPair &pair) { return VU1Native::classifyReads(pair); };
+    static constexpr auto classifyUpper = [](uint32_t up) { return VU1Native::classifyUpper(up); };
+    static constexpr auto packFastOp = [](const FastOp &op) { return VU1Native::packFastOp(op); };
+    static constexpr auto unpackFastOp = [](uint64_t packed) { return VU1Native::unpackFastOp(packed); };
 
     // Natively compiled blocks: X(index, lower, upper) per pair, the exact
     // code words of a hot block (ATV_VU_BLOCK_CENSUS). Each pair becomes its
@@ -540,511 +294,26 @@
                 ready = std::max(ready, m_cycle + 1u);
             return ready;
         };
-        static const bool s_fmacZero = std::getenv("ATV_VU_NO_FMAC_ZERO") == nullptr;
-        auto fastUpper = [&](const auto &opArg, uint32_t upper) {
-            const FastOp op = asFastOp(opArg);
-            if (op.kind == kExec)
-            {
-                execUpper(upper);
-                return;
-            }
-            m_currentUpperInstruction = upper;
-            switch (op.kind)
-            {
-            case kNop:
-                return;
-            case kClip:
-            {
-                uint32_t wBits = 0u;
-                std::memcpy(&wBits, &m_state.vf[op.ft][3], sizeof(wBits));
-                const int32_t limit =
-                    (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
-                uint32_t bits[3];
-                std::memcpy(bits, m_state.vf[op.fs], sizeof(bits));
-                uint32_t flags = 0u;
-                for (uint32_t c = 0; c < 3u; ++c)
-                {
-                    if (static_cast<int32_t>(bits[c]) > limit)
-                        flags |= 1u << (2u * c);
-                    if (static_cast<int32_t>(bits[c] ^ 0x80000000u) > limit)
-                        flags |= 2u << (2u * c);
-                }
-                queueClip(flags);
-                return;
-            }
-            case kFtoi0:
-            case kFtoi4:
-            {
-                const double scale = op.kind == kFtoi0 ? 1.0 : 16.0;
-                float result[4];
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    const double scaled = static_cast<double>(vuNormalizeOperand(m_state.vf[op.fs][c])) * scale;
-                    int32_t value;
-                    if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
-                        value = std::numeric_limits<int32_t>::max();
-                    else if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
-                        value = std::numeric_limits<int32_t>::min();
-                    else
-                        value = static_cast<int32_t>(scaled);
-                    std::memcpy(&result[c], &value, sizeof(value));
-                }
-                applyDest(m_state.vf[op.ft], result, op.dest);
-                return;
-            }
-            case kItof0:
-            {
-                float result[4];
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    int32_t value;
-                    std::memcpy(&value, &m_state.vf[op.fs][c], sizeof(value));
-                    result[c] = static_cast<float>(value);
-                }
-                applyDest(m_state.vf[op.ft], result, op.dest);
-                return;
-            }
-            default:
-                break;
-            }
-            const __m128 vs = vuNormalize4(_mm_loadu_ps(m_state.vf[op.fs]));
-            const __m128 vt = vuNormalize4(_mm_loadu_ps(m_state.vf[op.ft]));
-            const auto broadcast = [&]() {
-                switch (op.bc)
-                {
-                case 0: return _mm_shuffle_ps(vt, vt, 0x00);
-                case 1: return _mm_shuffle_ps(vt, vt, 0x55);
-                case 2: return _mm_shuffle_ps(vt, vt, 0xAA);
-                default: return _mm_shuffle_ps(vt, vt, 0xFF);
-                }
-            };
-            const auto acc = [&]() { return vuNormalize4(_mm_loadu_ps(m_state.acc)); };
-            __m128 result;
-            __m128 right = vt;
-            bool fmac = true;
-            bool toAcc = false;
-            bool productSum = false;
-            // How a +-0 result lane is proven exactly zero: vs == -right (add),
-            // vs == right (sub), or a zero factor (mul, product-sum).
-            enum : uint8_t { kZeroAdd, kZeroSub, kZeroFactor } zeroRule = kZeroFactor;
-            switch (op.kind)
-            {
-            case kAddBc: right = broadcast(); result = _mm_add_ps(vs, right); zeroRule = kZeroAdd; break;
-            case kSubBc: right = broadcast(); result = _mm_sub_ps(vs, right); zeroRule = kZeroSub; break;
-            case kMaddBc: right = broadcast(); result = _mm_add_ps(acc(), _mm_mul_ps(vs, right)); productSum = true; break;
-            case kMsubBc: right = broadcast(); result = _mm_sub_ps(acc(), _mm_mul_ps(vs, right)); productSum = true; break;
-            case kMaxBc: result = _mm_max_ps(vs, broadcast()); fmac = false; break;
-            case kMiniBc: result = _mm_min_ps(vs, broadcast()); fmac = false; break;
-            case kMulBc: right = broadcast(); result = _mm_mul_ps(vs, right); break;
-            case kAdd: result = _mm_add_ps(vs, vt); zeroRule = kZeroAdd; break;
-            case kSub: result = _mm_sub_ps(vs, vt); zeroRule = kZeroSub; break;
-            case kMul: result = _mm_mul_ps(vs, vt); break;
-            case kMax: result = _mm_max_ps(vs, vt); fmac = false; break;
-            case kMini: result = _mm_min_ps(vs, vt); fmac = false; break;
-            case kMulQ: right = _mm_set1_ps(vuNormalizeOperand(m_state.q)); result = _mm_mul_ps(vs, right); break;
-            case kMiniI: result = _mm_min_ps(vs, _mm_set1_ps(vuNormalizeOperand(m_state.i))); fmac = false; break;
-            case kMulI: right = _mm_set1_ps(vuNormalizeOperand(m_state.i)); result = _mm_mul_ps(vs, right); break;
-            case kAddI: right = _mm_set1_ps(vuNormalizeOperand(m_state.i)); result = _mm_add_ps(vs, right); zeroRule = kZeroAdd; break;
-            case kMulaBc: right = broadcast(); result = _mm_mul_ps(vs, right); toAcc = true; break;
-            case kMaddaBc: right = broadcast(); result = _mm_add_ps(acc(), _mm_mul_ps(vs, right)); toAcc = true; productSum = true; break;
-            default:
-                execUpper(upper);
-                return;
-            }
-            const __m128i destMask = vuDestMask(op.dest);
-            if (fmac)
-            {
-                // Lanes whose result normalizeFmacResult would provably leave
-                // unchanged with only the sign flag (same bounds as there).
-                const __m128i exponent = vuExponent4(result);
-                __m128i normal;
-                if (!productSum)
-                    normal = vuInRange4(exponent, 2, 0xFD);
-                else
-                {
-                    const __m128 zero = _mm_setzero_ps();
-                    const __m128i zeroFactor =
-                        _mm_castps_si128(_mm_or_ps(_mm_cmpeq_ps(vs, zero), _mm_cmpeq_ps(right, zero)));
-                    const __m128i productExponent = vuExponent4(_mm_mul_ps(vs, right));
-                    const __m128i productNormal =
-                        _mm_and_si128(vuInRange4(productExponent, 1, 0xFD),
-                                      _mm_cmpgt_epi32(_mm_add_epi32(exponent, _mm_set1_epi32(21)), productExponent));
-                    normal = _mm_and_si128(vuInRange4(exponent, 3, 0xFC), _mm_or_si128(zeroFactor, productNormal));
-                }
-                // +-0 lanes whose exact value is provably zero: the slow path
-                // keeps the value and reports Z, plus S from the sign the exact
-                // zero shares with the float result.
-                __m128i exactZero = _mm_setzero_si128();
-                if (s_fmacZero)
-                {
-                    const __m128 zero = _mm_setzero_ps();
-                    __m128 proof;
-                    if (zeroRule == kZeroAdd)
-                        proof = _mm_cmpeq_ps(vs, _mm_xor_ps(right, _mm_set1_ps(-0.0f)));
-                    else if (zeroRule == kZeroSub)
-                        proof = _mm_cmpeq_ps(vs, right);
-                    else
-                        proof = _mm_or_ps(_mm_cmpeq_ps(vs, zero), _mm_cmpeq_ps(right, zero));
-                    exactZero = _mm_castps_si128(_mm_and_ps(_mm_cmpeq_ps(result, zero), proof));
-                }
-                const __m128i handled = _mm_or_si128(normal, exactZero);
-                const bool allNormal =
-                    _mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(handled, destMask))) == 0 && !g_vuVerifyFast;
-                if (g_vuFmacStats)
-                {
-                    ++g_vuFmacStat[kFmacStatOps];
-                    const int slowLanes = _mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(handled, destMask)));
-                    if (slowLanes != 0)
-                    {
-                        ++g_vuFmacStat[kFmacStatSlowOps];
-                        if (g_vuSkipMacFlags)
-                            ++g_vuFmacStat[kFmacStatSlowNoFlag];
-                        alignas(16) float r[4];
-                        alignas(16) float s[4];
-                        _mm_store_ps(r, result);
-                        _mm_store_ps(s, vs);
-                        for (uint32_t c = 0; c < 4u; ++c)
-                        {
-                            if (((slowLanes >> c) & 1) == 0)
-                                continue;
-                            uint32_t bits = 0;
-                            std::memcpy(&bits, &r[c], 4);
-                            const uint32_t e = (bits >> 23) & 0xFFu;
-                            if ((bits & 0x7FFFFFFFu) == 0u)
-                            {
-                                ++g_vuFmacStat[kFmacStatZero];
-                                if (!productSum && s[c] == 0.0f)
-                                    ++g_vuFmacStat[kFmacStatZeroFactor];
-                            }
-                            else if (e == 0u)
-                                ++g_vuFmacStat[kFmacStatDenormal];
-                            else if (e == 0xFFu)
-                                ++g_vuFmacStat[kFmacStatInfNan];
-                            else if (productSum && e >= 3u && e <= 0xFCu)
-                                ++g_vuFmacStat[kFmacStatProduct];
-                            else
-                                ++g_vuFmacStat[kFmacStatEdge];
-                        }
-                    }
-                }
-                if (allNormal)
-                {
-                    if (g_vuMacOnlyFlags)
-                    {
-                        // Only Z and S can be set; MAC holds Z in bits 0..3 and S in
-                        // bits 4..7, x as the high bit of each nibble.
-                        static constexpr uint8_t kComponentsToLanes[16] = {0, 8, 4, 12, 2, 10, 6, 14,
-                                                                           1, 9, 5, 13, 3, 11, 7, 15};
-                        if (op.dest != 0u)
-                            pushPendingMac(
-                                m_state.mac, m_cycle + kFmacLatency,
-                                (static_cast<uint32_t>(kComponentsToLanes[_mm_movemask_ps(result)] & op.dest) << 4) |
-                                    (kComponentsToLanes[_mm_movemask_ps(_mm_castsi128_ps(exactZero))] & op.dest));
-                    }
-                    else if (!g_vuSkipMacFlags)
-                    {
-                        const int signs = _mm_movemask_ps(result);
-                        const int zeros = _mm_movemask_ps(_mm_castsi128_ps(exactZero));
-                        uint8_t laneFlags[4];
-                        for (uint32_t c = 0; c < 4u; ++c)
-                            laneFlags[c] = (op.dest & laneForComponent(c)) == 0u
-                                               ? 0u
-                                               : static_cast<uint8_t>((((signs >> c) & 1) ? 0x2u : 0u) |
-                                                                      (((zeros >> c) & 1) ? 0x1u : 0u));
-                        updateFmacFlags(laneFlags, op.dest, calculateFmacProductSticky(op.dest));
-                    }
-                }
-                else
-                {
-                    alignas(16) float lanes[4];
-                    _mm_store_ps(lanes, result);
-                    uint8_t laneFlags[4]{};
-                    normalizeFmacResult(lanes, op.dest, laneFlags);
-                    if (g_vuVerifyFast)
-                    {
-                        const int zeros = _mm_movemask_ps(_mm_castsi128_ps(exactZero));
-                        const int signs = _mm_movemask_ps(result);
-                        for (uint32_t c = 0; c < 4u; ++c)
-                        {
-                            if ((op.dest & laneForComponent(c)) == 0u || ((zeros >> c) & 1) == 0)
-                                continue;
-                            const uint8_t fastFlags = static_cast<uint8_t>(0x1u | (((signs >> c) & 1) ? 0x2u : 0u));
-                            uint32_t slowBits = 0;
-                            std::memcpy(&slowBits, &lanes[c], 4);
-                            if ((laneFlags[c] != fastFlags || slowBits != (((signs >> c) & 1) ? 0x80000000u : 0u)) &&
-                                g_vuVerifyFastReports < 16u)
-                            {
-                                ++g_vuVerifyFastReports;
-                                std::fprintf(stderr, "[vu-verify] fmac zero mismatch upper=%08x lane=%u slow=%x fast=%x value=%08x\n",
-                                             upper, c, laneFlags[c], fastFlags, slowBits);
-                            }
-                        }
-                    }
-                    if (g_vuMacOnlyFlags)
-                        updateFmacFlags(laneFlags, op.dest, 0u);
-                    else if (!g_vuSkipMacFlags)
-                        updateFmacFlags(laneFlags, op.dest, calculateFmacProductSticky(op.dest));
-                    result = _mm_load_ps(lanes);
-                }
-            }
-            float *dst = toAcc ? m_state.acc : m_state.vf[op.fd];
-            const __m128 keep = _mm_castsi128_ps(destMask);
-            _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(keep, result), _mm_andnot_ps(keep, _mm_loadu_ps(dst))));
-        };
-        // Same semantics as the matching execLower cases. kind/instr may be
-        // std::integral_constant (native blocks) to fold the decode.
+        auto fastUpper = [&](const auto &opArg, uint32_t upper) { VU1Native::fastUpper(*this, opArg, upper); };
         auto fastLower = [&](auto kindArg, auto instrArg, uint32_t upper) {
-            const uint8_t kind = kindArg;
-            const uint32_t instr = instrArg;
-            switch (kind)
-            {
-            case kLowerNop:
-                return;
-            case kLq:
-            {
-                uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(m_state.vi[VIS(instr)] + IMM11(instr))) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, vuData + addr, 16);
-                    applyDest(m_state.vf[FT(instr)], tmp, DEST(instr));
-                }
-                return;
-            }
-            case kSq:
-            {
-                uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(m_state.vi[VIT(instr)] + IMM11(instr))) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    uint32_t words[4];
-                    std::memcpy(words, m_state.vf[FS(instr)], sizeof(words));
-                    queueStore(addr, words, DEST(instr));
-                }
-                return;
-            }
-            case kIaddiu:
-            {
-                const uint8_t it = VIT(instr);
-                const int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
-                if (it != 0)
-                    m_state.vi[it] = (int16_t)(m_state.vi[VIS(instr)] + imm);
-                return;
-            }
-            case kLqi:
-            {
-                const uint8_t viS = VIS(instr);
-                uint32_t addr = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    float tmp[4];
-                    std::memcpy(tmp, vuData + addr, 16);
-                    applyDest(m_state.vf[FT(instr)], tmp, DEST(instr));
-                }
-                if (viS != 0)
-                    m_state.vi[viS] = (int16_t)(m_state.vi[viS] + 1);
-                return;
-            }
-            case kSqi:
-            {
-                const uint8_t viT = VIT(instr);
-                uint32_t addr = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viT])) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    uint32_t words[4];
-                    std::memcpy(words, m_state.vf[FS(instr)], sizeof(words));
-                    queueStore(addr, words, DEST(instr));
-                }
-                if (viT != 0)
-                    m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
-                return;
-            }
-            case kIbeq:
-            case kIbne:
-            {
-                const bool equal = (int16_t)readBranchVi(VIS(instr)) == (int16_t)readBranchVi(VIT(instr));
-                if (equal == (kind == kIbeq))
-                {
-                    m_state.branchPending = true;
-                    m_state.branchTarget = (m_state.pc + 8 + IMM11(instr) * 8) & microAddressMask();
-                    m_state.branchDelay = 1;
-                }
-                return;
-            }
-            case kMr32:
-            {
-                const float *s = m_state.vf[FS(instr)];
-                const float tmp[4] = {s[1], s[2], s[3], s[0]};
-                applyDest(m_state.vf[FT(instr)], tmp, DEST(instr));
-                return;
-            }
-            case kMove:
-            {
-                float tmp[4];
-                std::memcpy(tmp, m_state.vf[FS(instr)], 16);
-                applyDest(m_state.vf[FT(instr)], tmp, DEST(instr));
-                return;
-            }
-            case kIlw:
-            {
-                uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(m_state.vi[VIS(instr)] + IMM11(instr))) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    const uint8_t dest = DEST(instr);
-                    const uint32_t comp = (dest & 0x8u) ? 0u : (dest & 0x4u) ? 1u : (dest & 0x2u) ? 2u : 3u;
-                    uint32_t v;
-                    std::memcpy(&v, vuData + addr + comp * 4u, 4);
-                    if (VIT(instr) != 0)
-                        m_state.vi[VIT(instr)] = static_cast<int16_t>(v & 0xFFFFu);
-                }
-                return;
-            }
-            case kIsw:
-            {
-                uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(m_state.vi[VIS(instr)] + IMM11(instr))) * 16u;
-                addr &= (dataSize - 1);
-                if (addr + 16 <= dataSize)
-                {
-                    const uint32_t val = static_cast<uint16_t>(m_state.vi[VIT(instr)] & 0xFFFF);
-                    const uint32_t words[4] = {val, val, val, val};
-                    queueStore(addr, words, DEST(instr));
-                }
-                return;
-            }
-            case kIsubiu:
-            {
-                const uint8_t it = VIT(instr);
-                const int16_t imm = (int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800);
-                if (it != 0)
-                    m_state.vi[it] = (int16_t)(m_state.vi[VIS(instr)] - imm);
-                return;
-            }
-            case kFcand:
-                m_state.vi[1] = (m_state.clip & instr & 0xFFFFFFu) != 0u ? 1 : 0;
-                return;
-            case kFcor:
-                m_state.vi[1] = (m_state.clip | (instr & 0xFFFFFFu)) == 0xFFFFFFu ? 1 : 0;
-                return;
-            case kFcget:
-                if (VIT(instr) != 0)
-                    m_state.vi[VIT(instr)] = static_cast<int16_t>(m_state.clip & 0xFFFFu);
-                return;
-            case kB:
-                m_state.branchPending = true;
-                m_state.branchTarget = (m_state.pc + 8 + IMM11(instr) * 8) & microAddressMask();
-                m_state.branchDelay = 1;
-                return;
-            case kJr:
-                m_state.branchPending = true;
-                m_state.branchTarget =
-                    (static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[VIS(instr)])) * 8u) & microAddressMask();
-                m_state.branchDelay = 1;
-                return;
-            case kIbltz:
-            case kIbgtz:
-            case kIblez:
-            case kIbgez:
-            {
-                const int16_t value = (int16_t)readBranchVi(VIS(instr));
-                const bool taken = kind == kIbltz   ? value < 0
-                                   : kind == kIbgtz ? value > 0
-                                   : kind == kIblez ? value <= 0
-                                                    : value >= 0;
-                if (taken)
-                {
-                    m_state.branchPending = true;
-                    m_state.branchTarget = (m_state.pc + 8 + IMM11(instr) * 8) & microAddressMask();
-                    m_state.branchDelay = 1;
-                }
-                return;
-            }
-            case kIadd:
-                if (VID(instr) != 0)
-                    m_state.vi[VID(instr)] = (int16_t)(m_state.vi[VIS(instr)] + m_state.vi[VIT(instr)]);
-                return;
-            case kIsub:
-                if (VID(instr) != 0)
-                    m_state.vi[VID(instr)] = (int16_t)(m_state.vi[VIS(instr)] - m_state.vi[VIT(instr)]);
-                return;
-            case kIaddi:
-                if (VIT(instr) != 0)
-                    m_state.vi[VIT(instr)] =
-                        (int16_t)(m_state.vi[VIS(instr)] + (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27));
-                return;
-            case kIand:
-                if (VID(instr) != 0)
-                    m_state.vi[VID(instr)] = (int16_t)(m_state.vi[VIS(instr)] & m_state.vi[VIT(instr)]);
-                return;
-            case kIor:
-                if (VID(instr) != 0)
-                    m_state.vi[VID(instr)] = (int16_t)(m_state.vi[VIS(instr)] | m_state.vi[VIT(instr)]);
-                return;
-            case kWaitq:
-                return;
-            case kMtir:
-            {
-                uint32_t bits;
-                std::memcpy(&bits, &m_state.vf[FS(instr)][(instr >> 21) & 0x3u], 4);
-                if (VIT(instr) != 0)
-                    m_state.vi[VIT(instr)] = static_cast<int16_t>(bits & 0xFFFFu);
-                return;
-            }
-            case kMfir:
-            {
-                const int32_t value = static_cast<int16_t>(m_state.vi[VIS(instr)] & 0xFFFF);
-                float result[4];
-                std::memcpy(&result[0], &value, 4);
-                result[1] = result[0];
-                result[2] = result[0];
-                result[3] = result[0];
-                applyDest(m_state.vf[FT(instr)], result, DEST(instr));
-                return;
-            }
-            case kMfp:
-            {
-                const float result[4] = {m_state.p, m_state.p, m_state.p, m_state.p};
-                applyDest(m_state.vf[FT(instr)], result, DEST(instr));
-                return;
-            }
-            case kDiv:
-            {
-                const float num = vuNormalizeOperand(m_state.vf[FS(instr)][(instr >> 21) & 0x3u]);
-                const float den = vuNormalizeOperand(m_state.vf[FT(instr)][(instr >> 23) & 0x3u]);
-                uint32_t statusDi = 0u;
-                float result;
-                if (den == 0.0f)
-                {
-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
-                    result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
-                                                                    : std::numeric_limits<float>::max();
-                }
-                else
-                    result = num / den;
-                uint32_t ignoredFlags = 0u;
-                result = normalizeResult(result, ignoredFlags);
-                queueQ(result, 7u, statusDi);
-                return;
-            }
-            case kEleng:
-            {
-                const float x = vuNormalizeOperand(m_state.vf[FS(instr)][0]);
-                const float y = vuNormalizeOperand(m_state.vf[FS(instr)][1]);
-                const float z = vuNormalizeOperand(m_state.vf[FS(instr)][2]);
-                queueP(std::sqrt(x * x + y * y + z * z), 18u);
-                return;
-            }
-            default:
-                execLower(instr, vuData, dataSize, gs, memory, upper);
-                return;
-            }
+            VU1Native::fastLower(*this, kindArg, instrArg, upper, vuData, dataSize, gs, memory);
         };
 
         g_vuSkipMacFlags = !s_keepFlags && s_fastOps.readsFlags == 0u;
         g_vuMacOnlyFlags = !s_keepFlags && s_fastOps.readsFlags == kReadsMac;
+        g_vuFmacLean = (g_vuSkipMacFlags || g_vuMacOnlyFlags) && !g_vuApprox && !g_vuVerifyFast && !g_vuFmacStats && VU1Native::s_fmacZero;
+        // ATV_VU_TRACE_FLAGMODE=1: fast-loop runs per FMAC flag mode, every 50000 runs.
+        static const bool s_traceFlagMode = std::getenv("ATV_VU_TRACE_FLAGMODE") != nullptr;
+        if (s_traceFlagMode)
+        {
+            static uint64_t s_modeRuns[4]{};
+            ++s_modeRuns[g_vuFmacLean ? 0 : g_vuSkipMacFlags ? 1 : g_vuMacOnlyFlags ? 2 : 3];
+            if ((s_modeRuns[0] + s_modeRuns[1] + s_modeRuns[2] + s_modeRuns[3]) % 50000u == 0u)
+                std::fprintf(stderr, "[vu-flagmode] lean=%llu skip=%llu macOnly=%llu full=%llu readsFlags=%u\n",
+                             static_cast<unsigned long long>(s_modeRuns[0]), static_cast<unsigned long long>(s_modeRuns[1]),
+                             static_cast<unsigned long long>(s_modeRuns[2]), static_cast<unsigned long long>(s_modeRuns[3]),
+                             static_cast<unsigned>(s_fastOps.readsFlags));
+        }
         g_vuSkippedFlagsReady = 0;
         g_vuDirectStores = true;
         uint64_t writesReadyAt = 0;
@@ -1069,13 +338,13 @@
             constexpr uint32_t upper = decltype(upperC)::value;
             constexpr bool iBit = (upper >> 31) != 0u;
             constexpr FastOp op = unpackFastOp(packFastOp(classifyUpper(upper)) |
-                                               uint64_t{iBit ? kLowerExec : classifyLowerWord(lower)} << 48);
-            static_assert(op.kind != kExec, "native pair needs a fast upper op");
-            static_assert(iBit || op.lowerKind != kLowerExec, "native pair needs a fast lower op");
+                                               uint64_t{iBit ? VU1Native::kLowerExec : classifyLowerWord(lower)} << 48);
+            static_assert(op.kind != VU1Native::kExec, "native pair needs a fast upper op");
+            static_assert(iBit || op.lowerKind != VU1Native::kLowerExec, "native pair needs a fast lower op");
             constexpr std::integral_constant<uint64_t, packFastOp(op)> opC{};
             if constexpr (iBit)
             {
-                if constexpr (op.kind != kNop)
+                if constexpr (op.kind != VU1Native::kNop)
                     fastUpper(opC, upper);
                 constexpr float immediate = std::bit_cast<float>(lower);
                 m_state.i = normalizeOperand(immediate);
@@ -1085,9 +354,9 @@
             {
                 const bool viRecord = mode == kPairFastViRecord;
                 const int32_t oldVi = viRecord ? m_state.vi[viReg] : 0;
-                if constexpr (op.kind != kNop)
+                if constexpr (op.kind != VU1Native::kNop)
                     fastUpper(opC, upper);
-                if constexpr (op.lowerKind != kLowerNop)
+                if constexpr (op.lowerKind != VU1Native::kLowerNop)
                     fastLower(std::integral_constant<uint8_t, op.lowerKind>{}, lowerC, upper);
                 m_viBranchBackupValid = false;
                 if (viRecord)
@@ -1906,6 +1175,15 @@
         // Block (and schedule) replayed to completion just before this pair.
         BlockInfo *chainBlock = nullptr;
         uint32_t chainSchedule = 0;
+        // Natively compiled blocks (ps2_vu1_native.inc). They need the exact
+        // per-pair semantics, so not while per-pair traces are recorded.
+        const bool nativeOn = VU1Native::s_enabled && codeSize == 0x4000u && !g_vuVerifyTrace;
+        VU1Native::Ctx nativeCtx;
+        VU1Native::initCtx(nativeCtx, *this, vuData, dataSize, gs, memory, budgetEnd, &writesReadyAt, hint);
+        // ATV_VU_NATIVE_GEN: blocks are generated where the previous pair
+        // ended one (a branch delay slot or E-bit pair), and at run entry.
+        bool nativeBoundary = true;
+        bool nativeTail = false;
         while (m_cycle < budgetEnd && !m_stopRequested)
         {
             if (m_cycle >= hint.nextReady)
@@ -1915,6 +1193,28 @@
             {
                 fastLeft = true;
                 break;
+            }
+            if (nativeOn && !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot)
+            {
+                const VU1Native::BlockFn fn = VU1Native::lookup(vuCode, m_cachedCodeGeneration, pairIndex);
+                const uint64_t nativeCycleBefore = m_cycle;
+                const uint32_t end = fn ? (s_rec.block = nullptr, chainBlock = nullptr, fn(nativeCtx)) : VU1Native::kNativeBail;
+                if (fn && end == VU1Native::kNativeEnded)
+                {
+                    programEnded = true;
+                    break;
+                }
+                // A block that bails before its first pair without advancing (that pair would stall
+                // past the budget) would be dispatched again forever: let the per-pair path below
+                // take this pair; it advances to the budget and stops.
+                if (fn && !(end == VU1Native::kNativeBail && m_state.pc == (pairIndex << 3) && m_cycle == nativeCycleBefore))
+                {
+                    nativeBoundary = end == VU1Native::kNativeContinue;
+                    nativeTail = false;
+                    continue;
+                }
+                if (!fn && VU1Native::s_genPath && nativeBoundary)
+                    VU1Native::generate(*this, pairIndex, codePairs);
             }
             BlockInfo *const fromBlock = chainBlock;
             const uint32_t fromSchedule = chainSchedule;
@@ -2036,6 +1336,8 @@
                         chainBlock = block;
                         chainSchedule = foundIndex;
                     }
+                    nativeBoundary = false;
+                    nativeTail = false;
                     continue;
                 }
             }
@@ -2097,6 +1399,8 @@
             programEnded = finishPc(decoded);
             endPairCycle();
             ++g_vu1PairTotal;
+            nativeBoundary = nativeTail;
+            nativeTail = (!decoded.iBit && decoded.lowerUsage.pipeline == PipelineBranch) || decoded.eBit;
             if (s_rec.block && s_rec.count == s_rec.block->length)
                 finishRecording();
             if (programEnded)
@@ -2127,6 +1431,7 @@
         }
         g_vuMacOnlyFlags = false;
         g_vuSkipMacFlags = false;
+        g_vuFmacLean = false;
         g_vuDirectStores = false;
         fastDrainCycle = std::max(writesReadyAt, g_vuSkippedFlagsReady);
         recompRan = !fastLeft;

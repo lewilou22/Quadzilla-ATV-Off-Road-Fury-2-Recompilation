@@ -10,6 +10,11 @@
 #include <thread>
 #include <vector>
 
+// True when GSCpuBackend::DrawTriangle would write no pixel for this
+// triangle (rejected, outside the scissor, or a small triangle whose sample
+// points all miss). Exact for the boxes it tests; larger triangles return false.
+bool gsTriangleDrawsNothing(const GSPrimitiveBatch &batch);
+
 // Record tags of an ATV_GS_CAPTURE file (see gs_cpu_backend.cpp).
 enum GSCaptureTag : uint8_t
 {
@@ -137,6 +142,32 @@ private:
     // destination misses these and m_bandWrites runs without flushing the
     // queue (ATV_GS_UPLOAD_FLUSH=1 always flushes).
     mutable std::vector<BandWrite> m_bandReads;
+    // m_bandWrites/m_bandReads of the batch the band threads are drawing: an
+    // upload outside them need not wait for that batch (InFlightTouches).
+    mutable std::vector<BandWrite> m_bandInFlightWrites;
+    mutable std::vector<BandWrite> m_bandInFlightReads;
+    bool InFlightTouches(const BandWrite &range) const;
+    // CLUT seen by queued band primitives: the CLUT when the first of them was queued plus each
+    // later load (pending index, CLUT). Bands draw from these snapshots, so a palette load does not
+    // flush the queue (ATV2 loads ~1000 palettes a frame). LoadClut still flushes when queued
+    // draws write the palette's source or a pending TEXFLUSH leaves the shared page cache stale.
+    using ClutTable = std::array<uint16_t, 512>;
+    mutable ClutTable m_bandPendingClutStart{};
+    mutable std::vector<std::pair<size_t, ClutTable>> m_bandClutChanges;
+    mutable ClutTable m_bandInFlightClutStart{};
+    mutable std::vector<std::pair<size_t, ClutTable>> m_bandInFlightClutChanges;
+    // Everything QueueBandedPrimitive's ranges depend on. A primitive with the
+    // key of the last one queued since the last flush adds no ranges and hits
+    // no alias or hazard (that one passed the same checks), so it is appended.
+    struct BandKey
+    {
+        uint64_t clamp = 0;
+        uint32_t fbp = 0, fbw = 0, fpsm = 0, rows = 0, zbp = 0, zpsm = 0, tbp0 = 0, tbw = 0, tpsm = 0;
+        uint32_t texW = 0, texH = 0, flags = 0;
+        bool operator==(const BandKey &) const = default;
+    };
+    mutable BandKey m_lastBandKey{};
+    mutable bool m_lastBandKeyValid = false;
     bool PendingTouches(const BandWrite &range) const;
     BandWrite m_uploadRange{};
     bool m_uploadRangeValid = false;
@@ -159,7 +190,8 @@ private:
     bool m_bandStop = false;
     bool m_legacyTextureFlush = false;
     bool m_profileBands = false;
-    size_t m_bandBatchLimit = 1024;
+    // ATV_GS_BATCH_SIZE; 4096 cuts band wake/done handoffs (~1.5 fps in races vs 1024).
+    size_t m_bandBatchLimit = 4096;
     mutable std::array<uint64_t, 16> m_bandDrawNs{};
     mutable std::array<uint64_t, 16> m_bandAccumulatedNs{};
     mutable std::array<uint64_t, static_cast<size_t>(BandFlushReason::Count)> m_bandFlushCounts{};

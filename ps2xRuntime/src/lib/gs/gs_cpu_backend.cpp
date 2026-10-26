@@ -42,7 +42,11 @@ namespace
     thread_local uint32_t t_bandIndex = 0u;
     thread_local uint32_t t_bandCount = 1u;
     thread_local int t_ownedBandRow = -1;
+    // ATV_GS_CULL_VERIFY: set by DrawTriangle when a sample passes coverage.
+    thread_local bool t_triangleCovered = false;
     thread_local GSMem::TexturePageCache *t_bandCache = nullptr;
+    // Palette of the primitive a band is drawing (DrawBand); null = the backend's current CLUT.
+    thread_local const uint16_t *t_drawClut = nullptr;
 
     uint64_t bandClockNs()
     {
@@ -1297,15 +1301,16 @@ GSCpuBackend::GSCpuBackend()
     m_uploadNoFlush = std::getenv("ATV_GS_UPLOAD_FLUSH") == nullptr;
     m_profileBands = std::getenv("ATV_GS_PROFILE_BANDS") != nullptr;
     m_bandPipeline = std::getenv("ATV_GS_BAND_PIPELINE") != nullptr;
+    // ATV2 default (ATV1 sets ATV_GS_BANDS=12 in play_game.bat): up to 12 raster bands, half the
+    // host threads. ATV_GS_BANDS=1 rasterizes inline.
     if (const char *batch = std::getenv("ATV_GS_BATCH_SIZE"))
         m_bandBatchLimit = static_cast<size_t>(std::clamp<long>(std::strtol(batch, nullptr, 10), 16, 4096));
-    if (const char *bands = std::getenv("ATV_GS_BANDS"))
-    {
-        // The opt-in TBP census keeps an unsynchronized map in DrawTriangle.
-        const long requested = std::strtol(bands, nullptr, 10);
-        if (requested > 1 && std::getenv("ATV_TRACE_TBP_CENSUS") == nullptr)
-            m_bandCount = static_cast<uint32_t>(std::min<long>(requested, 16));
-    }
+    const char *bands = std::getenv("ATV_GS_BANDS");
+    const long requested = bands ? std::strtol(bands, nullptr, 10)
+                                 : std::clamp<long>(static_cast<long>(std::thread::hardware_concurrency() / 2u), 1, 12);
+    // The opt-in TBP census keeps an unsynchronized map in DrawTriangle.
+    if (requested > 1 && std::getenv("ATV_TRACE_TBP_CENSUS") == nullptr)
+        m_bandCount = static_cast<uint32_t>(std::min<long>(requested, 16));
 }
 
 void GSCpuBackend::StartBandThreads()
@@ -1361,7 +1366,8 @@ void GSCpuBackend::DrawBand(uint32_t band)
     t_ownedBandRow = -1;
     const uint64_t start = m_profileBands ? bandClockNs() : 0;
     auto &cache = band == 0u ? m_texturePageCache : *m_bandCaches[band - 1u];
-    size_t index = 0, nextFlush = 0;
+    size_t index = 0, nextFlush = 0, nextClut = 0;
+    t_drawClut = m_bandInFlightClutStart.data();
     for (const GSPrimitiveBatch &batch : m_bandInFlight)
     {
         if (nextFlush < m_bandInFlightTextureFlushes.size() && m_bandInFlightTextureFlushes[nextFlush] == index)
@@ -1369,10 +1375,13 @@ void GSCpuBackend::DrawBand(uint32_t band)
             cache.Invalidate();
             ++nextFlush;
         }
+        while (nextClut < m_bandInFlightClutChanges.size() && m_bandInFlightClutChanges[nextClut].first == index)
+            t_drawClut = m_bandInFlightClutChanges[nextClut++].second.data();
         if (bandMayDrawPrimitive(batch))
             DrawPrimitive(batch);
         ++index;
     }
+    t_drawClut = nullptr;
     if (nextFlush < m_bandInFlightTextureFlushes.size())
         cache.Invalidate(); // TEXFLUSH after the final queued primitive.
     if (m_profileBands)
@@ -1408,7 +1417,13 @@ void GSCpuBackend::FlushBands(BandFlushReason reason) const
     m_bandInFlightTextureFlushes.swap(m_bandTextureFlushes);
     m_bandPending.clear();
     m_bandTextureFlushes.clear();
+    m_bandInFlightClutStart = m_bandPendingClutStart;
+    m_bandInFlightClutChanges.swap(m_bandClutChanges);
+    m_bandClutChanges.clear();
+    m_bandInFlightWrites.swap(m_bandWrites);
     m_bandWrites.clear();
+    m_lastBandKeyValid = false;
+    m_bandInFlightReads.swap(m_bandReads);
     m_bandReads.clear();
     {
         std::lock_guard<std::mutex> lock(m_bandMutex);
@@ -1467,6 +1482,30 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
 
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    BandKey key;
+    key.clamp = ctx.clamp;
+    key.fbp = ctx.frame.fbp;
+    key.fbw = ctx.frame.fbw;
+    key.fpsm = ctx.frame.psm;
+    key.rows = ctx.scissor.y1;
+    key.zbp = ctx.zbuf.zbp;
+    key.zpsm = ctx.zbuf.psm;
+    key.tbp0 = ctx.tex0.tbp0;
+    key.tbw = ctx.tex0.tbw;
+    key.tpsm = ctx.tex0.psm;
+    key.texW = state.textureWidth;
+    key.texH = state.textureHeight;
+    key.flags = (ctx.zbuf.zmask ? 1u : 0u) | (state.prim.tme ? 2u : 0u);
+    if (m_lastBandKeyValid && key == m_lastBandKey && m_bandPending.size() < m_bandBatchLimit)
+    {
+        if (m_bandPending.empty())
+        {
+            m_bandPendingClutStart = m_clut;
+            m_bandClutChanges.clear();
+        }
+        m_bandPending.push_back(batch);
+        return;
+    }
     const uint32_t fbw = ctx.frame.fbw >= 1u ? ctx.frame.fbw : 10u;
     const uint32_t rows = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
     const BandWrite frame = surfaceRange<BandWrite>(ctx.frame.fbp * kVramPageBytes, fbw * 64u, ctx.frame.psm, rows,
@@ -1509,7 +1548,14 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
     if (hazard || samplesPendingWrite)
         FlushBands(batchFull ? BandFlushReason::Batch : BandFlushReason::Hazard);
 
+    if (m_bandPending.empty())
+    {
+        m_bandPendingClutStart = m_clut;
+        m_bandClutChanges.clear();
+    }
     m_bandPending.push_back(batch);
+    m_lastBandKey = key;
+    m_lastBandKeyValid = true;
     const auto recordWrite = [&](const BandWrite &range)
     {
         for (BandWrite &write : m_bandWrites)
@@ -1553,6 +1599,23 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
         if (!merged)
             m_bandReads.push_back(read);
     }
+}
+
+bool GSCpuBackend::InFlightTouches(const BandWrite &range) const
+{
+    // Pipelined bands run band 0 off-thread with the shared page cache, which
+    // uploads touch: they always wait.
+    if (m_bandPipeline)
+        return m_bandInFlightActive;
+    if (!m_bandInFlightActive)
+        return false;
+    for (const BandWrite &write : m_bandInFlightWrites)
+        if (overlaps(range, write))
+            return true;
+    for (const BandWrite &read : m_bandInFlightReads)
+        if (overlaps(range, read))
+            return true;
+    return false;
 }
 
 bool GSCpuBackend::PendingTouches(const BandWrite &range) const
@@ -1635,9 +1698,106 @@ void GSCpuBackend::ResetUnlocked()
     m_localToHostReadPos = 0u;
 }
 
+namespace
+{
+    // ATV_TRACE_PRIM_STATS=1: every ~5 s of a race, primitives per second by
+    // type, how many are degenerate, sub-pixel or outside the scissor, and how
+    // many repeat one of the previous 256 primitives exactly (same vertices and
+    // state) or only in screen geometry (another pass over the same triangle).
+    void tracePrimStats(const GSPrimitiveBatch &batch)
+    {
+        static const bool s_enabled = std::getenv("ATV_TRACE_PRIM_STATS") != nullptr;
+        if (!s_enabled || !g_raceLoadStarted)
+            return;
+        struct Stats
+        {
+            uint64_t total = 0, byType[8]{}, zeroArea = 0, subPixel = 0, offScissor = 0, exactRepeat = 0,
+                     geoRepeat = 0, textured = 0, alphaBlend = 0;
+            uint64_t geo[256]{}, full[256]{};
+            uint32_t ring = 0;
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        };
+        static Stats st;
+        const auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; };
+        const auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return static_cast<uint64_t>(u); };
+        const GSDrawState &state = batch.state;
+        const auto &ctx = state.context;
+        const uint32_t n = std::min<uint32_t>(batch.vertexCount, 3u);
+        uint64_t geo = 0xcbf29ce484222325ull;
+        uint64_t full = geo;
+        float minX = 1e30f, minY = 1e30f, maxX = -1e30f, maxY = -1e30f;
+        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            geo = mix(mix(mix(geo, bits(v.x)), bits(v.y)), bits(static_cast<float>(v.z)));
+            full = mix(mix(mix(mix(full, bits(v.s)), bits(v.t)), (uint64_t(v.u) << 16) | v.v),
+                       (uint64_t(v.r) << 24) | (uint64_t(v.g) << 16) | (uint64_t(v.b) << 8) | v.a);
+            minX = std::min(minX, v.x - ofx);
+            maxX = std::max(maxX, v.x - ofx);
+            minY = std::min(minY, v.y - ofy);
+            maxY = std::max(maxY, v.y - ofy);
+        }
+        full = mix(mix(mix(mix(full ^ geo, ctx.frame.fbp), ctx.tex0.tbp0), ctx.alpha), ctx.test);
+        full = mix(full, (uint64_t(state.prim.type) << 8) | (state.prim.tme << 1) | state.prim.abe);
+
+        ++st.total;
+        ++st.byType[state.prim.type & 7u];
+        st.textured += state.prim.tme;
+        st.alphaBlend += state.prim.abe;
+        if (maxX < ctx.scissor.x0 || minX > ctx.scissor.x1 + 1.0f || maxY < ctx.scissor.y0 || minY > ctx.scissor.y1 + 1.0f)
+            ++st.offScissor;
+        if (n == 3u && state.prim.type >= GS_PRIM_TRIANGLE && state.prim.type <= GS_PRIM_TRIFAN)
+        {
+            const GSVertex &a = batch.vertices[0], &b = batch.vertices[1], &c = batch.vertices[2];
+            const float area = std::fabs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) * 0.5f;
+            if (area == 0.0f)
+                ++st.zeroArea;
+            else if (area < 1.0f)
+                ++st.subPixel;
+        }
+        bool exact = false, sameGeo = false;
+        for (uint32_t i = 0; i < 256u; ++i)
+        {
+            exact = exact || st.full[i] == full;
+            sameGeo = sameGeo || st.geo[i] == geo;
+        }
+        st.exactRepeat += exact;
+        st.geoRepeat += !exact && sameGeo;
+        st.geo[st.ring & 255u] = geo;
+        st.full[st.ring & 255u] = full;
+        ++st.ring;
+
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - st.start).count();
+        if (secs < 5.0)
+            return;
+        const double k = 1.0 / secs;
+        std::fprintf(stderr,
+                     "[prim-stats] prims/s=%.0f tri=%.0f strip=%.0f fan=%.0f sprite=%.0f line=%.0f point=%.0f "
+                     "textured=%.1f%% blend=%.1f%% zeroArea=%.1f%% subPixel=%.1f%% offScissor=%.1f%% "
+                     "exactRepeat=%.1f%% geoRepeat=%.1f%%\n",
+                     st.total * k, st.byType[GS_PRIM_TRIANGLE] * k, st.byType[GS_PRIM_TRISTRIP] * k,
+                     st.byType[GS_PRIM_TRIFAN] * k, st.byType[GS_PRIM_SPRITE] * k,
+                     (st.byType[GS_PRIM_LINE] + st.byType[GS_PRIM_LINESTRIP]) * k, st.byType[GS_PRIM_POINT] * k,
+                     100.0 * st.textured / st.total, 100.0 * st.alphaBlend / st.total, 100.0 * st.zeroArea / st.total,
+                     100.0 * st.subPixel / st.total, 100.0 * st.offScissor / st.total,
+                     100.0 * st.exactRepeat / st.total, 100.0 * st.geoRepeat / st.total);
+        const uint32_t ring = st.ring;
+        uint64_t keepGeo[256], keepFull[256];
+        std::memcpy(keepGeo, st.geo, sizeof(keepGeo));
+        std::memcpy(keepFull, st.full, sizeof(keepFull));
+        st = Stats{};
+        std::memcpy(st.geo, keepGeo, sizeof(keepGeo));
+        std::memcpy(st.full, keepFull, sizeof(keepFull));
+        st.ring = ring;
+    }
+}
+
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    tracePrimStats(batch);
     if (gsCapture().enabled)
     {
         if (g_raceLoadStarted && !gsCapture().owner)
@@ -1692,44 +1852,57 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         return;
     }
 
-    WaitBandsIdle();
-    // Palette loads read the shared texture cache immediately. Replay any
-    // pending TEXFLUSH before loading, without changing earlier draws' cache.
-    if (!m_bandTextureFlushes.empty())
-        FlushBands(BandFlushReason::Clut);
-    if (m_bandPending.empty())
+    if (m_bandCount <= 1u)
     {
         LoadClutUnlocked(tex0, texclut);
         return;
     }
 
-    // Queued draws have not run yet and must see the CLUT as it was when
-    // they were submitted, so only a load that changes it forces a flush.
+    // Queued and in-flight draws use their CLUT snapshots (m_bandPendingClut*, m_bandInFlightClut*),
+    // so the load only has to read current VRAM (LoadClutUnlocked reads it directly): let queued or
+    // in-flight draws that write the palette's source finish first. ATV_GS_CLUT_FLUSH=1 flushes on
+    // every palette change as before.
+    static const bool s_clutFlush = std::getenv("ATV_GS_CLUT_FLUSH") != nullptr;
     const bool csm2 = tex0.csm != 0u;
-    const BandWrite source = surfaceRange<BandWrite>(tex0.cbp * kVramBlockBytes,
-                                                     csm2 ? std::max<uint32_t>(texclut.cbw, 1u) * 64u : 64u,
-                                                     tex0.cpsm,
-                                                     csm2 ? static_cast<uint32_t>(texclut.cov) + 1u : 16u,
-                                                     0u, kVramPageBytes);
-    for (const BandWrite &write : m_bandWrites)
+    BandWrite source{};
+    if (csm2)
+        source = surfaceRange<BandWrite>(tex0.cbp * kVramBlockBytes, std::max<uint32_t>(texclut.cbw, 1u) * 64u,
+                                         tex0.cpsm, static_cast<uint32_t>(texclut.cov) + 1u, 0u, kVramPageBytes);
+    else
     {
-        if (overlaps(source, write))
-        {
-            FlushBands(BandFlushReason::Clut);
-            LoadClutUnlocked(tex0, texclut);
-            return;
-        }
+        // A CSM1 palette (16x16 or 8x2 entries) spans at most four consecutive blocks. The page
+        // range surfaceRange gives wraps for the usual spot at the end of VRAM (CBP 0x3FFC) and
+        // would overlap every queued draw.
+        source.begin = tex0.cbp * kVramBlockBytes;
+        source.end = std::min<uint32_t>(source.begin + 4u * kVramBlockBytes, kVramBytes);
     }
-
-    const auto previous = m_clut;
-    LoadClutUnlocked(tex0, texclut);
-    if (m_clut != previous)
+    bool flush = false;
+    for (const BandWrite &write : m_bandWrites)
+        flush = flush || overlaps(source, write);
+    if (flush)
     {
-        const auto loaded = m_clut;
+        FlushBands(BandFlushReason::Clut);
+        WaitBandsIdle();
+    }
+    else if (InFlightTouches(source))
+        WaitBandsIdle();
+
+    const ClutTable previous = m_clut;
+    LoadClutUnlocked(tex0, texclut);
+    if (m_bandPending.empty() || m_clut == previous)
+        return;
+    if (s_clutFlush)
+    {
+        const ClutTable loaded = m_clut;
         m_clut = previous;
         FlushBands(BandFlushReason::Clut);
         m_clut = loaded;
+        return;
     }
+    if (!m_bandClutChanges.empty() && m_bandClutChanges.back().first == m_bandPending.size())
+        m_bandClutChanges.back().second = m_clut;
+    else
+        m_bandClutChanges.emplace_back(m_bandPending.size(), m_clut);
 }
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
@@ -1766,7 +1939,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             sourceY = static_cast<uint32_t>(texclut.cov);
         }
 
-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
+        // Straight from VRAM, not the shared texture page cache (stale until queued TEXFLUSHes run).
+        const uint32_t raw = ReadVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
         if (sixteenBit)
         {
@@ -2371,8 +2545,39 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
+    {
+        // ATV_GS_CULL_VERIFY=1 (with ATV_GS_NO_CULL=1): report triangles the
+        // GIF-thread cull would drop that still draw a pixel.
+        static const bool s_cullVerify = std::getenv("ATV_GS_CULL_VERIFY") != nullptr;
+        if (!s_cullVerify)
+        {
+            DrawTriangle(batch);
+            break;
+        }
+        const bool predictedEmpty = gsTriangleDrawsNothing(batch);
+        t_triangleCovered = false;
         DrawTriangle(batch);
+        static std::atomic<uint64_t> s_checked{0}, s_empty{0}, s_wrong{0};
+        const uint64_t checked = s_checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (predictedEmpty)
+            s_empty.fetch_add(1, std::memory_order_relaxed);
+        if (predictedEmpty && t_triangleCovered)
+        {
+            const uint64_t wrong = s_wrong.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (wrong <= 20u)
+                std::fprintf(stderr, "[gs-cull] WRONG drew a pixel: v=(%.4f,%.4f)(%.4f,%.4f)(%.4f,%.4f) ofs=%u,%u sc=%u,%u-%u,%u\n",
+                             batch.vertices[0].x, batch.vertices[0].y, batch.vertices[1].x, batch.vertices[1].y,
+                             batch.vertices[2].x, batch.vertices[2].y, batch.state.context.xyoffset.ofx,
+                             batch.state.context.xyoffset.ofy, batch.state.context.scissor.x0,
+                             batch.state.context.scissor.y0, batch.state.context.scissor.x1,
+                             batch.state.context.scissor.y1);
+        }
+        if (checked % 4000000u == 0u)
+            std::fprintf(stderr, "[gs-cull] checked=%llu wouldCull=%.1f%% wrong=%llu\n",
+                         static_cast<unsigned long long>(checked), 100.0 * s_empty.load() / checked,
+                         static_cast<unsigned long long>(s_wrong.load()));
         break;
+    }
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
         DrawLine(batch);
@@ -2599,6 +2804,7 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                      ? (static_cast<uint32_t>(index) & 0x0Fu)
                                      : static_cast<uint32_t>(index);
 
+    const uint16_t *clut = t_drawClut ? t_drawClut : m_clut.data();
     uint32_t clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
     if (!sixteenBit && csm == 0u && isEightBitIndexedPsm(sourcePsm))
     {
@@ -2610,17 +2816,17 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     {
     case GS_PSM_CT32:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw);
     }
     case GS_PSM_CT24:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
     }
     case GS_PSM_CT16:
     case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
+        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
     default:
         static uint32_t s_badCpsmLog = 0u;
         if (s_badCpsmLog < 16u)
@@ -2845,7 +3051,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     {
         setupPixelPipe(state, m_vram, m_readVramFuncs.data(), m_writeVramFuncs.data(), pixelPipe);
         if (state.prim.tme)
-            setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, m_clut.data(), texturePipe);
+            setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, t_drawClut ? t_drawClut : m_clut.data(), texturePipe);
     }
 
     if (state.prim.tme)
@@ -3008,6 +3214,84 @@ namespace
             b.descs.push_back(desc);
         return it->second;
     }
+}
+
+// Mirrors DrawTriangle's rejects and its coverage loop (all rows, no band
+// split): the GIF thread drops triangles that draw nothing before they are
+// copied, queued and banded. Keep in step with DrawTriangle.
+bool gsTriangleDrawsNothing(const GSPrimitiveBatch &batch)
+{
+    if (batch.vertexCount < 3u)
+        return false;
+    const GSDrawState &state = batch.state;
+    const GSVertex &v0 = batch.vertices[0];
+    const GSVertex &v1 = batch.vertices[1];
+    const GSVertex &v2 = batch.vertices[2];
+    const auto &ctx = state.context;
+    const int ofx = ctx.xyoffset.ofx >> 4;
+    const int ofy = ctx.xyoffset.ofy >> 4;
+    const float fx0 = v0.x - static_cast<float>(ofx);
+    const float fy0 = v0.y - static_cast<float>(ofy);
+    const float fx1 = v1.x - static_cast<float>(ofx);
+    const float fy1 = v1.y - static_cast<float>(ofy);
+    const float fx2 = v2.x - static_cast<float>(ofx);
+    const float fy2 = v2.y - static_cast<float>(ofy);
+
+    if (!state.prim.fst && state.prim.fge &&
+        (v0.q <= 1.0e-5f || v1.q <= 1.0e-5f || v2.q <= 1.0e-5f))
+        return true;
+    const int unclippedMinX = floorToInt(min3(fx0, fx1, fx2));
+    const int unclippedMaxX = ceilToInt(max3(fx0, fx1, fx2));
+    const int unclippedMinY = floorToInt(min3(fy0, fy1, fy2));
+    const int unclippedMaxY = ceilToInt(max3(fy0, fy1, fy2));
+    const int viewportWidth = static_cast<int>(ctx.scissor.x1) - static_cast<int>(ctx.scissor.x0) + 1;
+    const int viewportHeight = static_cast<int>(ctx.scissor.y1) - static_cast<int>(ctx.scissor.y0) + 1;
+    if (!state.prim.fst && state.prim.fge &&
+        (unclippedMaxX - unclippedMinX > viewportWidth ||
+         unclippedMaxY - unclippedMinY > viewportHeight))
+        return true;
+    if (unclippedMaxX < ctx.scissor.x0 || unclippedMinX > ctx.scissor.x1 ||
+        unclippedMaxY < ctx.scissor.y0 || unclippedMinY > ctx.scissor.y1)
+        return true;
+    if (std::fabs(fx0) > 30000.0f || std::fabs(fx1) > 30000.0f || std::fabs(fx2) > 30000.0f ||
+        std::fabs(fy0) > 30000.0f || std::fabs(fy1) > 30000.0f || std::fabs(fy2) > 30000.0f)
+        return true;
+    const int minX = clampInt(unclippedMinX, ctx.scissor.x0, ctx.scissor.x1);
+    const int maxX = clampInt(unclippedMaxX, ctx.scissor.x0, ctx.scissor.x1);
+    const int minY = clampInt(unclippedMinY, ctx.scissor.y0, ctx.scissor.y1);
+    const int maxY = clampInt(unclippedMaxY, ctx.scissor.y0, ctx.scissor.y1);
+    if (minY > maxY)
+        return true;
+    const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+    if (std::fabs(denom) < 0.001f)
+        return true;
+    // Larger boxes almost always cover a sample; testing them costs more than drawing.
+    if (maxX - minX > 3 || maxY - minY > 3)
+        return false;
+
+    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+    const float invAbsDenom = 1.0f / std::fabs(denom);
+    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const float a01 = (fy1 - fy2) * winding * invAbsDenom;
+    const float b01 = (fx2 - fx1) * winding * invAbsDenom;
+    const float a12 = (fy2 - fy0) * winding * invAbsDenom;
+    const float b12 = (fx0 - fx2) * winding * invAbsDenom;
+    for (int y = minY; y <= maxY; ++y)
+    {
+        const float py = static_cast<float>(y) + 0.5f;
+        const float px0 = static_cast<float>(minX) + 0.5f;
+        float w0 = a01 * (px0 - fx2) + b01 * (py - fy2);
+        float w1 = a12 * (px0 - fx2) + b12 * (py - fy2);
+        for (int x = minX; x <= maxX; ++x)
+        {
+            const float w2 = 1.0f - w0 - w1;
+            if (!(w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon))
+                return false;
+            w0 += a01;
+            w1 += a12;
+        }
+    }
+    return true;
 }
 
 void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
@@ -3358,7 +3642,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     {
         setupPixelPipe(state, m_vram, m_readVramFuncs.data(), m_writeVramFuncs.data(), pixelPipe);
         if (textured)
-            setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, m_clut.data(), texturePipe);
+            setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, t_drawClut ? t_drawClut : m_clut.data(), texturePipe);
     }
     const bool gouraud = state.prim.iip;
     // ATV_GS_NO_FOG=1: skip the fog blend (pre-session-54 look).
@@ -3412,6 +3696,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 continue;
             }
             insideSpan = true;
+            t_triangleCovered = true;
 
             const double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
 
@@ -3654,7 +3939,9 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
         if (m_uploadRange.end != UINT32_MAX)
             m_uploadRange.end = (m_uploadRange.end + kVramPageBytes - 1u) & ~(kVramPageBytes - 1u);
         m_uploadRangeValid = true;
-        WaitBandsIdle();
+        // Bands still drawing the previous batch never touch these pages.
+        if (InFlightTouches(m_uploadRange))
+            WaitBandsIdle();
         if (PendingTouches(m_uploadRange))
             FlushBands(BandFlushReason::Upload);
     }
@@ -3685,7 +3972,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     }
     if (m_uploadRangeValid && m_transferState.direction == 0u)
     {
-        WaitBandsIdle();
+        if (InFlightTouches(m_uploadRange))
+            WaitBandsIdle();
         if (PendingTouches(m_uploadRange))
             FlushBands(BandFlushReason::Upload);
     }
@@ -3705,6 +3993,13 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         {
             if (m_bandTextureFlushes.empty() || m_bandTextureFlushes.back() != m_bandPending.size())
                 m_bandTextureFlushes.push_back(m_bandPending.size());
+        }
+        else if (m_bandInFlightActive)
+        {
+            // Bands 1.. may still be drawing: drop their caches before the
+            // next batch's first primitive instead (same effect for draws).
+            if (m_bandTextureFlushes.empty() || m_bandTextureFlushes.back() != 0u)
+                m_bandTextureFlushes.push_back(0u);
         }
         else
         {

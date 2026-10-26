@@ -55,8 +55,9 @@ bool g_raceLoadStarted = false;
 // FPU_C_* macros (ps2_runtime_macros.h): EE ordering by default, host IEEE
 // compares with ATV_FPU_IEEE_COMPARE=1.
 bool g_ps2FpuIeeeCompare = std::getenv("ATV_FPU_IEEE_COMPARE") != nullptr;
-// VU1 bench (ATV_VU_BENCH) hook; the ATV1 host sampling profiler is not ported.
-void atvStartHostProfiler() {}
+
+// ps2_memory.cpp: lone GIF packets bypass the arbiter copy (set in syncCoreSubsystems).
+extern std::function<void(const uint8_t *, uint32_t)> g_ps2GifDirectProcess;
 
 // ps2_missing_interp.cpp: interprets guest code at addresses without a recompiled entry.
 bool ps2InterpCanHandle(uint32_t address);
@@ -696,44 +697,59 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
-    m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+    g_ps2GifDirectProcess = [this](const uint8_t *data, uint32_t size)
+    { m_gs.processGIFPacket(data, size); };
+    // VU1 on the GS worker (ATV_VU1_THREAD) uses the FBRST captured when its
+    // chain was queued and does not write the EE's VPU_STAT.
+    m_memory.setVu0FbrstProvider([this]() -> uint32_t
                                  {
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     return (cpuContext ? cpuContext : &m_cpuContext)->vu0_fbrst;
+                                 });
+    m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                 {
+                                     const bool onWorker = PS2Memory::onGsWorker();
+                                     R5900Context *cpuContext = onWorker ? nullptr
+                                                                         : (m_eeScheduler ? m_eeScheduler->currentContext() : nullptr);
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onWorker ? PS2Memory::gsWorkerVu0Fbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      const auto vuHostStart = std::chrono::steady_clock::now();
                                      const uint64_t vuCyclesBefore = m_vu1.state().cycles;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      noteVu1Run(startPC, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
+                                     if (onWorker)
+                                         return;
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     const bool onWorker = PS2Memory::onGsWorker();
+                                     R5900Context *cpuContext = onWorker ? nullptr
+                                                                         : (m_eeScheduler ? m_eeScheduler->currentContext() : nullptr);
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onWorker ? PS2Memory::gsWorkerVu0Fbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      const auto vuHostStart = std::chrono::steady_clock::now();
                                      const uint64_t vuCyclesBefore = m_vu1.state().cycles;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
                                      noteVu1Run(0xFFFFu, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
+                                     if (onWorker)
+                                         return;
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -2169,8 +2185,22 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// Game hook: adjusts guest reads of GS CSR by guest PC (ATV2: Flip's FINISH poll with the GS
+// worker). Keyed by PC because generated code resumes mid-function after an EE checkpoint.
+uint64_t (*g_ps2GsCsrReadHook)(uint32_t pc, uint64_t value) = nullptr;
+
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    if (vaddr == 0x12001000u && g_ps2GsCsrReadHook)
+    {
+        try
+        {
+            return static_cast<uint32_t>(g_ps2GsCsrReadHook(ctx->pc, m_memory.read64(vaddr)));
+        }
+        catch (const std::exception &)
+        {
+        }
+    }
     try
     {
         return m_memory.read32(vaddr);
@@ -2186,6 +2216,8 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
+        if (vaddr == 0x12001000u && g_ps2GsCsrReadHook)
+            return g_ps2GsCsrReadHook(ctx->pc, m_memory.read64(vaddr));
         return m_memory.read64(vaddr);
     }
     catch (const std::exception &)
@@ -2295,12 +2327,15 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    // These fast paths write the GS directly; with the GS worker the chain
+    // takes the normal (queued, in-order) path instead.
+    const bool gsDirectOk = !m_memory.gsWorkerEnabled();
+    if (gsDirectOk && m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
     }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
+    if (gsDirectOk && m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;

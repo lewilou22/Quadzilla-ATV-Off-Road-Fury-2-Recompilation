@@ -726,7 +726,12 @@ namespace
 
     std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
     {
-        static const bool s_threaded = std::getenv("ATV_GS_THREAD") != nullptr;
+        // On by default in ATV2 (ATV1 opts in from play_game.bat); ATV_GS_THREAD=0 draws on the caller.
+        static const bool s_threaded = []
+        {
+            const char *env = std::getenv("ATV_GS_THREAD");
+            return env == nullptr || env[0] != '0';
+        }();
         auto backend = std::make_unique<GSCpuBackend>();
         if (!s_threaded)
             return backend;
@@ -734,9 +739,8 @@ namespace
         return std::make_unique<GSThreadedBackend>(std::move(backend));
     }
 
-    // Opt-in (ATV_GS_GIF_THREAD=1, set by play_game.bat and benchmark_game.ps1
-    // since session 32; GS tests observe the backend synchronously and run
-    // without it): GS::processGIFPacket only queues a copy of
+    // On by default in ATV2 (ATV_GS_GIF_THREAD=0 parses on the caller; ATV1 opts
+    // in from play_game.bat and its GS tests run without it): GS::processGIFPacket only queues a copy of
     // the packet and a dedicated thread parses packets in submission order.
     // Every other public GS entry point (GSApiScope) and the EE GS privileged
     // register accessors (gsSyncAsyncGif) first complete all queued packets on
@@ -747,7 +751,7 @@ namespace
         static const bool s_enabled = []
         {
             const char *env = std::getenv("ATV_GS_GIF_THREAD");
-            return env && env[0] != '\0' && env[0] != '0';
+            return env == nullptr || (env[0] != '\0' && env[0] != '0');
         }();
         return s_enabled;
     }
@@ -797,7 +801,9 @@ namespace
 
     void asyncGifThreadMain(AsyncGifQueue *q)
     {
-        atvStartHostProfilerForThisThread();
+        // ATV_HOST_PROFILE_GIF=1 samples this thread (ATV1 made it opt-in too).
+        if (std::getenv("ATV_HOST_PROFILE_GIF") != nullptr)
+            atvStartHostProfilerForThisThread();
         t_gsGifDirect = true;
         static const uint32_t s_spin = []
         {
@@ -877,12 +883,45 @@ namespace
         }
     }
 
+    // Packets from the VIF1/VU1 worker collect here and enter the queue under
+    // one lock (every kGifBatchMax packets, when the worker finishes a work
+    // item, or before it drains): the worker and the GIF thread no longer take
+    // queueMutex once per packet each. Other threads reach the GS only after
+    // fencing the idle worker, so they never miss a batched packet.
+    // ATV_GS_GIF_NO_BATCH=1 queues every packet at once.
+    constexpr size_t kGifBatchMax = 64u;
+    thread_local std::vector<std::vector<uint8_t>> t_gifBatch;
+    thread_local std::vector<std::vector<uint8_t>> t_gifFree;
+
+    void asyncGifFlushLocal(AsyncGifQueue &q)
+    {
+        if (t_gifBatch.empty())
+            return;
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lock(q.queueMutex);
+            for (std::vector<uint8_t> &packet : t_gifBatch)
+                q.queue.push_back(std::move(packet));
+            q.pending.fetch_add(static_cast<uint32_t>(t_gifBatch.size()), std::memory_order_relaxed);
+            notify = q.sleeping;
+            while (!q.pool.empty() && t_gifFree.size() < kGifBatchMax)
+            {
+                t_gifFree.push_back(std::move(q.pool.back()));
+                q.pool.pop_back();
+            }
+        }
+        t_gifBatch.clear();
+        if (notify)
+            q.wake.notify_one();
+    }
+
     void asyncGifDrain(const char *site = "gsSyncAsyncGif")
     {
         static const bool s_stats = std::getenv("ATV_GIF_DRAIN_STATS") != nullptr;
         AsyncGifQueue *q = s_asyncGif.load(std::memory_order_acquire);
         if (!q || t_gsGifDirect)
             return;
+        asyncGifFlushLocal(*q);
         const uint32_t pendingBefore = q->pending.load(std::memory_order_acquire);
         if (pendingBefore == 0u)
             return;
@@ -907,22 +946,38 @@ namespace
         if (q->pending.load(std::memory_order_relaxed) >= kAsyncGifMaxPending)
             asyncGifDrain("queueFull");
 
-        std::vector<uint8_t> packet;
+        static const bool s_noBatch = std::getenv("ATV_GS_GIF_NO_BATCH") != nullptr;
+        if (!s_noBatch && PS2Memory::onGsWorker())
         {
-            std::lock_guard<std::mutex> lock(q->queueMutex);
-            if (!q->pool.empty())
+            std::vector<uint8_t> packet;
+            if (!t_gifFree.empty())
             {
-                packet = std::move(q->pool.back());
-                q->pool.pop_back();
+                packet = std::move(t_gifFree.back());
+                t_gifFree.pop_back();
             }
+            packet.assign(data, data + sizeBytes);
+            t_gifBatch.push_back(std::move(packet));
+            if (t_gifBatch.size() >= kGifBatchMax)
+                asyncGifFlushLocal(*q);
+            return true;
         }
-        packet.assign(data, data + sizeBytes);
+        // One lock per packet: copy into this thread's spare buffer, then swap
+        // in a recycled buffer for the next packet while pushing.
+        thread_local std::vector<uint8_t> t_spare;
+        t_spare.assign(data, data + sizeBytes);
         bool notify = false;
         {
             std::lock_guard<std::mutex> lock(q->queueMutex);
-            q->queue.push_back(std::move(packet));
+            q->queue.push_back(std::move(t_spare));
             q->pending.fetch_add(1u, std::memory_order_relaxed);
             notify = q->sleeping;
+            if (!q->pool.empty())
+            {
+                t_spare = std::move(q->pool.back());
+                q->pool.pop_back();
+            }
+            else
+                t_spare = {};
         }
         if (notify)
             q->wake.notify_one();
@@ -942,6 +997,12 @@ namespace
         GSApiScope(const GSApiScope &) = delete;
         GSApiScope &operator=(const GSApiScope &) = delete;
     };
+}
+
+void gsFlushWorkerGif()
+{
+    if (AsyncGifQueue *q = s_asyncGif.load(std::memory_order_acquire))
+        asyncGifFlushLocal(*q);
 }
 
 void gsSyncAsyncGif()
@@ -2640,7 +2701,13 @@ void GS::vertexKick(bool drawing)
             }
         }
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        // Triangles that would draw no pixel skip the copy, queue and band
+        // work (about half of race triangles are sub-pixel). ATV_GS_NO_CULL=1 keeps them.
+        static const bool s_noCull = std::getenv("ATV_GS_NO_CULL") != nullptr;
+        const bool triangle = batch.state.prim.type == GS_PRIM_TRIANGLE ||
+                              batch.state.prim.type == GS_PRIM_TRISTRIP || batch.state.prim.type == GS_PRIM_TRIFAN;
+        if (s_noCull || !triangle || !gsTriangleDrawsNothing(batch))
+            m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 
