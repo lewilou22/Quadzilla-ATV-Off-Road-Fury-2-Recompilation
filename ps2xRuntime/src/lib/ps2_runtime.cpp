@@ -93,6 +93,24 @@ static void noteVu1Run(uint32_t startPc, uint64_t cyclesBefore, uint64_t cyclesA
     }
 }
 
+// vu/ps2_vu1_core.cpp: VU1's last run stopped at its cycle budget before the program ended.
+extern bool g_vu1ProgramCut;
+// Set by game overrides while cut VU1 programs are dropped as before (ATV2's event loading screen).
+bool g_vu1DropCutPrograms = false;
+
+// A VU1 run stops at a 65,536-cycle budget, but real VIF1 holds the next MSCAL/MSCNT until the
+// program ends, so a cut program is run on here, up to 8 more budgets. Abandoned, race programs lost
+// the rest of their XGKICKs: strips of terrain went missing and showed the water below (each needs
+// one more budget). ATV2's event loading screen runs a ~37-budget program; run on, it drew black lines
+// across the screen, so that screen keeps dropping it. ATV_VU1_ABANDON_CUT=1 restores the old behaviour.
+template <typename Resume>
+static void finishCutVu1Program(Resume &&resume)
+{
+    static const bool s_abandon = std::getenv("ATV_VU1_ABANDON_CUT") != nullptr;
+    for (uint32_t extra = 0; !s_abandon && !g_vu1DropCutPrograms && g_vu1ProgramCut && extra < 8u; ++extra)
+        resume();
+}
+
 static bool missingInterpEnabled()
 {
     static const bool enabled = []()
@@ -723,6 +741,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     finishCutVu1Program([this]
+                                                         { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE, m_gs, &m_memory,
+                                                                        m_vu1.state().top, m_vu1.state().itop, 65536); });
                                      noteVu1Run(startPC, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      if (onWorker)
                                          return;
@@ -747,6 +769,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     finishCutVu1Program([this]
+                                                         { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                        m_memory.getVU1Data(), PS2_VU1_DATA_SIZE, m_gs, &m_memory,
+                                                                        m_vu1.state().top, m_vu1.state().itop, 65536); });
                                      noteVu1Run(0xFFFFu, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      if (onWorker)
                                          return;

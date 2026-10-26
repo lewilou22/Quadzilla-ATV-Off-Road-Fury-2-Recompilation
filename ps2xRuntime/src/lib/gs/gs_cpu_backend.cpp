@@ -3329,7 +3329,9 @@ namespace
 
 // Mirrors DrawTriangle's rejects and its coverage loop (all rows, no band
 // split): the GIF thread drops triangles that draw nothing before they are
-// copied, queued and banded. Keep in step with DrawTriangle.
+// copied, queued and banded. Keep in step with DrawTriangle. Its tolerance
+// test covers at least DrawTriangle's exact edge test, so it never drops a
+// triangle that draws.
 bool gsTriangleDrawsNothing(const GSPrimitiveBatch &batch)
 {
     if (batch.vertexCount < 3u)
@@ -3766,10 +3768,10 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const uint32_t idFbw = ctx.frame.fbw >= 1u ? ctx.frame.fbw : 10u;
     if (gsIdBuf().intervalSec > 0.0 && g_raceLoadStarted)
     {
-        char desc[256];
+        char desc[320];
         std::snprintf(desc, sizeof(desc),
                       "tme=%u tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x csa=%u tw=%u th=%u tcc=%u tfx=%u "
-                      "abe=%u alpha=0x%llx test=0x%llx fge=%u fst=%u iip=%u up=%s",
+                      "abe=%u alpha=0x%llx test=0x%llx fge=%u fst=%u iip=%u clamp=0x%llx lin=%u texa=%x/%u/%x up=%s",
                       static_cast<uint32_t>(state.prim.tme), ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.tbw),
                       static_cast<uint32_t>(ctx.tex0.psm), static_cast<uint32_t>(ctx.tex0.cbp),
                       static_cast<uint32_t>(ctx.tex0.cpsm), static_cast<uint32_t>(ctx.tex0.csa),
@@ -3778,13 +3780,74 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                       static_cast<uint32_t>(state.prim.abe), static_cast<unsigned long long>(ctx.alpha),
                       static_cast<unsigned long long>(ctx.test), static_cast<uint32_t>(state.prim.fge),
                       static_cast<uint32_t>(state.prim.fst), static_cast<uint32_t>(state.prim.iip),
+                      static_cast<unsigned long long>(ctx.clamp), state.linearFilter ? 1u : 0u,
+                      static_cast<uint32_t>(state.texa.ta0), state.texa.aem ? 1u : 0u,
+                      static_cast<uint32_t>(state.texa.ta1),
                       state.prim.tme ? gsIdLastUploads(ctx.tex0.tbp0).c_str() : "-");
         drawId = gsIdFor(desc);
-        idRows = gsIdRows(ctx.frame.fbp);
-        uvRows = gsIdRows(ctx.frame.fbp, true);
+        // ATV_GS_IDBUF_SKIP=<text>[|<text>...]: draws whose description contains one of them are
+        // not recorded, to see what lies under an overlay. ATV_GS_IDBUF_HIDE: such draws are not drawn.
+        const auto patterns = [](const char *name)
+        {
+            std::vector<std::string> parts;
+            const std::string list = std::getenv(name) ? std::getenv(name) : "";
+            for (size_t start = 0; start < list.size();)
+            {
+                const size_t end = std::min(list.find('|', start), list.size());
+                if (end > start)
+                    parts.push_back(list.substr(start, end - start));
+                start = end + 1;
+            }
+            return parts;
+        };
+        const auto matches = [&](const std::vector<std::string> &parts)
+        {
+            return std::any_of(parts.begin(), parts.end(),
+                               [&](const std::string &part) { return std::strstr(desc, part.c_str()) != nullptr; });
+        };
+        static const std::vector<std::string> s_idSkip = patterns("ATV_GS_IDBUF_SKIP");
+        static const std::vector<std::string> s_idHide = patterns("ATV_GS_IDBUF_HIDE");
+        if (matches(s_idHide))
+            return;
+        if (!matches(s_idSkip))
+        {
+            idRows = gsIdRows(ctx.frame.fbp);
+            uvRows = gsIdRows(ctx.frame.fbp, true);
+        }
     }
     const auto &tex = ctx.tex0;
     static const bool s_traceGroundSample = std::getenv("ATV_TRACE_GROUND_SAMPLE") != nullptr;
+
+    // Coverage uses exact edge functions on the GS's 1/16-pixel vertex grid at pixel centres with the
+    // top-left rule, so triangles sharing an edge draw each of its pixels exactly once. The weights
+    // above only interpolate. (A tolerance test drew shared-edge pixels twice, blending them twice in
+    // blended meshes.) ATV_GS_EDGE_EPSILON=1 restores that test.
+    static const bool s_edgeEpsilon = std::getenv("ATV_GS_EDGE_EPSILON") != nullptr;
+    struct CoverEdge
+    {
+        int64_t dx, dy, ax, ay, bias;
+        int64_t at(int64_t px, int64_t py) const { return dx * (py - ay) - dy * (px - ax) + bias; }
+    };
+    const int64_t gx[3] = {std::llround(fx0 * 16.0f), std::llround(fx1 * 16.0f), std::llround(fx2 * 16.0f)};
+    const int64_t gy[3] = {std::llround(fy0 * 16.0f), std::llround(fy1 * 16.0f), std::llround(fy2 * 16.0f)};
+    const int64_t area2 = (gx[1] - gx[0]) * (gy[2] - gy[0]) - (gy[1] - gy[0]) * (gx[2] - gx[0]);
+    if (area2 == 0 && !s_edgeEpsilon)
+        return;
+    CoverEdge cover[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        // Edges oriented so the interior is positive; top edges (horizontal, interior below) and left
+        // edges (going up) keep their own pixels.
+        int a = (i + 1) % 3, b = (i + 2) % 3;
+        if (area2 < 0)
+            std::swap(a, b);
+        CoverEdge &e = cover[i];
+        e.dx = gx[b] - gx[a];
+        e.dy = gy[b] - gy[a];
+        e.ax = gx[a];
+        e.ay = gy[a];
+        e.bias = (e.dy < 0 || (e.dy == 0 && e.dx > 0)) ? 0 : -1;
+    }
 
     for (int y = minY; y <= maxY; y = nextBandRow(y))
     {
@@ -3794,11 +3857,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
         float w0 = a01 * (px0 - fx2) + b01 * (py - fy2);
         float w1 = a12 * (px0 - fx2) + b12 * (py - fy2);
         bool insideSpan = false;
+        const int64_t cpx = 16 * static_cast<int64_t>(minX) + 8, cpy = 16 * static_cast<int64_t>(y) + 8;
+        int64_t c0 = cover[0].at(cpx, cpy), c1 = cover[1].at(cpx, cpy), c2 = cover[2].at(cpx, cpy);
+        const int64_t s0 = -16 * cover[0].dy, s1 = -16 * cover[1].dy, s2 = -16 * cover[2].dy;
 
-        for (int x = minX; x <= maxX; ++x)
+        for (int x = minX; x <= maxX; ++x, c0 += s0, c1 += s1, c2 += s2)
         {
             const float w2 = 1.0f - w0 - w1;
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (s_edgeEpsilon ? (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon) : ((c0 | c1 | c2) < 0))
             {
                 w0 += a01;
                 w1 += a12;

@@ -1703,6 +1703,8 @@ uint32_t g_ps2XgkickCount = 0;
 // VU1 cycles and instruction pairs executed by run(), for ATV_BENCHMARK.
 uint64_t g_vu1CycleTotal = 0;
 uint64_t g_vu1PairTotal = 0;
+// VU1's last run() stopped at its cycle budget before the program ended.
+bool g_vu1ProgramCut = false;
 // Set by the game override once the player's racer is moving (gates VU workload capture).
 bool g_atvRaceStarted = false;
 uint64_t g_vu1DecodeRebuilds = 0;
@@ -3002,6 +3004,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
     }
 
+    if (m_unit == Unit::VU1)
+        g_vu1ProgramCut = !programEnded && m_cycle >= budgetEnd;
     if (programEnded)
     {
         m_state.ebit = false;

@@ -272,12 +272,17 @@ namespace GSMem
                     out[i] = Traits::Read(table, data, bp, bw, x[i], y[i], &cache);
                 return;
             }
-            // All four texels sit in one page: Traits::Read with the page id
+            // All four texels sit in one texture page: Traits::Read with the page id
             // and the page-cache lookup shared (the first lookup loads the
-            // page, the others would hit the same slot).
+            // page, the others would hit the same slot). A base block that is not
+            // page-aligned puts the page's later blocks in the next memory page, so
+            // a texel there needs its own lookup (sharing it read the wrong page:
+            // lines of stray texels along block edges of the sky and mountains).
             const u32 page = static_cast<u32>(Traits::PageId(bp, bw, x[0], y[0]));
             const u32 block = static_cast<u32>(bp % Traits::BlocksPerPage());
+            constexpr u32 kPageMask = TexturePageCache::kPageSize - 1u;
             const u8 *pageBytes = nullptr;
+            u32 pageBase = 0u;
             for (int i = 0; i < 4; ++i)
             {
                 const u32 pixel_addr = static_cast<u32>((page * Traits::PixelsPerPage()) + table[block][y[i] % pe.y][x[i] % pe.x]);
@@ -288,11 +293,16 @@ namespace GSMem
                 if (i == 0)
                 {
                     source = cache.Resolve(data, byte_addr);
-                    pageBytes = source - (byte_addr & (TexturePageCache::kPageSize - 1u));
+                    pageBytes = source - (byte_addr & kPageMask);
+                    pageBase = byte_addr & ~kPageMask;
+                }
+                else if ((byte_addr & ~kPageMask) == pageBase)
+                {
+                    source = pageBytes + (byte_addr & kPageMask);
                 }
                 else
                 {
-                    source = pageBytes + (byte_addr & (TexturePageCache::kPageSize - 1u));
+                    source = cache.Resolve(data, byte_addr);
                 }
                 PackedT v;
                 std::memcpy(&v, source, sizeof(PackedT));
