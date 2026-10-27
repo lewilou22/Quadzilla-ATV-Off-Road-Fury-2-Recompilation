@@ -24,6 +24,10 @@ bool ps2InterpCanHandle(uint32_t address);
 // Opt-in diagnostic: number of upcoming guest dispatches to log (0 = off).
 uint32_t g_ps2TraceDispatchRemaining = 0;
 uint32_t g_ps2TraceRange0Lo = 0, g_ps2TraceRange0Hi = 0, g_ps2TraceRange1Lo = 0, g_ps2TraceRange1Hi = 0;
+// Also dispatch INTC cause 9 (timer 0) on every VBlank. Off by default: cause 9 is the timer-0
+// compare interrupt, which advanceEeTimers already raises; firing it per VBlank ran ATV2's
+// 100 ms clock tick (FUN_00156590) ~60 extra times a second. ATV2_VBLANK_INTC9=1 restores it.
+bool g_ps2VblankDispatchIntc9 = std::getenv("ATV2_VBLANK_INTC9") != nullptr;
 
 namespace
 {
@@ -2248,7 +2252,8 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
-        dispatchIrq(false, 9u); // VBlank INTC cause 9 (game's handler)
+        if (g_ps2VblankDispatchIntc9)
+            dispatchIrq(false, 9u);
         break;
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);

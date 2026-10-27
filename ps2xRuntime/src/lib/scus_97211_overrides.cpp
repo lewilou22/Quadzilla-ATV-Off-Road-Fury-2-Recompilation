@@ -4740,7 +4740,7 @@ namespace
     }
 
     // ATV2_TIMER0_PER_FRAME=1: old behaviour, the host pump bumps the timer-0 counter 0x488F38
-    // once per host frame instead of at 10 Hz real time.
+    // once per host frame on top of the emulated timer-0 interrupt.
     bool timer0CounterPerHostFrame()
     {
         static const bool s_perFrame = []() {
@@ -4748,6 +4748,39 @@ namespace
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
         return s_perFrame;
+    }
+
+    // Keeps the game's millisecond clock ((RCNT0 + 0x488F38 * 0xE100) / 576) on host real time.
+    // Timer 0 advances with emulated EE cycles, which fall behind real time whenever the host runs
+    // the game below full speed (races), while online peers' updates arrive in real time. Only ever
+    // moves the clock forward. ATV2_TIMER0_GUEST=1 leaves it on emulated cycles.
+    void syncTimer0ToRealTime(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        static const bool s_guestTime = std::getenv("ATV2_TIMER0_GUEST") != nullptr;
+        if (s_guestTime || timer0CounterPerHostFrame())
+            return;
+        auto &mem = runtime->memory();
+        uint32_t *counter = reinterpret_cast<uint32_t *>(getMemPtr(rdram, 0x00488F38u));
+        const uint64_t now = static_cast<uint64_t>(*counter) * 0xE100u + (mem.readIORegister(0x10000000u) & 0xFFFFu);
+        static const auto s_start = std::chrono::steady_clock::now();
+        static const uint64_t s_base = now;
+        const uint64_t realTicks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                             std::chrono::steady_clock::now() - s_start)
+                                                             .count()) *
+                                   576u / 1000u;
+        const uint64_t want = s_base + realTicks;
+        if (want <= now)
+            return;
+        *counter = static_cast<uint32_t>(want / 0xE100u);
+        mem.writeIORegister(0x10000000u, static_cast<uint32_t>(want % 0xE100u));
+    }
+
+    // Timer-0 compare handler (INTC cause 9): RCNT0 %= 0xE100, counter++; then catch up to real time.
+    PS2Runtime::RecompiledFunction g_origTimer0Handler = nullptr;
+    void timer0Handler156590(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_origTimer0Handler(rdram, ctx, runtime);
+        syncTimer0ToRealTime(rdram, runtime);
     }
 
     // Frame limiter hook @ 0x0015DA90
@@ -4768,24 +4801,27 @@ namespace
         }();
         ++s_frameCount;
 
-        // 0x488F38 counts timer-0 compare interrupts (handler FUN_00156590: RCNT0 %= 0xE100,
-        // counter++), i.e. one per 100 ms at RCNT0's 576 kHz; the game's millisecond clock is
-        // (RCNT0 + counter * 0xE100) / 576. The runtime doesn't dispatch that interrupt, and bumping
-        // the counter once per host frame made the clock run several times too fast (network
-        // timeouts expired before replies were processed). Advance it at the real 10 Hz instead.
-        if (!timer0CounterPerHostFrame())
+        // 0x488F38 counts timer-0 compare interrupts (INTC cause 9, handler FUN_00156590:
+        // RCNT0 %= 0xE100, counter++), i.e. one per 100 ms at RCNT0's 576 kHz; the game's
+        // millisecond clock is (RCNT0 + counter * 0xE100) / 576. The emulated timer 0 raises that
+        // interrupt; syncTimer0ToRealTime keeps it from falling behind real time.
+        syncTimer0ToRealTime(rdram, runtime);
+        // ATV2_CLOCK_TRACE=1: every 5 s of real time, compare the game's millisecond clock with the host's.
+        static const bool s_clockTrace = std::getenv("ATV2_CLOCK_TRACE") != nullptr;
+        if (s_clockTrace)
         {
-            static const auto s_start = std::chrono::steady_clock::now();
-            static uint64_t s_ticks = 0;
-            const uint64_t ticks = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                             std::chrono::steady_clock::now() - s_start)
-                                                             .count()) /
-                                   100u;
-            if (ticks > s_ticks)
+            static const auto s_t0 = std::chrono::steady_clock::now();
+            static int64_t s_nextMs = 0;
+            const int64_t realMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s_t0).count();
+            if (realMs >= s_nextMs)
             {
-                uint32_t *counter = reinterpret_cast<uint32_t *>(getMemPtr(rdram, 0x00488F38u));
-                *counter += static_cast<uint32_t>(ticks - s_ticks);
-                s_ticks = ticks;
+                s_nextMs = realMs + 5000;
+                const uint32_t cnt = READ32(0x00488F38u);
+                const uint32_t rc = runtime->memory().readIORegister(0x10000000u);
+                const uint32_t mode = runtime->memory().readIORegister(0x10000010u);
+                std::cerr << "[ATV2:CLOCK] real=" << realMs << " gameMs=" << (static_cast<uint64_t>(cnt) * 0xE100u + rc) / 576u
+                          << " cnt=" << cnt << " rcnt0=0x" << std::hex << rc << " mode=0x" << mode << std::dec << std::endl;
             }
         }
 
@@ -6366,12 +6402,16 @@ namespace
         // ATV2 guest frame counter = 0x489008 (read by the frame-lockstep limiter
         // FUN_0015da90: `while (iRam00489008 < param_1)`). Its only in-game writer is the
         // GS-flip tail of sub_0015D4A0 (called from sub_001CD090), which never runs because
-        // the game's VBlank INTC handler (FUN_00156590, registered on channel 9) is not
-        // dispatched by the runtime as a frame tick. Host pump bumps this once per host frame
-        // (ps2_runtime.cpp bumpGuestCounter). The timer-0 counter 0x488f38 is advanced at 10 Hz
-        // real time by frameLimiter15da90; ATV2_TIMER0_PER_FRAME=1 restores the old per-frame bump.
+        // that path never runs here. Host pump bumps this once per host frame (ps2_runtime.cpp
+        // bumpGuestCounter). The timer-0 counter 0x488f38 is advanced by the game's own timer-0
+        // handler (FUN_00156590, INTC cause 9); ATV2_TIMER0_PER_FRAME=1 restores the old per-frame bump.
         g_ps2GuestVsyncCounterAddr = 0x00489008u;
         g_ps2GuestVsyncCounterAddr2 = timer0CounterPerHostFrame() ? 0x00488f38u : 0u;
+        if (runtime.hasFunction(0x00156590u))
+        {
+            g_origTimer0Handler = runtime.lookupFunction(0x00156590u);
+            runtime.replaceFunction(0x00156590u, &timer0Handler156590);
+        }
 
         // pc=0 resume machinery (ATV1 pattern): when main thread goes Dormant at pc=0,
         // EeScheduler's usableResume() will resume it to the GS flip handler (0x164160)

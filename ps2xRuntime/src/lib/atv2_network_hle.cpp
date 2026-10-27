@@ -1296,6 +1296,36 @@ namespace
                   << (resp ? hexDump(guestPtr(rdram, resp), 0x30u) : std::string()) << std::endl;
         g_origSessionBeginCb(rdram, ctx, runtime);
     }
+    // Join game (lobby page, alert 0x20 "Game is full!" on any failure): 0x003168F0(loginMgr, gameId)
+    // = Medius JoinGame (callback 0x0030A160: a3 = reply, +0x18 status, +0x28 host address) then the
+    // DME connect 0x0039A0A0 and a 30 s wait for the host.
+    PS2Runtime::RecompiledFunction g_origJoinGame = nullptr;
+    void joinGameTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cerr << "[ATV2:NET] join game id=" << static_cast<int32_t>(getRegU32(ctx, 5)) << std::endl;
+        g_origJoinGame(rdram, ctx, runtime);
+        std::cerr << "[ATV2:NET] join game -> " << static_cast<int32_t>(getRegU32(ctx, 2)) << std::endl;
+    }
+    PS2Runtime::RecompiledFunction g_origJoinGameCb = nullptr;
+    void joinGameCbTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t resp = getRegU32(ctx, 7);
+        int32_t status = 0;
+        if (resp)
+            std::memcpy(&status, guestPtr(rdram, resp + 0x18u), 4);
+        std::cerr << "[ATV2:NET] Medius JoinGame reply status=" << status << " resp=0x" << std::hex << resp << std::dec
+                  << (resp ? hexDump(guestPtr(rdram, resp), 0x60u) : std::string()) << std::endl;
+        g_origJoinGameCb(rdram, ctx, runtime);
+    }
+    PS2Runtime::RecompiledFunction g_origDmeConnect = nullptr;
+    void dmeConnectTrace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t req = getRegU32(ctx, 4);
+        std::cerr << "[ATV2:NET] DME connect req=0x" << std::hex << req << std::dec
+                  << (req ? hexDump(guestPtr(rdram, req), 0xC0u) : std::string()) << std::endl;
+        g_origDmeConnect(rdram, ctx, runtime);
+        std::cerr << "[ATV2:NET] DME connect -> " << static_cast<int32_t>(getRegU32(ctx, 2)) << std::endl;
+    }
 
     // ATV2_NET_TRACE: countdown helper @ 0x003032B0 (timer struct: float remaining, u64 last ms at +8).
     PS2Runtime::RecompiledFunction g_origCountdown = nullptr;
@@ -1500,6 +1530,23 @@ void registerAtv2NetworkHle(PS2Runtime &runtime)
         }
         else
             std::cerr << "[ATV2:NET] no function entry at 0x3B00D8 (handler trace off)" << std::endl;
+        const struct
+        {
+            uint32_t addr;
+            PS2Runtime::RecompiledFunction *orig;
+            PS2Runtime::RecompiledFunction wrap;
+        } joinTraces[] = {{0x003168F0u, &g_origJoinGame, &joinGameTrace},
+                          {0x0030A160u, &g_origJoinGameCb, &joinGameCbTrace},
+                          {0x0039A0A0u, &g_origDmeConnect, &dmeConnectTrace}};
+        for (const auto &t : joinTraces)
+            if (runtime.hasFunction(t.addr))
+            {
+                *t.orig = runtime.lookupFunction(t.addr);
+                runtime.replaceFunction(t.addr, t.wrap);
+            }
+            else
+                std::cerr << "[ATV2:NET] no function entry at 0x" << std::hex << t.addr << std::dec << " (join trace off)"
+                          << std::endl;
     }
     if (netTrace() && runtime.hasFunction(0x003032B0u))
     {
