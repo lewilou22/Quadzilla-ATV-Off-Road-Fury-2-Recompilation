@@ -1203,7 +1203,8 @@
             }
             if (nativeOn && !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot)
             {
-                const VU1Native::BlockFn fn = VU1Native::lookup(vuCode, m_cachedCodeGeneration, pairIndex);
+                const VU1Native::BlockFn fn =
+                    VU1Native::s_regen ? nullptr : VU1Native::lookup(vuCode, m_cachedCodeGeneration, pairIndex);
                 const uint64_t nativeCycleBefore = m_cycle;
                 const uint32_t end = fn ? (s_rec.block = nullptr, chainBlock = nullptr, fn(nativeCtx)) : VU1Native::kNativeBail;
                 if (fn && end == VU1Native::kNativeEnded)

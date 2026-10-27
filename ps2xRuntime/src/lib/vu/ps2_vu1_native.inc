@@ -1013,6 +1013,9 @@ struct VU1Native
 
     static inline const bool s_enabled = std::getenv("ATV_VU_NO_NATIVE_BLOCKS") == nullptr;
     static inline const char *const s_genPath = std::getenv("ATV_VU_NATIVE_GEN");
+    // ATV_VU_NATIVE_REGEN=1 with ATV_VU_NATIVE_GEN: ignore the compiled blocks, so every block that
+    // runs is generated again (after the fast loop learns new ops; merge the new chunks first).
+    static inline const bool s_regen = s_genPath != nullptr && std::getenv("ATV_VU_NATIVE_REGEN") != nullptr;
     // Same knob and test as fastAdvanceTo in the fast loop.
     static inline const bool s_idleSkip = std::getenv("ATV_VU_NO_IDLE_SKIP") == nullptr;
 
