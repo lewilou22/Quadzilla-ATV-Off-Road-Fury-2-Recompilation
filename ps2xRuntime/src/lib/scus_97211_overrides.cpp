@@ -21,6 +21,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <thread>
 #include <cstdio>
 #include "runtime/gs/ps2_gif_arbiter.h"
 
@@ -51,6 +53,7 @@ extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
 void atv2ArmWriteWatch(uint8_t *rdram, uint32_t guestAddr, uint32_t len);
+bool gsQueueLocalToHostCopy(uint8_t *out, uint32_t maxBytes, std::atomic<uint32_t> *done); // gs/gs_frontend.cpp
 void registerAtv2NetworkHle(PS2Runtime &runtime); // atv2_network_hle.cpp
 void atvStartHostProfiler();                       // Kernel/Atv2HostProfiler.cpp
 void atvInstallCrashTrace();                       // Kernel/Atv2HostProfiler.cpp
@@ -5552,6 +5555,70 @@ namespace
         return true;
     }
 
+    // PSXWater reads a GS rectangle back twice a frame and DMAs it to VU1 straight away. Waiting for
+    // the GS to draw it held the VIF1/VU1 worker ~20% of a race (4 ms a download). The worker now hands
+    // the continuation the same download's bytes from the previous frame and has the GS worker copy
+    // this frame's behind the transfer, so the water is one frame behind. A first download, a changed
+    // rectangle or bytes older than 200 ms wait as before; ATV2_WATER_SYNC=1 always waits.
+    struct WaterReadbackSlot
+    {
+        uint32_t dst = 0u, sbp = 0u, psm = 0u, ssa = 0u, rr = 0u;
+        std::chrono::steady_clock::time_point filled{};
+        bool queued = false; // a copy into `data` may still be running on the GS worker
+        std::vector<uint8_t> data;
+        std::atomic<uint32_t> done{0u};
+    };
+
+    uint32_t waterReadback(PS2Runtime *runtime, uint8_t *out, uint32_t dst, uint32_t sbp, uint32_t psm,
+                           uint32_t ssa, uint32_t rr, uint32_t bytes)
+    {
+        static const bool s_sync = std::getenv("ATV2_WATER_SYNC") != nullptr;
+        static WaterReadbackSlot s_slots[4];
+        if (s_sync)
+            return runtime->gs().consumeLocalToHostBytes(out, bytes);
+        auto finish = [](WaterReadbackSlot &s)
+        {
+            if (s.queued)
+                while ((s.done.load(std::memory_order_acquire) & 0x80000000u) == 0u)
+                    std::this_thread::yield();
+            s.queued = false;
+        };
+        WaterReadbackSlot *slot = nullptr;
+        for (WaterReadbackSlot &s : s_slots)
+            if (s.dst == dst && s.sbp == sbp && s.psm == psm && s.ssa == ssa && s.rr == rr)
+                slot = &s;
+        const auto now = std::chrono::steady_clock::now();
+        if (slot == nullptr)
+        {
+            slot = &s_slots[0];
+            for (WaterReadbackSlot &s : s_slots)
+                if (s.filled < slot->filled)
+                    slot = &s;
+        }
+        finish(*slot);
+        const bool fresh = slot->dst == dst && slot->sbp == sbp && slot->psm == psm && slot->ssa == ssa &&
+                           slot->rr == rr && slot->data.size() == bytes && now - slot->filled < std::chrono::milliseconds(200);
+        uint32_t copied = 0u;
+        if (fresh)
+        {
+            copied = slot->done.load(std::memory_order_acquire) & 0x7FFFFFFFu;
+            std::memcpy(out, slot->data.data(), bytes);
+        }
+        slot->dst = dst, slot->sbp = sbp, slot->psm = psm, slot->ssa = ssa, slot->rr = rr;
+        slot->filled = now;
+        slot->data.resize(bytes);
+        slot->done.store(0u, std::memory_order_relaxed);
+        if (fresh && gsQueueLocalToHostCopy(slot->data.data(), bytes, &slot->done))
+        {
+            slot->queued = true;
+            return copied;
+        }
+        copied = runtime->gs().consumeLocalToHostBytes(out, bytes);
+        std::memcpy(slot->data.data(), out, bytes);
+        slot->done.store(copied | 0x80000000u, std::memory_order_release);
+        return copied;
+    }
+
     bool workerDownload(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation)
     {
         static std::atomic<uint32_t> s_logs{0};
@@ -5583,7 +5650,7 @@ namespace
         runtime->memory().submitGifPacket(GifPathId::Path2, reinterpret_cast<const uint8_t *>(pkt), sizeof(pkt), true, false);
         uint32_t copied = 0u;
         if (dst != 0u && (dst & 0x01FFFFFFu) + bytes <= PS2_RAM_SIZE)
-            copied = runtime->gs().consumeLocalToHostBytes(getMemPtr(rdram, dst), bytes);
+            copied = waterReadback(runtime, getMemPtr(rdram, dst), dst, sbp, psm, ssax | (ssay << 16), rrw | (rrh << 16), bytes);
         if (callback != 0u)
         {
             static std::atomic<uint32_t> s_cbLogs{0};

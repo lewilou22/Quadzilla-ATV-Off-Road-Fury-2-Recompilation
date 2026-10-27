@@ -261,10 +261,13 @@ namespace
         {
             m_worker = std::thread([this]
                                    { workerLoop(); });
+            s_instance.store(this, std::memory_order_release);
         }
 
         ~GSThreadedBackend() override
         {
+            GSThreadedBackend *self = this;
+            s_instance.compare_exchange_strong(self, nullptr);
             {
                 std::lock_guard<std::mutex> stageLock(m_stageMutex);
                 flushStagedLocked(nullptr);
@@ -408,7 +411,24 @@ namespace
             return m_transfer;
         }
 
+        // Copies the pending local->host bytes into `out` once the worker reaches this point of the
+        // command stream, then stores the byte count | 0x80000000 in *done. `out` must stay alive
+        // until then. Returns at once.
+        void QueueReadback(uint8_t *out, uint32_t maxBytes, std::atomic<uint32_t> *done)
+        {
+            push(Command{ReadbackCommand{out, maxBytes, done}});
+        }
+
+        // The threaded backend in use (gsQueueLocalToHostCopy).
+        inline static std::atomic<GSThreadedBackend *> s_instance{nullptr};
+
     private:
+        struct ReadbackCommand
+        {
+            uint8_t *out;
+            uint32_t maxBytes;
+            std::atomic<uint32_t> *done;
+        };
         struct ClutCommand
         {
             GSTex0Reg tex0;
@@ -435,7 +455,8 @@ namespace
             std::vector<uint8_t> *out;
         };
         using Command = std::variant<GSPrimitiveBatch, ClutCommand, GSTransferCommand, UploadCommand,
-                                     FlushCommand, TextureFlushCommand, WriteVramCommand, SnapshotCommand>;
+                                     FlushCommand, TextureFlushCommand, WriteVramCommand, SnapshotCommand,
+                                     ReadbackCommand>;
 
         static constexpr size_t kMaxQueued = 16384u;
         // Commands are handed to the worker in groups: one queue lock and at
@@ -645,6 +666,12 @@ namespace
                 m_inner->WriteVram(write->psm, write->base, write->bw, write->x, write->y, write->value);
             else if (auto *snap = std::get_if<SnapshotCommand>(&command))
                 m_inner->SnapshotVram(*snap->out);
+            else if (auto *readback = std::get_if<ReadbackCommand>(&command))
+            {
+                const uint32_t copied = m_inner->ConsumeLocalToHostBytes(readback->out, readback->maxBytes);
+                refreshTransfer();
+                readback->done->store(copied | 0x80000000u, std::memory_order_release);
+            }
         }
 
         void workerLoop()
@@ -1036,6 +1063,21 @@ void gsSyncAsyncGif()
 {
     if (t_gsApiDepth == 0u)
         asyncGifDrain("privReg");
+}
+
+// GS::consumeLocalToHostBytes without the wait: the GIF packets this thread queued (the TRXDIR=1
+// transfer) reach the backend first, then the threaded backend copies the transfer's bytes into
+// `out` when it gets there and sets *done (byte count | 0x80000000). False, with nothing queued,
+// when the raster backend is not threaded.
+bool gsQueueLocalToHostCopy(uint8_t *out, uint32_t maxBytes, std::atomic<uint32_t> *done)
+{
+    GSThreadedBackend *threaded = GSThreadedBackend::s_instance.load(std::memory_order_acquire);
+    if (threaded == nullptr)
+        return false;
+    if (t_gsApiDepth == 0u)
+        asyncGifDrain("readback");
+    threaded->QueueReadback(out, maxBytes, done);
+    return true;
 }
 
 
