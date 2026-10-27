@@ -39,6 +39,10 @@ namespace GSMem
 
 namespace
 {
+    // ATV_GS_IDBUF (defined with it, below DrawSprite).
+    bool gsIdBegin(const GSDrawState &state, const char *kind, uint32_t &drawId, uint32_t *&idRows, uint32_t *&uvRows);
+    void gsIdMark(uint32_t *idRows, int x, int y, uint32_t drawId);
+
     constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
     constexpr uint32_t kVramPageBytes = 8192u;
     constexpr uint32_t kVramBlockBytes = 256u;
@@ -1558,14 +1562,17 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
     const bool writesZ = !ctx.zbuf.zmask;
     const BandWrite depth = surfaceRange<BandWrite>(ctx.zbuf.zbp * kVramPageBytes, fbw * 64u, ctx.zbuf.psm, rows,
                                                     0x80000000u | (ctx.zbuf.zbp << 16) | (fbw << 8) | ctx.zbuf.psm, 0u);
+    const auto sampledRange = [](const GSDrawState &draw)
+    {
+        const auto &tex0 = draw.context.tex0;
+        const uint32_t texWidth = std::max<uint32_t>(tex0.tbw * 64u, static_cast<uint32_t>(draw.textureWidth));
+        return surfaceRange<BandWrite>(tex0.tbp0 * kVramBlockBytes, texWidth, tex0.psm,
+                                       std::max<uint32_t>(draw.textureHeight, 1u), 0u, kVramPageBytes);
+    };
     BandWrite texture{};
     const bool textured = state.prim.tme;
     if (textured)
-    {
-        const uint32_t texWidth = std::max<uint32_t>(ctx.tex0.tbw * 64u, static_cast<uint32_t>(state.textureWidth));
-        texture = surfaceRange<BandWrite>(ctx.tex0.tbp0 * kVramBlockBytes, texWidth, ctx.tex0.psm,
-                                          std::max<uint32_t>(state.textureHeight, 1u), 0u, kVramPageBytes);
-    }
+        texture = sampledRange(state);
 
     // A draw that samples its own render target sees rows it has already
     // drawn, and aliased depth/colour buffers map one pixel's writes onto
@@ -1590,6 +1597,22 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
                  (overlaps(frame, write) && write.layoutKey != frame.layoutKey) ||
                  (writesZ && overlaps(depth, write) && write.layoutKey != depth.layoutKey);
     }
+    // Overwriting texels an earlier draw of the batch samples lets a band that
+    // is ahead destroy them before a slower band reads them (the 2D screens
+    // clear depth over the image they have just drawn). A range inside one the
+    // batch already writes needs no scan: a sampler queued since that write
+    // would have flushed, and the ones before it were checked then.
+    const auto overwritesSample = [&](const BandWrite &range)
+    {
+        for (const BandWrite &write : m_bandWrites)
+            if (write.begin <= range.begin && range.end <= write.end)
+                return false;
+        for (const GSPrimitiveBatch &queued : m_bandPending)
+            if (queued.state.prim.tme && overlaps(range, sampledRange(queued.state)))
+                return true;
+        return false;
+    };
+    hazard = hazard || overwritesSample(frame) || (writesZ && overwritesSample(depth));
     if (hazard || samplesPendingWrite)
         FlushBands(batchFull ? BandFlushReason::Batch : BandFlushReason::Hazard);
 
@@ -3155,6 +3178,27 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     }
 
 
+    uint32_t *idRows = nullptr;
+    uint32_t *uvRows = nullptr;
+    uint32_t drawId = 0u;
+    if (!gsIdBegin(state, "sprite", drawId, idRows, uvRows))
+        return;
+    const uint32_t idFbpBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+    const uint32_t idFbw = ctx.frame.fbw >= 1u ? ctx.frame.fbw : 10u;
+    // Marks the pixel's ATV_GS_IDBUF entry when the write changed it.
+    const auto writeTracked = [&](int x, int y, const auto &write)
+    {
+        if (idRows == nullptr)
+        {
+            write();
+            return;
+        }
+        const uint32_t before = ReadVramUnlocked(ctx.frame.psm, idFbpBlock, idFbw, x, y);
+        write();
+        if (ReadVramUnlocked(ctx.frame.psm, idFbpBlock, idFbw, x, y) != before)
+            gsIdMark(idRows, x, y, drawId);
+    };
+
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
@@ -3237,10 +3281,13 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
 
-                if (pixelPipe.vram)
-                    writePixelFast(pixelPipe, x, y, z1, color.r, color.g, color.b, color.a);
-                else
-                    WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                writeTracked(x, y, [&]
+                             {
+                                 if (pixelPipe.vram)
+                                     writePixelFast(pixelPipe, x, y, z1, color.r, color.g, color.b, color.a);
+                                 else
+                                     WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                             });
             }
         }
     }
@@ -3256,10 +3303,13 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
             t_ownedBandRow = y;
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                if (pixelPipe.vram)
-                    writePixelFast(pixelPipe, x, y, clearZ, r, g, b, a);
-                else
-                    WritePixel(state, x, y, clearZ, r, g, b, a, v1.fog);
+                writeTracked(x, y, [&]
+                             {
+                                 if (pixelPipe.vram)
+                                     writePixelFast(pixelPipe, x, y, clearZ, r, g, b, a);
+                                 else
+                                     WritePixel(state, x, y, clearZ, r, g, b, a, v1.fog);
+                             });
             }
         }
     }
@@ -3331,6 +3381,70 @@ namespace
         if (inserted)
             b.descs.push_back(desc);
         return it->second;
+    }
+    // The ATV_GS_IDBUF part of one draw: its id and the rows to mark (left null when it is not
+    // recorded). False when ATV_GS_IDBUF_HIDE says not to draw it. Races only, unless
+    // ATV_GS_IDBUF_ALWAYS=1.
+    bool gsIdBegin(const GSDrawState &state, const char *kind, uint32_t &drawId, uint32_t *&idRows, uint32_t *&uvRows)
+    {
+        static const bool s_always = std::getenv("ATV_GS_IDBUF_ALWAYS") != nullptr;
+        if (gsIdBuf().intervalSec <= 0.0 || !(g_raceLoadStarted || s_always))
+            return true;
+        const auto &ctx = state.context;
+        char desc[360];
+        std::snprintf(desc, sizeof(desc),
+                      "%s fbp=0x%x fbw=%u fpsm=0x%x tme=%u tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x csa=%u tw=%u th=%u "
+                      "tcc=%u tfx=%u abe=%u alpha=0x%llx test=0x%llx fge=%u fst=%u iip=%u clamp=0x%llx lin=%u "
+                      "texa=%x/%u/%x up=%s",
+                      kind, static_cast<uint32_t>(ctx.frame.fbp), static_cast<uint32_t>(ctx.frame.fbw),
+                      static_cast<uint32_t>(ctx.frame.psm), static_cast<uint32_t>(state.prim.tme), ctx.tex0.tbp0,
+                      static_cast<uint32_t>(ctx.tex0.tbw), static_cast<uint32_t>(ctx.tex0.psm),
+                      static_cast<uint32_t>(ctx.tex0.cbp), static_cast<uint32_t>(ctx.tex0.cpsm),
+                      static_cast<uint32_t>(ctx.tex0.csa), static_cast<uint32_t>(state.textureWidth),
+                      static_cast<uint32_t>(state.textureHeight), static_cast<uint32_t>(ctx.tex0.tcc),
+                      static_cast<uint32_t>(ctx.tex0.tfx), static_cast<uint32_t>(state.prim.abe),
+                      static_cast<unsigned long long>(ctx.alpha), static_cast<unsigned long long>(ctx.test),
+                      static_cast<uint32_t>(state.prim.fge), static_cast<uint32_t>(state.prim.fst),
+                      static_cast<uint32_t>(state.prim.iip), static_cast<unsigned long long>(ctx.clamp),
+                      state.linearFilter ? 1u : 0u, static_cast<uint32_t>(state.texa.ta0), state.texa.aem ? 1u : 0u,
+                      static_cast<uint32_t>(state.texa.ta1),
+                      state.prim.tme ? gsIdLastUploads(ctx.tex0.tbp0).c_str() : "-");
+        drawId = gsIdFor(desc);
+        // ATV_GS_IDBUF_SKIP=<text>[|<text>...]: draws whose description contains one of them are
+        // not recorded, to see what lies under an overlay. ATV_GS_IDBUF_HIDE: such draws are not drawn.
+        const auto patterns = [](const char *name)
+        {
+            std::vector<std::string> parts;
+            const std::string list = std::getenv(name) ? std::getenv(name) : "";
+            for (size_t start = 0; start < list.size();)
+            {
+                const size_t end = std::min(list.find('|', start), list.size());
+                if (end > start)
+                    parts.push_back(list.substr(start, end - start));
+                start = end + 1;
+            }
+            return parts;
+        };
+        const auto matches = [&](const std::vector<std::string> &parts)
+        {
+            return std::any_of(parts.begin(), parts.end(),
+                               [&](const std::string &part) { return std::strstr(desc, part.c_str()) != nullptr; });
+        };
+        static const std::vector<std::string> s_idSkip = patterns("ATV_GS_IDBUF_SKIP");
+        static const std::vector<std::string> s_idHide = patterns("ATV_GS_IDBUF_HIDE");
+        if (matches(s_idHide))
+            return false;
+        if (!matches(s_idSkip))
+        {
+            idRows = gsIdRows(ctx.frame.fbp);
+            uvRows = gsIdRows(ctx.frame.fbp, true);
+        }
+        return true;
+    }
+    void gsIdMark(uint32_t *idRows, int x, int y, uint32_t drawId)
+    {
+        if (x >= 0 && y >= 0 && static_cast<uint32_t>(x) < kIdBufW && static_cast<uint32_t>(y) < kIdBufH)
+            idRows[static_cast<uint32_t>(y) * kIdBufW + static_cast<uint32_t>(x)] = drawId;
     }
 }
 
@@ -3773,55 +3887,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     uint32_t drawId = 0u;
     const uint32_t idFbpBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
     const uint32_t idFbw = ctx.frame.fbw >= 1u ? ctx.frame.fbw : 10u;
-    if (gsIdBuf().intervalSec > 0.0 && g_raceLoadStarted)
-    {
-        char desc[320];
-        std::snprintf(desc, sizeof(desc),
-                      "tme=%u tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x csa=%u tw=%u th=%u tcc=%u tfx=%u "
-                      "abe=%u alpha=0x%llx test=0x%llx fge=%u fst=%u iip=%u clamp=0x%llx lin=%u texa=%x/%u/%x up=%s",
-                      static_cast<uint32_t>(state.prim.tme), ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.tbw),
-                      static_cast<uint32_t>(ctx.tex0.psm), static_cast<uint32_t>(ctx.tex0.cbp),
-                      static_cast<uint32_t>(ctx.tex0.cpsm), static_cast<uint32_t>(ctx.tex0.csa),
-                      static_cast<uint32_t>(state.textureWidth), static_cast<uint32_t>(state.textureHeight),
-                      static_cast<uint32_t>(ctx.tex0.tcc), static_cast<uint32_t>(ctx.tex0.tfx),
-                      static_cast<uint32_t>(state.prim.abe), static_cast<unsigned long long>(ctx.alpha),
-                      static_cast<unsigned long long>(ctx.test), static_cast<uint32_t>(state.prim.fge),
-                      static_cast<uint32_t>(state.prim.fst), static_cast<uint32_t>(state.prim.iip),
-                      static_cast<unsigned long long>(ctx.clamp), state.linearFilter ? 1u : 0u,
-                      static_cast<uint32_t>(state.texa.ta0), state.texa.aem ? 1u : 0u,
-                      static_cast<uint32_t>(state.texa.ta1),
-                      state.prim.tme ? gsIdLastUploads(ctx.tex0.tbp0).c_str() : "-");
-        drawId = gsIdFor(desc);
-        // ATV_GS_IDBUF_SKIP=<text>[|<text>...]: draws whose description contains one of them are
-        // not recorded, to see what lies under an overlay. ATV_GS_IDBUF_HIDE: such draws are not drawn.
-        const auto patterns = [](const char *name)
-        {
-            std::vector<std::string> parts;
-            const std::string list = std::getenv(name) ? std::getenv(name) : "";
-            for (size_t start = 0; start < list.size();)
-            {
-                const size_t end = std::min(list.find('|', start), list.size());
-                if (end > start)
-                    parts.push_back(list.substr(start, end - start));
-                start = end + 1;
-            }
-            return parts;
-        };
-        const auto matches = [&](const std::vector<std::string> &parts)
-        {
-            return std::any_of(parts.begin(), parts.end(),
-                               [&](const std::string &part) { return std::strstr(desc, part.c_str()) != nullptr; });
-        };
-        static const std::vector<std::string> s_idSkip = patterns("ATV_GS_IDBUF_SKIP");
-        static const std::vector<std::string> s_idHide = patterns("ATV_GS_IDBUF_HIDE");
-        if (matches(s_idHide))
-            return;
-        if (!matches(s_idSkip))
-        {
-            idRows = gsIdRows(ctx.frame.fbp);
-            uvRows = gsIdRows(ctx.frame.fbp, true);
-        }
-    }
+    if (!gsIdBegin(state, "tri", drawId, idRows, uvRows))
+        return;
     const auto &tex = ctx.tex0;
     static const bool s_traceGroundSample = std::getenv("ATV_TRACE_GROUND_SAMPLE") != nullptr;
 
@@ -3855,6 +3922,10 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
         e.ay = gy[a];
         e.bias = (e.dy < 0 || (e.dy == 0 && e.dx > 0)) ? 0 : -1;
     }
+    // Z relative to v2: the float weights' error then scales with the slope, not
+    // with Z itself (Z32 values near 2^32 drifted by hundreds, so a flat 2D panel
+    // failed ZTST=GEQUAL against its own depth in a dotted pattern).
+    const double dz0 = v0.z - v2.z, dz1 = v1.z - v2.z;
 
     for (int y = minY; y <= maxY; y = nextBandRow(y))
     {
@@ -3882,7 +3953,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             insideSpan = true;
             t_triangleCovered = true;
 
-            const double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const double z = v2.z + dz0 * w0 + dz1 * w1;
 
             uint8_t r, g, b, a;
             uint32_t texelUv = 0u;
@@ -4719,7 +4790,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         {
             GsIdBuf &ib = gsIdBuf();
             const auto now = std::chrono::steady_clock::now();
-            if (ib.intervalSec > 0.0 && g_raceLoadStarted &&
+            static const bool s_idAlways = std::getenv("ATV_GS_IDBUF_ALWAYS") != nullptr;
+            if (ib.intervalSec > 0.0 && (g_raceLoadStarted || s_idAlways) &&
                 std::chrono::duration<double>(now - ib.lastDump).count() >= ib.intervalSec)
             {
                 ib.lastDump = now;
