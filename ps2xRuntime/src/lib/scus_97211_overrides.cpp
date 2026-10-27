@@ -6321,6 +6321,71 @@ namespace
         }
     }
 
+    // Online, the lobby tells the other players each pick as a roster index: game message type 9
+    // (0x2C bytes at 0x4B7E30, built by 0x27DDA0, sent by 0x309100), roster index in msg+0x28 & 0x1F.
+    // The handler (0x27CCF0) stores it unchecked and every machine turns roster indices into quads
+    // from its own roster at race start (0x27E360), so a DZ400 pick (index 25) would read past the end
+    // of a PS2 player's 25-quad roster. Send the KFX700 (index 3) instead, tagged with msg+0x2B =
+    // kDz400NetTag: retail senders leave that byte 0 (only 0/1 flags are stored to the word at
+    // msg+0x28) and retail receivers never read it. Recomp receivers map the tagged KFX700 back to
+    // the DZ400, so PS2 players see a KFX700 and recomp players the DZ400.
+    constexpr uint32_t kNetMsgBuf = 0x004B7E30u;
+    constexpr uint8_t kNetMsgSelect = 9u;
+    constexpr uint32_t kDz400RosterIndex = 25u;
+    constexpr uint32_t kKfx700RosterIndex = 3u;
+    constexpr uint32_t kDz400NetTag = 0xD4u;
+
+    // The buffer is only ever sent: 0x27DDA0 rewrites the roster bits before each type-9 send and
+    // nothing reads them back, so the rewrite stays in place. Every other type-9 send clears the tag,
+    // so a later real KFX700 pick is not taken for the DZ400.
+    PS2Runtime::RecompiledFunction g_sendGameMsg309100Orig = nullptr;
+
+    void sendGameMsg309100(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (READ8(kNetMsgBuf + 4u) == kNetMsgSelect)
+        {
+            uint32_t select = READ32(kNetMsgBuf + 0x28u) & 0x00FFFFFFu;
+            if ((select & 0x1Fu) == kDz400RosterIndex)
+            {
+                static bool s_logged = false;
+                if (!s_logged)
+                {
+                    s_logged = true;
+                    std::cerr << "[ATV2:DZ400] online: the DZ400 is sent as the KFX700 (recomp players still see "
+                                 "the DZ400)"
+                              << std::endl;
+                }
+                select = (select & ~0x1Fu) | kKfx700RosterIndex | (kDz400NetTag << 24);
+            }
+            WRITE32(kNetMsgBuf + 0x28u, select);
+        }
+        g_sendGameMsg309100Orig(rdram, ctx, runtime);
+    }
+
+    void mapDz400NetPick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t msg)
+    {
+        if (msg == 0u || READ8(msg + 4u) != kNetMsgSelect)
+            return;
+        const uint32_t select = READ32(msg + 0x28u);
+        if ((select >> 24) != kDz400NetTag || (select & 0x1Fu) != kKfx700RosterIndex)
+            return;
+        const uint32_t roster = READ32(READ32(0x00404818u) + 0x2CCu);
+        if (roster == 0u || READ32(roster) <= kDz400RosterIndex)
+            return; // roster without the DZ400 (ATV2_DZ400=0): show the KFX700
+        WRITE32(msg + 0x28u, (select & 0x00FFFFE0u) | kDz400RosterIndex);
+        std::cerr << "[ATV2:DZ400] online: player " << ((select >> 19) & 3u) << " picked the DZ400" << std::endl;
+    }
+
+    // Lobby page message handler (a1 = queued message). The DME callback that queues received
+    // messages (0x309840) has no generated entry and runs in the interpreter, so map them here.
+    PS2Runtime::RecompiledFunction g_lobbyMsg27ccf0Orig = nullptr;
+
+    void lobbyMsg27ccf0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mapDz400NetPick(rdram, ctx, runtime, getRegU32(ctx, 5));
+        g_lobbyMsg27ccf0Orig(rdram, ctx, runtime);
+    }
+
     void registerSuzukiDz400(PS2Runtime &runtime)
     {
         const char *env = std::getenv("ATV2_DZ400");
@@ -6336,6 +6401,19 @@ namespace
         }
         runtime.replaceFunction(0x0033F510u, &findDiscFile33f510);
         runtime.replaceFunction(0x00210D20u, &aiOpponents210d20);
+        if (runtime.hasFunction(0x00309100u) && runtime.hasFunction(0x0027CCF0u))
+        {
+            g_sendGameMsg309100Orig = runtime.lookupFunction(0x00309100u);
+            g_lobbyMsg27ccf0Orig = runtime.lookupFunction(0x0027CCF0u);
+            runtime.replaceFunction(0x00309100u, &sendGameMsg309100);
+            runtime.replaceFunction(0x0027CCF0u, &lobbyMsg27ccf0);
+        }
+        else
+        {
+            std::cerr << "[ATV2:DZ400] no generated lobby message functions; online PS2 players would get "
+                         "roster index 25 for the DZ400"
+                      << std::endl;
+        }
     }
 
     void applyScus97211Overrides(PS2Runtime &runtime)
