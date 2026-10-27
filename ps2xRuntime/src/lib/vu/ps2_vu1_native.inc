@@ -103,6 +103,8 @@ struct VU1Native
         kMulaBc, kMaddaBc,
         kMulI, kAddI,
         kClip, kFtoi0, kFtoi4, kItof0,
+        // Appended, so the packed ops in ps2_vu1_native_blocks.inc keep their kinds.
+        kAddaBc, kMula, kSubI, kOpmula, kOpmsub, kItof12, kAbs,
     };
     struct FastReads
     {
@@ -235,6 +237,10 @@ struct VU1Native
             op.kind = kMiniI;
         else if (low == 0x22u)
             op.kind = kAddI;
+        else if (low == 0x26u)
+            op.kind = kSubI;
+        else if (low == 0x2Eu && (op.dest & 1u) == 0u) // OPMSUB; the interpreter's w is 0, not ACC.w - 0
+            op.kind = kOpmsub;
         else if (low == 0x28u)
             op.kind = kAdd;
         else if (low == 0x2Au)
@@ -263,6 +269,16 @@ struct VU1Native
                 op.kind = kFtoi4;
             else if (spec == 0x10u)
                 op.kind = kItof0;
+            else if (spec <= 0x03u)
+                op.kind = kAddaBc;
+            else if (spec == 0x2Au)
+                op.kind = kMula;
+            else if (spec == 0x2Eu && (op.dest & 1u) == 0u) // OPMULA, as OPMSUB
+                op.kind = kOpmula;
+            else if (spec == 0x12u)
+                op.kind = kItof12;
+            else if (spec == 0x1Du)
+                op.kind = kAbs;
         }
         return op;
     }
@@ -445,21 +461,32 @@ struct VU1Native
             return;
         }
         case kItof0:
+        case kItof12:
         {
+            const float scale = op.kind == kItof0 ? 1.0f : 4096.0f;
             float result[4];
             for (uint32_t c = 0; c < 4u; ++c)
             {
                 int32_t value;
                 std::memcpy(&value, &m_state.vf[op.fs][c], sizeof(value));
-                result[c] = static_cast<float>(value);
+                result[c] = static_cast<float>(value) / scale;
             }
+            vu.applyDest(m_state.vf[op.ft], result, op.dest);
+            return;
+        }
+        case kAbs:
+        {
+            alignas(16) float result[4];
+            _mm_store_ps(result, _mm_andnot_ps(_mm_set1_ps(-0.0f), vuNormalize4(_mm_loadu_ps(m_state.vf[op.fs]))));
             vu.applyDest(m_state.vf[op.ft], result, op.dest);
             return;
         }
         default:
             break;
         }
-        const __m128 vs = vuNormalize4(_mm_loadu_ps(m_state.vf[op.fs]));
+        // The cross products (OPMULA, OPMSUB) take fs.yzx and ft.zxy, so the zero
+        // and normal-range proofs below see the operands of each lane.
+        __m128 vs = vuNormalize4(_mm_loadu_ps(m_state.vf[op.fs]));
         const __m128 vt = vuNormalize4(_mm_loadu_ps(m_state.vf[op.ft]));
         const auto broadcast = [&]() {
             switch (op.bc)
@@ -509,6 +536,22 @@ struct VU1Native
         case kAddI: right = vuNormalize4(_mm_set1_ps(m_state.i)); result = _mm_add_ps(vs, right); zeroRule = kZeroAdd; break;
         case kMulaBc: right = broadcast(); result = _mm_mul_ps(vs, right); toAcc = true; break;
         case kMaddaBc: right = broadcast(); result = _mm_add_ps(acc(), _mm_mul_ps(vs, right)); toAcc = true; productSum = true; break;
+        case kAddaBc: right = broadcast(); result = _mm_add_ps(vs, right); toAcc = true; zeroRule = kZeroAdd; break;
+        case kMula: result = _mm_mul_ps(vs, vt); toAcc = true; break;
+        case kSubI: right = vuNormalize4(_mm_set1_ps(m_state.i)); result = _mm_sub_ps(vs, right); zeroRule = kZeroSub; break;
+        case kOpmula:
+        case kOpmsub:
+            vs = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
+            right = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(3, 1, 0, 2));
+            result = _mm_mul_ps(vs, right);
+            if (op.kind == kOpmula)
+                toAcc = true;
+            else
+            {
+                result = _mm_sub_ps(acc(), result);
+                productSum = true;
+            }
+            break;
         default:
             vu.execUpper(upper);
             return;

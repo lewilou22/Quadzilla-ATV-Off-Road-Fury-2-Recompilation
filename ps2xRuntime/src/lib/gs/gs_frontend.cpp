@@ -804,12 +804,36 @@ namespace
         return s_enabled;
     }
 
+    // Packet FIFO that keeps its storage: MSVC's std::deque gives every 32-byte vector its own heap
+    // block, an allocation and a free per GIF packet on the VIF1/VU1 worker and the GIF thread.
+    struct PacketFifo
+    {
+        std::vector<std::vector<uint8_t>> items;
+        size_t head = 0u;
+        bool empty() const { return head == items.size(); }
+        std::vector<uint8_t> &front() { return items[head]; }
+        void push_back(std::vector<uint8_t> &&packet) { items.push_back(std::move(packet)); }
+        void pop_front()
+        {
+            if (++head == items.size())
+            {
+                items.clear();
+                head = 0u;
+            }
+            else if (head >= 1024u && head * 2u >= items.size())
+            {
+                items.erase(items.begin(), items.begin() + static_cast<std::ptrdiff_t>(head));
+                head = 0u;
+            }
+        }
+    };
+
     struct AsyncGifQueue
     {
         GS *gs = nullptr;
         std::mutex queueMutex;
         std::condition_variable wake;
-        std::deque<std::vector<uint8_t>> queue;
+        PacketFifo queue;
         std::vector<std::vector<uint8_t>> pool;
         bool sleeping = false;
         std::mutex processMutex;
