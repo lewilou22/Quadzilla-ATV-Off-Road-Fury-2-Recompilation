@@ -342,6 +342,52 @@ namespace GSMem
         }
     }
 
+    // The 256-byte blocks a w x h transfer at (x, y) writes: [first, end), unwrapped (blocks past
+    // 0x3FFF wrap to the start of local memory). False for an empty rectangle or an unknown PSM.
+    // (gs_cpu_backend.cpp declares it: a page-granular estimate of a small upload near the end of
+    // local memory ran past 4 MB and so covered all of it.)
+    bool TransferBlockSpan(u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32 w, u32 h, u32& first, u32& end)
+    {
+        if (w == 0u || h == 0u)
+            return false;
+        const auto span = [&]<PixelStorageMode mode>(const auto& blockTable)
+        {
+            using Traits = PixelStorageTraits<mode>;
+            constexpr auto cell = Traits::ColumnExtent(); // one block, in pixels
+            u32 lo = UINT32_MAX;
+            u32 hi = 0u;
+            for (u32 py = y - y % cell.y; py < y + h; py += cell.y)
+                for (u32 px = x - x % cell.x; px < x + w; px += cell.x)
+                {
+                    const u32 block = static_cast<u32>(Traits::PageId(bp, bw, px, py) * Traits::BlocksPerPage()) +
+                                      bp % static_cast<u32>(Traits::BlocksPerPage()) +
+                                      static_cast<u32>(Traits::BlockId(blockTable, px, py));
+                    lo = std::min(lo, block);
+                    hi = std::max(hi, block);
+                }
+            first = lo;
+            end = hi + 1u;
+            return true;
+        };
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32: return span.template operator()<C32>(BlockTableC32);
+        case C24: return span.template operator()<C24>(BlockTableC32);
+        case C16: return span.template operator()<C16>(BlockTableC16);
+        case C16S: return span.template operator()<C16S>(BlockTableC16S);
+        case P8: return span.template operator()<P8>(BlockTableP8);
+        case P4: return span.template operator()<P4>(BlockTableP4);
+        case P8H: return span.template operator()<P8H>(BlockTableC32);
+        case P4HL: return span.template operator()<P4HL>(BlockTableC32);
+        case P4HH: return span.template operator()<P4HH>(BlockTableC32);
+        case Z32: return span.template operator()<Z32>(BlockTableZ32);
+        case Z24: return span.template operator()<Z24>(BlockTableZ32);
+        case Z16: return span.template operator()<Z16>(BlockTableZ16);
+        case Z16S: return span.template operator()<Z16S>(BlockTableZ16S);
+        default: return false;
+        }
+    }
+
     namespace
     {
         template <PixelStorageMode mode, typename Table>

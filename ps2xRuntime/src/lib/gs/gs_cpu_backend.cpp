@@ -30,6 +30,13 @@ using namespace GSInternal;
 extern uint32_t g_ps2XgkickCount;
 extern bool g_raceLoadStarted;
 
+namespace GSMem
+{
+    // ps2_gs_memory.cpp: the 256-byte blocks [first, end) a w x h transfer at (x, y) writes.
+    bool TransferBlockSpan(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                           uint32_t &first, uint32_t &end);
+}
+
 namespace
 {
     constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
@@ -4108,10 +4115,20 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
         // neither sample nor draw those pages give the same result whether
         // they run before or after it, so they can stay queued.
         const uint32_t dbw = std::max<uint32_t>(command.bitbltbuf.dbw, 1u);
-        m_uploadRange = surfaceRange<BandWrite>(command.bitbltbuf.dbp * kVramBlockBytes,
-                                                std::max<uint32_t>(dbw * 64u, static_cast<uint32_t>(command.trxpos.dsax) + command.trxreg.rrw),
-                                                command.bitbltbuf.dpsm,
-                                                static_cast<uint32_t>(command.trxpos.dsay) + command.trxreg.rrh, 0u, kVramPageBytes);
+        // The blocks the rectangle writes, in whole pages (the band caches copy pages). The page
+        // estimate below is the fallback: for small uploads near the end of local memory (the
+        // 8x2 CLUTs at block 0x3ffc) it ran past 4 MB, covered all of it, and flushed every queued
+        // draw: most of ~700 upload flushes a second in races.
+        uint32_t firstBlock = 0u, endBlock = 0u;
+        if (GSMem::TransferBlockSpan(command.bitbltbuf.dpsm, command.bitbltbuf.dbp, dbw, command.trxpos.dsax,
+                                     command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh, firstBlock, endBlock) &&
+            endBlock <= kVramBytes / kVramBlockBytes)
+            m_uploadRange = BandWrite{firstBlock * kVramBlockBytes, endBlock * kVramBlockBytes, 0u};
+        else
+            m_uploadRange = surfaceRange<BandWrite>(command.bitbltbuf.dbp * kVramBlockBytes,
+                                                    std::max<uint32_t>(dbw * 64u, static_cast<uint32_t>(command.trxpos.dsax) + command.trxreg.rrw),
+                                                    command.bitbltbuf.dpsm,
+                                                    static_cast<uint32_t>(command.trxpos.dsay) + command.trxreg.rrh, 0u, kVramPageBytes);
         m_uploadRange.begin &= ~(kVramPageBytes - 1u);
         if (m_uploadRange.end != UINT32_MAX)
             m_uploadRange.end = (m_uploadRange.end + kVramPageBytes - 1u) & ~(kVramPageBytes - 1u);
