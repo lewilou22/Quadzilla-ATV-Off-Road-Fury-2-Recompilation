@@ -20,6 +20,8 @@
 #include <optional>
 #include <limits>
 #include <functional>
+#include <map>
+#include <set>
 #include <thread>
 
 namespace fs = std::filesystem;
@@ -281,6 +283,109 @@ namespace ps2recomp
         bool isEntryFunctionName(const std::string &name)
         {
             return name.rfind("entry_", 0) == 0;
+        }
+
+        // The instruction at `address` looks like the first one of a function: a stack frame
+        // allocation, or code that follows a return or a tail jump (after its delay slot and any
+        // nop padding).
+        bool looksLikeFunctionStart(const ElfParser &parser, uint32_t address)
+        {
+            constexpr uint32_t kJrRa = 0x03E00008u;
+            if (!parser.isValidAddress(address) || !parser.isValidAddress(address - 8u))
+            {
+                return false;
+            }
+
+            const uint32_t first = parser.readWord(address);
+            if ((first >> 16) == 0x27BDu && (first & 0x8000u) != 0u) // addiu $sp, $sp, -N
+            {
+                return true;
+            }
+
+            uint32_t last = address - 4u;
+            while (last + 64u > address && parser.isValidAddress(last - 4u) && parser.readWord(last) == 0u)
+            {
+                last -= 4u;
+            }
+            auto endsFlow = [](uint32_t word)
+            { return word == kJrRa || (word >> 26) == OPCODE_J; };
+            // `last` is the last non-nop word: the delay slot of the return or jump, or the return or
+            // jump itself when its delay slot was a nop (never the word right before `address`, which
+            // would make `address` the delay slot).
+            return endsFlow(parser.readWord(last - 4u)) ||
+                   (last != address - 4u && endsFlow(parser.readWord(last)));
+        }
+
+        // A stub replaces only the function at its own start, but the JAL-target scan hands it all
+        // the code up to the next JAL target. A function reached only by tail jumps (`j`) from other
+        // code then gets no code at all (atanf behind the sin stub), so such a target starts a
+        // function of its own.
+        size_t splitStubsAtExternalJumps(std::vector<Function> &functions, const std::vector<Section> &sections,
+                                         const std::function<bool(const Function &)> &isStub)
+        {
+            std::sort(functions.begin(), functions.end(),
+                      [](const Function &a, const Function &b)
+                      { return a.start < b.start; });
+
+            std::map<size_t, std::set<uint32_t>> splitsByStub;
+            for (const Section &section : sections)
+            {
+                if (!section.isCode || section.data == nullptr)
+                {
+                    continue;
+                }
+                for (uint32_t offset = 0; offset + 4u <= section.size; offset += 4u)
+                {
+                    uint32_t word = 0;
+                    std::memcpy(&word, section.data + offset, sizeof(word));
+                    if ((word >> 26) != OPCODE_J)
+                    {
+                        continue;
+                    }
+
+                    const uint32_t source = section.address + offset;
+                    const uint32_t target = decodeAbsoluteJumpTarget(source, word & 0x03FFFFFFu);
+                    auto it = std::upper_bound(functions.begin(), functions.end(), target,
+                                               [](uint32_t value, const Function &f)
+                                               { return value < f.start; });
+                    if (it == functions.begin())
+                    {
+                        continue;
+                    }
+                    --it;
+                    if (target == it->start || target >= it->end || !isStub(*it) ||
+                        (source >= it->start && source < it->end))
+                    {
+                        continue;
+                    }
+                    splitsByStub[static_cast<size_t>(it - functions.begin())].insert(target);
+                }
+            }
+
+            std::vector<Function> added;
+            for (auto &[index, targets] : splitsByStub)
+            {
+                Function &stub = functions[index];
+                uint32_t end = stub.end;
+                for (auto it = targets.rbegin(); it != targets.rend(); ++it)
+                {
+                    char name[32]{};
+                    std::snprintf(name, sizeof(name), "sub_%08X", *it);
+                    Function function{};
+                    function.name = name;
+                    function.start = *it;
+                    function.end = end;
+                    added.push_back(std::move(function));
+                    end = *it;
+                }
+                stub.end = end;
+            }
+
+            functions.insert(functions.end(), added.begin(), added.end());
+            std::sort(functions.begin(), functions.end(),
+                      [](const Function &a, const Function &b)
+                      { return a.start < b.start; });
+            return added.size();
         }
 
         EntryDiscoveryStats discoverAdditionalEntryPointsImpl(
@@ -812,6 +917,12 @@ namespace ps2recomp
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
             collectCorrectnessCriticalFunctionStarts();
+            if (const size_t split = splitStubsAtExternalJumps(m_functions, m_sections,
+                                                               [this](const Function &function)
+                                                               { return isStubFunction(function); }))
+            {
+                m_reporter.progress("split " + std::to_string(split) + " tail-jump target(s) out of stub ranges");
+            }
 
             if (m_functions.empty())
             {
@@ -1885,8 +1996,9 @@ namespace ps2recomp
 
         // Virtual methods are only referenced from vtables, so the analyzer can merge them into the
         // preceding function. Treat runs of data words that point at decoded instructions as method
-        // tables; a run whose targets all share one owner looks like a jump table and is left alone.
-        // Section-less ELFs expose one RWX load segment, so words inside function bodies are skipped.
+        // tables; a run whose targets all share one owner looks like a jump table, so it (like a lone
+        // pointer) only counts where a function starts. Section-less ELFs expose one RWX load
+        // segment, so words inside function bodies are skipped.
         std::vector<const Function *> owners;
         for (const auto &function : m_functions)
         {
@@ -1930,6 +2042,53 @@ namespace ps2recomp
             return (it != decoded.end() && it->address == address) ? owner : nullptr;
         };
 
+        // Callbacks are usually built in code (lui/addiu or lui/ori of the function's address,
+        // stored into an object or passed as an argument), so they reach no table either.
+        size_t addressTakenTargets = 0u;
+        for (const Function *function : owners)
+        {
+            const auto &instructions = m_decodedFunctions.at(function->start);
+            for (size_t i = 0; i < instructions.size(); ++i)
+            {
+                const Instruction &lui = instructions[i];
+                if (lui.opcode != OPCODE_LUI || lui.rt == 0u)
+                {
+                    continue;
+                }
+
+                for (size_t j = i + 1u; j < instructions.size() && j <= i + 8u; ++j)
+                {
+                    const Instruction &next = instructions[j];
+                    if ((next.opcode == OPCODE_ADDIU || next.opcode == OPCODE_ORI) && next.rs == lui.rt)
+                    {
+                        const uint32_t high = (lui.immediate & 0xFFFFu) << 16;
+                        const uint32_t target = next.opcode == OPCODE_ADDIU ? high + next.simmediate
+                                                                             : high | (next.immediate & 0xFFFFu);
+                        const Function *owner = ((target & 3u) == 0u) ? ownerDecoding(target) : nullptr;
+                        if (owner != nullptr && owner->start != target)
+                        {
+                            m_resumeEntryTargetsByOwner[owner->start].push_back(target);
+                            ++addressTakenTargets;
+                        }
+                        break;
+                    }
+
+                    const uint32_t written = next.opcode == OPCODE_SPECIAL ? next.rd : next.rt;
+                    if (written == lui.rt && !next.isStore && !next.isBranch)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (addressTakenTargets > 0u)
+        {
+            std::ostringstream msg;
+            msg << "collected " << addressTakenTargets << " address-taken entry point(s) from lui pairs";
+            m_reporter.progress(msg.str());
+        }
+
         size_t dataPointerTargets = 0u;
         for (const auto &section : m_sections)
         {
@@ -1941,23 +2100,19 @@ namespace ps2recomp
             std::vector<std::pair<uint32_t, const Function *>> run;
             auto flushRun = [&]()
             {
-                if (run.size() >= 2u)
+                const bool methodTable = run.size() >= 2u &&
+                                         !std::all_of(run.begin(), run.end(),
+                                                      [&](const auto &entry)
+                                                      { return entry.second == run.front().second; });
+                for (const auto &[target, owner] : run)
                 {
-                    const bool singleOwner = std::all_of(run.begin(), run.end(),
-                                                         [&](const auto &entry)
-                                                         { return entry.second == run.front().second; });
-                    if (!singleOwner)
+                    if (owner->start == target ||
+                        (!methodTable && !looksLikeFunctionStart(*m_elfParser, target)))
                     {
-                        for (const auto &[target, owner] : run)
-                        {
-                            if (owner->start == target)
-                            {
-                                continue;
-                            }
-                            m_resumeEntryTargetsByOwner[owner->start].push_back(target);
-                            ++dataPointerTargets;
-                        }
+                        continue;
                     }
+                    m_resumeEntryTargetsByOwner[owner->start].push_back(target);
+                    ++dataPointerTargets;
                 }
                 run.clear();
             };
