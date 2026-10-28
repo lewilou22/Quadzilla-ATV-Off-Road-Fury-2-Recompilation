@@ -6,6 +6,7 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include "ThreadNaming.h"
 #include <atomic>
 #include <algorithm>
 #include <bit>
@@ -46,7 +47,12 @@ namespace
     constexpr uint32_t kVramBytes = 4u * 1024u * 1024u;
     constexpr uint32_t kVramPageBytes = 8192u;
     constexpr uint32_t kVramBlockBytes = 256u;
-    constexpr uint32_t kBandRowShift = 3u;
+    // Bands own interleaved blocks of 1 << kBandRowShift rows (ATV_GS_BAND_ROW_SHIFT, 0-5, default 3).
+    const uint32_t kBandRowShift = []
+    {
+        const char *env = std::getenv("ATV_GS_BAND_ROW_SHIFT");
+        return env ? static_cast<uint32_t>(std::clamp<long>(std::strtol(env, nullptr, 10), 0, 5)) : 3u;
+    }();
 
     // Band assignment of the calling thread while it draws a banded batch;
     // t_bandCount == 1 means the thread draws every row.
@@ -58,6 +64,9 @@ namespace
     thread_local GSMem::TexturePageCache *t_bandCache = nullptr;
     // Palette of the primitive a band is drawing (DrawBand); null = the backend's current CLUT.
     thread_local const uint16_t *t_drawClut = nullptr;
+
+    // ATV_GS_PROFILE_BANDS: sum of each batch's slowest band (the raster worker only).
+    uint64_t g_bandSpanNs = 0;
 
     uint64_t bandClockNs()
     {
@@ -1317,11 +1326,19 @@ GSCpuBackend::GSCpuBackend()
     m_freezeUploads = std::getenv("ATV_GS_UPLOAD_FLUSH_READS") == nullptr &&
                       std::getenv("ATV_GS_UPLOAD_NO_TEXFLUSH") == nullptr;
     m_profileBands = std::getenv("ATV_GS_PROFILE_BANDS") != nullptr;
-    m_bandPipeline = std::getenv("ATV_GS_BAND_PIPELINE") != nullptr;
+    // ATV2 default: band 0 runs on a band thread too, so the raster worker queues the next batch
+    // while every band draws (race raster worker ~73% -> ~48% busy); ATV_GS_BAND_PIPELINE=0 draws
+    // band 0 on the raster worker as before.
+    const char *pipeline = std::getenv("ATV_GS_BAND_PIPELINE");
+    m_bandPipeline = pipeline == nullptr || pipeline[0] != '0';
+    // ATV2 default 16384 primitives a batch (was 4096): a race batch of one object's small triangles
+    // covers few band rows, so the slowest band decides; bigger batches spread over more rows
+    // (sum of the slowest band per batch ~5.0 -> ~4.2 s per 10 s).
+    m_bandBatchLimit = 16384u;
     // ATV2 default (ATV1 sets ATV_GS_BANDS=12 in play_game.bat): up to 12 raster bands, half the
     // host threads. ATV_GS_BANDS=1 rasterizes inline.
     if (const char *batch = std::getenv("ATV_GS_BATCH_SIZE"))
-        m_bandBatchLimit = static_cast<size_t>(std::clamp<long>(std::strtol(batch, nullptr, 10), 16, 4096));
+        m_bandBatchLimit = static_cast<size_t>(std::clamp<long>(std::strtol(batch, nullptr, 10), 16, 65536));
     const char *bands = std::getenv("ATV_GS_BANDS");
     const long requested = bands ? std::strtol(bands, nullptr, 10)
                                  : std::clamp<long>(static_cast<long>(std::thread::hardware_concurrency() / 2u), 1, 12);
@@ -1332,7 +1349,9 @@ GSCpuBackend::GSCpuBackend()
 
 void GSCpuBackend::StartBandThreads()
 {
-    for (uint32_t band = 1u; band < m_bandCount; ++band)
+    // Pipelined, band 0 runs off the calling thread too and gets its own cache (ATV1 6365aaf):
+    // m_bandCaches[band] then, m_bandCaches[band - 1] otherwise.
+    for (uint32_t band = m_bandPipeline ? 0u : 1u; band < m_bandCount; ++band)
         m_bandCaches.push_back(std::make_unique<GSMem::TexturePageCache>());
     for (uint32_t band = m_bandPipeline ? 0u : 1u; band < m_bandCount; ++band)
         m_bandThreads.emplace_back([this, band]
@@ -1353,9 +1372,10 @@ GSCpuBackend::~GSCpuBackend()
 
 void GSCpuBackend::BandWorker(uint32_t band)
 {
+    ThreadNaming::SetCurrentThreadName("GsBand" + std::to_string(band));
     t_bandIndex = band;
     t_bandCount = m_bandCount;
-    t_bandCache = band == 0u ? nullptr : m_bandCaches[band - 1u].get();
+    t_bandCache = m_bandPipeline ? m_bandCaches[band].get() : band == 0u ? nullptr : m_bandCaches[band - 1u].get();
     uint64_t seenGeneration = 0;
     for (;;)
     {
@@ -1382,7 +1402,7 @@ void GSCpuBackend::DrawBand(uint32_t band)
     // count. Do not reuse its last row-ownership proof across batches.
     t_ownedBandRow = -1;
     const uint64_t start = m_profileBands ? bandClockNs() : 0;
-    auto &cache = band == 0u ? m_texturePageCache : *m_bandCaches[band - 1u];
+    auto &cache = m_bandPipeline ? *m_bandCaches[band] : band == 0u ? m_texturePageCache : *m_bandCaches[band - 1u];
     const bool frozen = !m_bandInFlightSegments.empty();
     const auto useSegment = [&](size_t segment) {
         const std::vector<GSMem::FrozenPage> &pages = m_bandInFlightSegments[segment];
@@ -1430,8 +1450,13 @@ void GSCpuBackend::WaitBandsIdle() const
     if (m_profileBands)
     {
         m_bandWaitNs += bandClockNs() - waitStart;
+        uint64_t slowest = 0;
         for (uint32_t i = 0; i < m_bandCount; ++i)
+        {
             m_bandAccumulatedNs[i] += m_bandDrawNs[i];
+            slowest = std::max<uint64_t>(slowest, m_bandDrawNs[i]);
+        }
+        g_bandSpanNs += slowest;
     }
 }
 
@@ -1515,7 +1540,9 @@ void GSCpuBackend::FlushBands(BandFlushReason reason) const
                 std::fprintf(stderr, " %s=%llu", names[i], static_cast<unsigned long long>(m_bandFlushCounts[i]));
             for (uint32_t i = 0; i < m_bandCount; ++i)
                 std::fprintf(stderr, " band%u_ms=%.3f", i, m_bandAccumulatedNs[i] / 1e6);
-            std::fprintf(stderr, "\n");
+            // span = sum over batches of the slowest band: the batches' critical path.
+            std::fprintf(stderr, " span_ms=%.3f\n", g_bandSpanNs / 1e6);
+            g_bandSpanNs = 0;
             m_bandProfileStartNs = now;
             m_bandFlushNs = m_bandWaitNs = m_bandPrimitiveCount = 0;
             m_bandFlushCounts.fill(0);
@@ -1671,10 +1698,7 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
 
 bool GSCpuBackend::InFlightTouches(const BandWrite &range) const
 {
-    // Pipelined bands run band 0 off-thread with the shared page cache, which
-    // uploads touch: they always wait.
-    if (m_bandPipeline)
-        return m_bandInFlightActive;
+    // Pipelined band 0 has its own page cache, so uploads wait only on a real overlap here too.
     if (!m_bandInFlightActive)
         return false;
     for (const BandWrite &write : m_bandInFlightWrites)

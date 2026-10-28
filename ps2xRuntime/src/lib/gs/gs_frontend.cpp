@@ -1,6 +1,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
+#include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
@@ -458,7 +459,12 @@ namespace
                                      FlushCommand, TextureFlushCommand, WriteVramCommand, SnapshotCommand,
                                      ReadbackCommand>;
 
-        static constexpr size_t kMaxQueued = 16384u;
+        // ATV_GS_QUEUE_MAX: commands the GIF thread may queue ahead of the raster worker.
+        inline static const size_t kMaxQueued = []
+        {
+            const char *env = std::getenv("ATV_GS_QUEUE_MAX");
+            return env ? static_cast<size_t>(std::clamp<long>(std::strtol(env, nullptr, 10), 1024, 1 << 20)) : 16384u;
+        }();
         // Commands are handed to the worker in groups: one queue lock and at
         // most one wake per group instead of per triangle or register write.
         static constexpr size_t kStageBatch = 64u;
@@ -676,6 +682,7 @@ namespace
 
         void workerLoop()
         {
+            ThreadNaming::SetCurrentThreadName("GsRaster");
             static const bool s_profileWorker = std::getenv("ATV_HOST_PROFILE_GS") != nullptr;
             bool profilerStarted = false;
             std::vector<Command> batch;
@@ -847,7 +854,12 @@ namespace
     thread_local bool t_gsGifDirect = false;
     thread_local uint32_t t_gsApiDepth = 0u;
 
-    constexpr uint32_t kAsyncGifMaxPending = 4096u;
+    // ATV_GS_GIF_MAX_PENDING: GIF packets the VIF1/VU1 worker may queue before it waits for the GIF thread.
+    const uint32_t kAsyncGifMaxPending = []
+    {
+        const char *env = std::getenv("ATV_GS_GIF_MAX_PENDING");
+        return env ? static_cast<uint32_t>(std::clamp<long>(std::strtol(env, nullptr, 10), 256, 1 << 20)) : 4096u;
+    }();
 
     // Caller holds processMutex and has t_gsGifDirect set.
     void asyncGifProcessQueued(AsyncGifQueue &q)
@@ -873,6 +885,7 @@ namespace
 
     void asyncGifThreadMain(AsyncGifQueue *q)
     {
+        ThreadNaming::SetCurrentThreadName("GifParse");
         // ATV_HOST_PROFILE_GIF=1 samples this thread (ATV1 made it opt-in too).
         if (std::getenv("ATV_HOST_PROFILE_GIF") != nullptr)
             atvStartHostProfilerForThisThread();

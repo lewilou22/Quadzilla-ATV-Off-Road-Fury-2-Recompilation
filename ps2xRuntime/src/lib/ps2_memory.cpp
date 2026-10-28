@@ -2,6 +2,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
+#include "ThreadNaming.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -381,6 +382,7 @@ void gsMarkGifBatchingThread(); // gs_frontend.cpp: this thread batches its GIF 
 
 void PS2Memory::gsWorkerMain()
 {
+    ThreadNaming::SetCurrentThreadName("Vif1Vu1");
     t_onGsWorker = true;
     gsMarkGifBatchingThread();
     // Same float environment as the game thread (FTZ|DAZ from GameThread start), where VU1 ran before.
