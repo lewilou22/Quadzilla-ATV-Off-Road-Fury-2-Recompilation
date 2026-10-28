@@ -5,6 +5,7 @@
 #include "Kernel/Stubs/Pad.h"
 #include "ps2_audio_spu2.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <bit>
 #include <chrono>
@@ -6494,6 +6495,439 @@ namespace
         }
     }
 
+    // ---- Pickup truck in place of the player's quad and rider (ATV2_TRUCK) -------------------
+    // The trucks parked at the tracks are static props: geometry\<name>.psg in the track archive
+    // (suv01 on ENV05, truck01-03/suv02 on ENV03/ENV08/FREE06, rustedtruck on ENV02/ENV08, flattruck
+    // on ENV05). The game draws a prop with a 0x1D0-byte mesh node (ctor 0x1B10D0; load by name
+    // 0x1B1430 = vtable(+0x168)+0xA4 -> 0x1B2D40, which shares a mesh the track already loaded).
+    // A mesh node is a transform node (local matrix +0x80, world +0xC0, transform parent +0x140,
+    // children +0x144/+0x148, name +0x38, +0x150 bit 0 = world matrix valid; 0x164A30 updates it)
+    // with its GameObject at +8 (scene children +0x18/+0x14, traversal flags +0x20, bit 8 = drawn).
+    // Lit meshes (props, quads, riders: load argument 4 = 1) are drawn through the player's spatial
+    // grid, not the scene walk: 0x168080 registers a mesh (settings +0x4C8, mode 1 for props, 2 for
+    // quads), 0x168120 moves it, which 0x1E7600 does every frame for the quad and rider meshes.
+    // The race setup 0x1F6C60 builds each racer's vehicle (0x1F9690; quad model wrapper at +0x93C,
+    // wrapper[1] = quad mesh) and rider (0x1F9280; a model wrapper, [1] = rider mesh, first-person arms
+    // at +0x4DC/+0x4E0), then links them in 0x1E4C90 (rider at vehicle +0x884). After that link the
+    // truck mesh is loaded lit and registered in the grid like the quad, as a scene child of the
+    // vehicle (freed with it, 0x1E1F10). It follows the quad's "body" node, and 0x1E7600 moves it in
+    // the grid; the mesh draw (0x1B2390, and its GameObject entry 0x1B25E0) skips the quad and rider
+    // meshes. Physics, collision, sounds, dust and the AI stay the quad's; the truck's wheels don't turn.
+    // ATV2_TRUCK=1: local players; ATV2_TRUCK=all: every racer. ATV2_TRUCK_MODEL=a,b,...: props to try
+    // in order; ATV2_TRUCK_SCALE (default 0.5: full size puts the chase camera inside the truck),
+    // ATV2_TRUCK_YAW (degrees), ATV2_TRUCK_OFFSET=x,y,z (feet, quad body space); ATV2_TRUCK_LIT=0
+    // draws it unlit through the vehicle's scene children instead; ATV2_TRUCK_SHOW_QUAD=1 keeps the
+    // quad and rider; ATV2_TRUCK_DUMP=1 logs the scene nodes and draw calls.
+    struct TruckOptions
+    {
+        bool everyRacer = false;
+        bool showQuad = false;
+        bool dump = false;
+        bool lit = true;
+        std::vector<std::string> models{"suv01", "truck02", "truck03", "truck01", "suv02", "rustedtruck", "flattruck"};
+        float scale = 0.5f;
+        float yawDeg = 0.0f;
+        float offset[3] = {0.0f, 0.0f, 0.0f};
+    };
+    struct TruckRacer
+    {
+        uint32_t vehicle = 0u;
+        uint32_t truck = 0u; // truck mesh; 0 = none (no truck prop on this track)
+        uint32_t body = 0u;  // quad "body" node the truck follows
+        bool inGrid = false;
+        std::vector<uint32_t> hidden; // quad and rider meshes whose draw is skipped
+    };
+    TruckOptions g_truck;
+    std::vector<TruckRacer> g_truckRacers;
+    PS2Runtime::RecompiledFunction g_raceSetup1f6c60Orig = nullptr;
+    PS2Runtime::RecompiledFunction g_linkRider1e4c90Orig = nullptr;
+    PS2Runtime::RecompiledFunction g_moveModels1e7600Orig = nullptr;
+    PS2Runtime::RecompiledFunction g_vehicleDtor1e1f10Orig = nullptr;
+    PS2Runtime::RecompiledFunction g_meshDraw1b2390Orig = nullptr;
+
+    bool truckPtr(uint32_t p) { return p >= 0x00100000u && p < 0x02000000u && (p & 3u) == 0u; }
+
+    std::string truckGuestString(uint8_t *rdram, uint32_t addr)
+    {
+        std::string s;
+        for (uint32_t i = 0; i < 63u; ++i)
+        {
+            const char c = static_cast<char>(FAST_READ8(addr + i));
+            if (c == 0)
+                break;
+            s += (c >= 32 && c < 127) ? c : '?';
+        }
+        return s;
+    }
+
+    // Guest call whose second argument is a string: the string goes below the caller's stack and the
+    // callee runs on a stack below it.
+    uint32_t truckCallWithName(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t fnAddr,
+                               uint32_t a0, const std::string &name, uint32_t a2, uint32_t a3)
+    {
+        R5900Context frame = *ctx;
+        const uint32_t buf = (getRegU32(ctx, 29) - 0x80u) & ~0xFu;
+        const size_t len = std::min<size_t>(name.size(), 0x3Fu);
+        for (size_t i = 0; i < len; ++i)
+            WRITE8(buf + static_cast<uint32_t>(i), static_cast<uint8_t>(name[i]));
+        WRITE8(buf + static_cast<uint32_t>(len), 0u);
+        SET_GPR_U32(&frame, 29, buf - 0x10u);
+        return callRecompiled4(runtime, rdram, &frame, fnAddr, a0, buf, a2, a3);
+    }
+
+    void truckDumpObjects(uint8_t *rdram, uint32_t obj, int depth)
+    {
+        uint32_t child = FAST_READ32(obj + 0x18u);
+        for (int n = 0; truckPtr(child) && n < 48; ++n, child = FAST_READ32(child + 0x14u))
+        {
+            std::cerr << "[ATV2:TRUCK]   " << std::string(static_cast<size_t>(depth) * 2u, ' ') << "obj 0x" << std::hex
+                      << child << " vt=0x" << FAST_READ32(child + 8u) << " own=0x" << FAST_READ32(child + 0x20u) << " sub=0x"
+                      << FAST_READ32(child + 0x24u) << " b29=0x" << static_cast<uint32_t>(FAST_READ8(child + 0x29u));
+            const uint32_t vt168 = FAST_READ32(child - 8u + 0x168u); // transform nodes keep their GameObject at +8
+            if (vt168 >= 0x00440000u && vt168 < 0x00470000u)
+                std::cerr << " node '" << truckGuestString(rdram, child - 8u + 0x38u) << "' vt168=0x" << vt168
+                          << " b150=0x" << static_cast<uint32_t>(FAST_READ8(child - 8u + 0x150u)) << " b151=0x"
+                          << static_cast<uint32_t>(FAST_READ8(child - 8u + 0x151u)) << " tparent=0x"
+                          << FAST_READ32(child - 8u + 0x140u);
+            std::cerr << std::dec << std::endl;
+            if (depth < 4)
+                truckDumpObjects(rdram, child, depth + 1);
+        }
+    }
+
+    void truckDumpTransforms(uint8_t *rdram, uint32_t node, int depth)
+    {
+        for (int n = 0; truckPtr(node) && n < 64; ++n, node = FAST_READ32(node + 0x148u))
+        {
+            std::cerr << "[ATV2:TRUCK]   " << std::string(static_cast<size_t>(depth) * 2u, ' ') << "node 0x" << std::hex
+                      << node << " '" << truckGuestString(rdram, node + 0x38u) << "' b150=0x"
+                      << static_cast<uint32_t>(FAST_READ8(node + 0x150u)) << " b151=0x"
+                      << static_cast<uint32_t>(FAST_READ8(node + 0x151u)) << " own=0x" << FAST_READ32(node + 8u + 0x20u)
+                      << " objparent=0x" << FAST_READ32(node + 8u + 0x1Cu) << " vt168=0x" << FAST_READ32(node + 0x168u)
+                      << " pos=" << std::bit_cast<float>(FAST_READ32(node + 0xB0u)) << ","
+                      << std::bit_cast<float>(FAST_READ32(node + 0xB4u)) << "," << std::bit_cast<float>(FAST_READ32(node + 0xB8u))
+                      << std::dec << std::endl;
+            if (depth < 6)
+                truckDumpTransforms(rdram, FAST_READ32(node + 0x144u), depth + 1);
+        }
+    }
+
+    void truckDumpRacer(uint8_t *rdram, uint32_t vehicle, uint32_t rider)
+    {
+        const uint32_t wrapper = FAST_READ32(vehicle + 0x93Cu);
+        std::cerr << "[ATV2:TRUCK] vehicle 0x" << std::hex << vehicle << " vt=0x" << FAST_READ32(vehicle + 8u) << " own=0x"
+                  << FAST_READ32(vehicle + 0x20u) << " sub=0x" << FAST_READ32(vehicle + 0x24u) << " objparent=0x"
+                  << FAST_READ32(vehicle + 0x1Cu) << " flags=0x" << FAST_READ32(FAST_READ32(vehicle + 0x30u) + 8u) << " wrapper=0x"
+                  << wrapper << " (node 0x" << (truckPtr(wrapper) ? FAST_READ32(wrapper) : 0u) << ", mesh 0x"
+                  << (truckPtr(wrapper) ? FAST_READ32(wrapper + 4u) : 0u) << ") +1a4=0x" << FAST_READ32(vehicle + 0x1A4u)
+                  << " rider=0x" << rider << " (node 0x" << (truckPtr(rider) ? FAST_READ32(rider) : 0u) << ", mesh 0x"
+                  << (truckPtr(rider) ? FAST_READ32(rider + 4u) : 0u) << ", arms 0x"
+                  << (truckPtr(rider) ? FAST_READ32(rider + 0x4DCu) : 0u) << "/0x"
+                  << (truckPtr(rider) ? FAST_READ32(rider + 0x4E0u) : 0u) << ")" << std::dec << std::endl;
+        std::cerr << "[ATV2:TRUCK]  vehicle objects:" << std::endl;
+        truckDumpObjects(rdram, vehicle, 0);
+        if (truckPtr(rider) && truckPtr(FAST_READ32(rider)))
+        {
+            std::cerr << "[ATV2:TRUCK]  rider objects:" << std::endl;
+            truckDumpObjects(rdram, FAST_READ32(rider), 0);
+        }
+        if (truckPtr(wrapper) && truckPtr(FAST_READ32(wrapper + 4u)))
+        {
+            std::cerr << "[ATV2:TRUCK]  quad transforms:" << std::endl;
+            truckDumpTransforms(rdram, FAST_READ32(wrapper + 4u), 0);
+        }
+    }
+
+    TruckRacer *truckRacerOf(uint32_t vehicle)
+    {
+        for (TruckRacer &r : g_truckRacers)
+        {
+            if (r.vehicle == vehicle)
+                return &r;
+        }
+        return nullptr;
+    }
+
+    // Local matrix = (scale, yaw, offset) x the body's world matrix (row vectors: rows 0-2 axes, row 3
+    // position). The truck is no transform child of the body: the quad frees its node tree with the
+    // quad mesh, before the vehicle frees its scene children (the truck among them).
+    void truckFollowBody(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, const TruckRacer &r)
+    {
+        callRecompiled4(runtime, rdram, ctx, 0x164A30u, r.body, 0u, 0u, 0u);
+        const float yaw = g_truck.yawDeg * 3.14159265f / 180.0f;
+        const float c = std::cos(yaw) * g_truck.scale, s = std::sin(yaw) * g_truck.scale;
+        const float local[16] = {c, 0.0f, -s, 0.0f, 0.0f, g_truck.scale, 0.0f, 0.0f, s, 0.0f, c, 0.0f,
+                                 g_truck.offset[0], g_truck.offset[1], g_truck.offset[2], 1.0f};
+        float body[16];
+        for (uint32_t i = 0; i < 16u; ++i)
+            body[i] = std::bit_cast<float>(READ32(r.body + 0xC0u + i * 4u));
+        for (uint32_t row = 0; row < 4u; ++row)
+        {
+            for (uint32_t col = 0; col < 4u; ++col)
+            {
+                float v = 0.0f;
+                for (uint32_t k = 0; k < 4u; ++k)
+                    v += local[row * 4u + k] * body[k * 4u + col];
+                WRITE32(r.truck + 0x80u + (row * 4u + col) * 4u, std::bit_cast<uint32_t>(v));
+            }
+        }
+        WRITE8(r.truck + 0x150u, static_cast<uint8_t>(READ8(r.truck + 0x150u) & 0xFEu)); // world = local
+    }
+
+    void truckApply(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vehicle, uint32_t rider)
+    {
+        if (!truckPtr(vehicle) || truckRacerOf(vehicle) != nullptr)
+            return;
+        const uint32_t owner = READ32(vehicle + 0x30u);
+        const uint32_t ownerFlags = truckPtr(owner) ? READ32(owner + 8u) : 0u;
+        if (!g_truck.everyRacer && (ownerFlags & 4u) == 0u) // local humans get 0x80004 (0x1F9690)
+            return;
+        g_truckRacers.push_back(TruckRacer{vehicle});
+        if (g_truck.dump)
+            truckDumpRacer(rdram, vehicle, rider);
+
+        const uint32_t wrapper = READ32(vehicle + 0x93Cu);
+        const uint32_t quadMesh = truckPtr(wrapper) ? READ32(wrapper + 4u) : 0u;
+        if (!truckPtr(quadMesh))
+        {
+            std::cerr << "[ATV2:TRUCK] vehicle 0x" << std::hex << vehicle << " has no quad model" << std::dec << std::endl;
+            return;
+        }
+        uint32_t body = truckCallWithName(runtime, rdram, ctx, 0x1668B0u, quadMesh, "body", 0u, 0u);
+        if (!truckPtr(body))
+            body = quadMesh;
+
+        uint32_t truck = 0u;
+        std::string used;
+        for (const std::string &name : g_truck.models)
+        {
+            const uint32_t mesh = callRecompiled4(runtime, rdram, ctx, 0x103E30u, 0x1D0u, 0x00420560u, 0x8Bu, 0u);
+            if (!truckPtr(mesh))
+                break;
+            callRecompiled4(runtime, rdram, ctx, 0x1B10D0u, mesh, 1u, 0u, 0u);
+            // Last argument 1 = lit (+0x173 bit 0), as the track loads its props (0x242FF0).
+            // A failed load deletes the node (0x1B2D40).
+            if (truckCallWithName(runtime, rdram, ctx, 0x1B1430u, mesh, name, 0u, g_truck.lit ? 1u : 0u) != 0u)
+            {
+                truck = mesh;
+                used = name;
+                break;
+            }
+        }
+        if (truck == 0u)
+        {
+            std::cerr << "[ATV2:TRUCK] this track has none of the truck props; racing the quad" << std::endl;
+            return;
+        }
+
+        // +0x173 as the quad and rider have it when lit (0x09; the lit bit reads back clear after the load,
+        // though 0x1B1840 built a lit draw packet); unlit, a dynamic object like the tag ball (0x16F780).
+        if (g_truck.lit)
+            WRITE8(truck + 0x173u, static_cast<uint8_t>(READ8(truck + 0x173u) | 0x09u));
+        else
+            WRITE8(truck + 0x173u, static_cast<uint8_t>(READ8(truck + 0x173u) & 0xF7u));
+        WRITE8(truck + 0x151u, static_cast<uint8_t>(READ8(truck + 0x151u) | 1u));
+        TruckRacer &racer = g_truckRacers.back();
+        racer.truck = truck;
+        racer.body = body;
+        truckFollowBody(runtime, rdram, ctx, racer);
+        // A lit mesh goes in the player's grid like the quad (0x1E1FD0; vehicle +0x964 = the player's
+        // settings) and is a scene child of the vehicle without traversal flags, so it goes with it.
+        // Unlit, the vehicle draws it as a scene child (0x1D8130 -> 0x106370).
+        const uint32_t playerSettings = READ32(vehicle + 0x964u);
+        const uint32_t grids = truckPtr(playerSettings) ? READ32(playerSettings + 0x4C8u) : 0u;
+        const uint32_t grid = truckPtr(grids) ? READ32(grids) : 0u;
+        racer.inGrid = g_truck.lit && truckPtr(grid);
+        if (racer.inGrid)
+            callRecompiled4(runtime, rdram, ctx, 0x168080u, truck, grid, 2u, 0u);
+        callRecompiled4(runtime, rdram, ctx, 0x105FA0u, vehicle, truck + 8u, racer.inGrid ? 0u : 0xFFFFFFFFu, 0u);
+
+        if (!g_truck.showQuad)
+        {
+            racer.hidden.push_back(quadMesh);
+            for (uint32_t part : {rider, truckPtr(rider) ? READ32(rider + 0x4DCu) : 0u,
+                                  truckPtr(rider) ? READ32(rider + 0x4E0u) : 0u})
+            {
+                if (truckPtr(part) && truckPtr(READ32(part + 4u)))
+                    racer.hidden.push_back(READ32(part + 4u));
+            }
+        }
+        std::cerr << "[ATV2:TRUCK] vehicle 0x" << std::hex << vehicle << " drives the '" << used << "' prop (mesh 0x"
+                  << truck << " on body 0x" << body << ", ";
+        if (racer.inGrid)
+            std::cerr << "lit, grid 0x" << grid;
+        else
+            std::cerr << "unlit, scene child";
+        std::cerr << "), " << std::dec << (g_truck.showQuad ? "quad and rider kept" : "quad and rider hidden") << std::endl;
+    }
+
+    void raceSetup1f6c60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Meshes of an earlier race are gone; their addresses get reused.
+        g_truckRacers.clear();
+        g_raceSetup1f6c60Orig(rdram, ctx, runtime);
+    }
+
+    void linkRider1e4c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t vehicle = getRegU32(ctx, 4);
+        const uint32_t rider = getRegU32(ctx, 5);
+        const uint32_t returnPc = getRegU32(ctx, 31);
+        {
+            HoldEeTimeslices hold;
+            g_linkRider1e4c90Orig(rdram, ctx, runtime);
+            for (uint32_t guard = 0; ctx->pc != returnPc; ++guard)
+            {
+                if (ctx->pc == 0u || guard >= 1000000u || runtime->isStopRequested() || !runtime->hasFunction(ctx->pc))
+                {
+                    std::cerr << "[ATV2:TRUCK] rider link stopped at pc=0x" << std::hex << ctx->pc << std::dec
+                              << "; no truck" << std::endl;
+                    return;
+                }
+                runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+            }
+        }
+        truckApply(runtime, rdram, ctx, vehicle, rider);
+    }
+
+    // Per frame: moves the quad mesh and the rider mesh in the grid (0x168120); move the truck too.
+    void moveModels1e7600(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t vehicle = getRegU32(ctx, 4);
+        const TruckRacer *racer = truckRacerOf(vehicle);
+        if (racer == nullptr || racer->truck == 0u)
+        {
+            g_moveModels1e7600Orig(rdram, ctx, runtime);
+            return;
+        }
+        const uint32_t returnPc = getRegU32(ctx, 31);
+        HoldEeTimeslices hold;
+        g_moveModels1e7600Orig(rdram, ctx, runtime);
+        for (uint32_t guard = 0; ctx->pc != returnPc; ++guard)
+        {
+            if (ctx->pc == 0u || guard >= 1000000u || runtime->isStopRequested() || !runtime->hasFunction(ctx->pc))
+                return;
+            runtime->lookupFunction(ctx->pc)(rdram, ctx, runtime);
+        }
+        truckFollowBody(runtime, rdram, ctx, *racer);
+        if (racer->inGrid)
+            callRecompiled4(runtime, rdram, ctx, 0x168120u, racer->truck, 0u, 0u, 0u);
+    }
+
+    // The vehicle's destructor frees the truck with its other scene children.
+    void vehicleDtor1e1f10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t vehicle = getRegU32(ctx, 4);
+        const size_t before = g_truckRacers.size();
+        g_truckRacers.erase(std::remove_if(g_truckRacers.begin(), g_truckRacers.end(),
+                                           [vehicle](const TruckRacer &r) { return r.vehicle == vehicle; }),
+                            g_truckRacers.end());
+        if (g_truck.dump && g_truckRacers.size() != before)
+            std::cerr << "[ATV2:TRUCK] vehicle 0x" << std::hex << vehicle << std::dec << " freed" << std::endl;
+        g_vehicleDtor1e1f10Orig(rdram, ctx, runtime);
+    }
+
+    void truckMeshDraw1b2390(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t mesh = getRegU32(ctx, 4);
+        for (const TruckRacer &r : g_truckRacers)
+        {
+            const bool hidden = std::find(r.hidden.begin(), r.hidden.end(), mesh) != r.hidden.end();
+            if (g_truck.dump && (hidden || mesh == r.truck))
+            {
+                static int s_logged = 0;
+                if (s_logged++ < 40)
+                    std::cerr << "[ATV2:TRUCK] draw " << (hidden ? "hidden" : "truck") << " mesh 0x" << std::hex << mesh
+                              << " ra=0x" << getRegU32(ctx, 31) << " b151=0x"
+                              << static_cast<uint32_t>(READ8(mesh + 0x151u)) << " b173=0x"
+                              << static_cast<uint32_t>(READ8(mesh + 0x173u)) << std::dec << std::endl;
+            }
+            if (hidden)
+            {
+                // Skip the mesh but keep drawing its scene children, as the end of 0x1B2390 does.
+                SET_GPR_U32(ctx, 4, mesh + 8u);
+                ctx->pc = 0x00106370u;
+                runtime->lookupFunction(0x00106370u)(rdram, ctx, runtime);
+                return;
+            }
+            if (mesh == r.truck)
+            {
+                truckFollowBody(runtime, rdram, ctx, r);
+                break;
+            }
+        }
+        g_meshDraw1b2390Orig(rdram, ctx, runtime);
+    }
+
+    // GameObject draw entry: j 0x1B2390 with a0 -= 8, a jump inside the generated function.
+    void truckMeshDrawObj1b25e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_U32(ctx, 4, getRegU32(ctx, 4) - 8u);
+        ctx->pc = 0x001B2390u;
+        truckMeshDraw1b2390(rdram, ctx, runtime);
+    }
+
+    void registerTruck(PS2Runtime &runtime)
+    {
+        const char *env = std::getenv("ATV2_TRUCK");
+        if (env == nullptr || env[0] == '\0' || env[0] == '0')
+            return;
+        g_truck.everyRacer = std::strcmp(env, "all") == 0;
+        g_truck.showQuad = std::getenv("ATV2_TRUCK_SHOW_QUAD") != nullptr;
+        g_truck.dump = std::getenv("ATV2_TRUCK_DUMP") != nullptr;
+        if (const char *s = std::getenv("ATV2_TRUCK_LIT"))
+            g_truck.lit = s[0] != '0';
+        if (const char *models = std::getenv("ATV2_TRUCK_MODEL"))
+        {
+            g_truck.models.clear();
+            std::string list = models;
+            for (size_t start = 0; start <= list.size();)
+            {
+                const size_t comma = std::min(list.find(',', start), list.size());
+                if (comma > start)
+                    g_truck.models.push_back(list.substr(start, comma - start));
+                start = comma + 1;
+            }
+        }
+        if (const char *s = std::getenv("ATV2_TRUCK_SCALE"))
+            g_truck.scale = std::strtof(s, nullptr);
+        if (const char *s = std::getenv("ATV2_TRUCK_YAW"))
+            g_truck.yawDeg = std::strtof(s, nullptr);
+        if (const char *s = std::getenv("ATV2_TRUCK_OFFSET"))
+        {
+            char *end = const_cast<char *>(s);
+            for (float &v : g_truck.offset)
+            {
+                v = std::strtof(end, &end);
+                if (*end == ',')
+                    ++end;
+            }
+        }
+        g_raceSetup1f6c60Orig = runtime.lookupFunction(0x001F6C60u);
+        g_linkRider1e4c90Orig = runtime.lookupFunction(0x001E4C90u);
+        g_moveModels1e7600Orig = runtime.lookupFunction(0x001E7600u);
+        g_vehicleDtor1e1f10Orig = runtime.lookupFunction(0x001E1F10u);
+        g_meshDraw1b2390Orig = runtime.lookupFunction(0x001B2390u);
+        if (!g_raceSetup1f6c60Orig || !g_linkRider1e4c90Orig || !g_moveModels1e7600Orig || !g_vehicleDtor1e1f10Orig ||
+            !g_meshDraw1b2390Orig)
+        {
+            std::cerr << "[ATV2:TRUCK] no generated function at 0x1F6C60, 0x1E4C90, 0x1E7600, 0x1E1F10 or 0x1B2390; "
+                         "no truck"
+                      << std::endl;
+            return;
+        }
+        runtime.replaceFunction(0x001F6C60u, &raceSetup1f6c60);
+        runtime.replaceFunction(0x001E4C90u, &linkRider1e4c90);
+        runtime.replaceFunction(0x001E7600u, &moveModels1e7600);
+        runtime.replaceFunction(0x001E1F10u, &vehicleDtor1e1f10);
+        runtime.replaceFunction(0x001B2390u, &truckMeshDraw1b2390);
+        runtime.replaceFunction(0x001B25E0u, &truckMeshDrawObj1b25e0);
+        std::cerr << "[ATV2:TRUCK] on (" << (g_truck.everyRacer ? "every racer" : "local players")
+                  << (g_truck.lit ? ", lit" : ", unlit") << ", scale "
+                  << g_truck.scale << ", yaw " << g_truck.yawDeg << ", offset " << g_truck.offset[0] << ","
+                  << g_truck.offset[1] << "," << g_truck.offset[2] << ")" << std::endl;
+    }
+
     void applyScus97211Overrides(PS2Runtime &runtime)
     {
         runtime.replaceFunction(0x0014F610u, &resourceInit14f610);
@@ -6900,6 +7334,7 @@ namespace
         registerPadHle(runtime);
         registerAtv2NetworkHle(runtime);
         registerSuzukiDz400(runtime);
+        registerTruck(runtime);
         atvInstallCrashTrace();
     }
 }
