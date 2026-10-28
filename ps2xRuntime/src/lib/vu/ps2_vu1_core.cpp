@@ -274,6 +274,11 @@ namespace
     {
         static uint32_t s_reports = 0u;
         static uint32_t s_ok = 0u;
+        // Mismatched runs, and those of them where neither side ended its program
+        // within 65,536 cycles (the MSCAL budget): the fast path stops after whole
+        // native blocks there, the interpreter per pair, so they differ by design.
+        static uint32_t s_mismatched = 0u;
+        static uint32_t s_budgetCut = 0u;
         std::string problems;
         char buf[256];
         const size_t pairs = std::min(recomp.size(), interp.size());
@@ -352,11 +357,15 @@ namespace
         {
             ++s_ok;
             if (s_ok <= 3u || (s_ok % 1000u) == 0u)
-                std::fprintf(stderr, "[vu-verify] run#%u ok pairs=%zu kicks=%zu (ok=%u recompRuns=%llu)\n",
-                             run, interp.size(), kicksB.size(), s_ok,
-                             static_cast<unsigned long long>(g_vuRecompRuns));
+                std::fprintf(stderr,
+                             "[vu-verify] run#%u ok pairs=%zu kicks=%zu (ok=%u recompRuns=%llu mismatched=%u budgetCut=%u)\n",
+                             run, interp.size(), kicksB.size(), s_ok, static_cast<unsigned long long>(g_vuRecompRuns),
+                             s_mismatched, s_budgetCut);
             return;
         }
+        ++s_mismatched;
+        if (!stateA.ebit && !stateB.ebit && std::min(cycleA, cycleB) >= 65536u)
+            ++s_budgetCut;
         if (s_reports++ < 12u)
             std::fprintf(stderr, "[vu-verify] run#%u MISMATCH start=%04x%s\n", run,
                          interp.empty() ? 0u : interp.front().pc, problems.c_str());
@@ -483,18 +492,17 @@ namespace
                                _mm256_set1_epi64x(static_cast<long long>(cycle)));
     }
 
-    // Four-lane vuNormalizeOperand.
+    // Four-lane vuNormalizeOperand, on the magnitude bits: below the smallest
+    // normal (exponent 0) -> 0, above the largest finite (exponent 0xFF) -> max,
+    // then the sign back.
     inline __m128 vuNormalize4(__m128 value)
     {
         const __m128i bits = _mm_castps_si128(value);
-        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
-        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
-        const __m128i zeroExp = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
-        const __m128i maxExp = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
-        __m128i out = _mm_andnot_si128(_mm_or_si128(zeroExp, maxExp), bits);
-        out = _mm_or_si128(out, _mm_and_si128(zeroExp, sign));
-        out = _mm_or_si128(out, _mm_and_si128(maxExp, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
-        return _mm_castsi128_ps(out);
+        const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
+        const __m128i magnitude = _mm_and_si128(bits, absMask);
+        const __m128i clamped = _mm_min_epi32(magnitude, _mm_set1_epi32(0x7F7FFFFF));
+        const __m128i denormal = _mm_cmpgt_epi32(_mm_set1_epi32(0x00800000), magnitude);
+        return _mm_castsi128_ps(_mm_or_si128(_mm_andnot_si128(denormal, clamped), _mm_andnot_si128(absMask, bits)));
     }
 
     inline __m128i vuExponent4(__m128 value)
@@ -2463,6 +2471,17 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
     };
     static DecodeShadow s_shadows[2];
     DecodeShadow &shadow = s_shadows[m_unit == Unit::VU1 ? 1 : 0];
+    // Decodes by code words (per unit): uploads alternate between the same few
+    // programs, so a changed pair was usually decoded before.
+    struct DecodeMemo
+    {
+        uint64_t words = 0;
+        bool valid = false;
+        DecodedInstructionPair pair{};
+    };
+    constexpr uint32_t kMemoBits = 12u;
+    static DecodeMemo s_memo[2][1u << kMemoBits];
+    DecodeMemo *const memo = s_memo[m_unit == Unit::VU1 ? 1 : 0];
     const bool incremental = m_decodedCodeCacheValid && shadow.owner == this && shadow.code == vuCode &&
                              shadow.size == codeSize && shadow.generation == m_cachedCodeGeneration &&
                              m_cachedVuCode == vuCode && m_cachedCodeSize == codeSize;
@@ -2473,7 +2492,16 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
         if (incremental && std::memcmp(bytes, vuCode + i * 8u, 8u) == 0)
             continue;
         std::memcpy(bytes, vuCode + i * 8u, 8u);
-        m_decodedCodeCache[i] = decodeInstructionPair(vuCode, i * 8u);
+        uint64_t words = 0;
+        std::memcpy(&words, bytes, 8u);
+        DecodeMemo &entry = memo[(words * 0x9E3779B97F4A7C15ull) >> (64u - kMemoBits)];
+        if (!entry.valid || entry.words != words)
+        {
+            entry.words = words;
+            entry.valid = true;
+            entry.pair = decodeInstructionPair(vuCode, i * 8u);
+        }
+        m_decodedCodeCache[i] = entry.pair;
     }
     shadow.owner = this;
     shadow.code = vuCode;
@@ -2937,11 +2965,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
     // The fast loop commits VF/VI/ACC at issue (and may skip flag entries);
     // the interpreter would still be draining those here.
-    advanceTo(fastDrainCycle);
+    const uint64_t drainStart = m_cycle;
+    const bool drainKick = m_xgkick.active;
     // The fast loop requires empty pipelines on entry, so with ATV_VU_FAST every
     // run drains. Otherwise writes stay queued across a budget-limited run.
-    if (programEnded || s_vuFast)
-        flushPipelines();
+    // After a fast-loop run the drain skips the idle cycles (VU1Native::drain;
+    // ATV_VU_STEP_DRAIN=1 steps every cycle).
+    static const bool s_stepDrain = std::getenv("ATV_VU_STEP_DRAIN") != nullptr;
+    if (s_stepDrain || !recompRan || !(programEnded || s_vuFast) || !VU1Native::drain(*this, fastDrainCycle))
+    {
+        advanceTo(fastDrainCycle);
+        if (programEnded || s_vuFast)
+            flushPipelines();
+    }
+    if (VU1Native::s_counts && recompRan)
+        VU1Native::count(VU1Native::s_drainCounts, drainKick, m_cycle - drainStart);
     if (m_unit == Unit::VU1)
         g_vu1CycleTotal += m_cycle - (budgetEnd - maxCycles);
 
