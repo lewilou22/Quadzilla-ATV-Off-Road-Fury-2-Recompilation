@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "gs_texture_replace.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -893,6 +894,8 @@ namespace
         bool fst = false, linear = false;
         bool clut16 = false, fourBit = false, csm1Eight = false;
         uint32_t clutBase = 0, clutMask = 0;
+        const GSTexReplace::Image *replacement = nullptr; // ATV2_TEXTURE_PACK image for this texture
+        GSTexReplace::Sampler hd;                         // set up per primitive when replacement is
     };
 
     void setupTexturePipe(const GSDrawState &state, const uint8_t *vram, GSMem::TexturePageCache &cache,
@@ -951,6 +954,7 @@ namespace
         t.clutMask = t.clut16 ? 0x1FFu : 0x0FFu;
         t.fourBit = isFourBitIndexedPsm(tex.psm);
         t.csm1Eight = !t.clut16 && tex.csm == 0u && isEightBitIndexedPsm(tex.psm);
+        t.replacement = GSTexReplace::Active() ? GSTexReplace::Current() : nullptr;
         t.ready = true;
     }
 
@@ -999,6 +1003,8 @@ namespace
             texUf = s * invQ * static_cast<float>(t.texW);
             texVf = tc * invQ * static_cast<float>(t.texH);
         }
+        if (t.hd.texels)
+            return GSTexReplace::Sample(t.hd, texUf, texVf);
 
         if (!t.linear)
         {
@@ -1402,6 +1408,8 @@ void GSCpuBackend::DrawBand(uint32_t band)
     // count. Do not reuse its last row-ownership proof across batches.
     t_ownedBandRow = -1;
     const uint64_t start = m_profileBands ? bandClockNs() : 0;
+    if (GSTexReplace::Active())
+        GSTexReplace::BeginBand(this);
     auto &cache = m_bandPipeline ? *m_bandCaches[band] : band == 0u ? m_texturePageCache : *m_bandCaches[band - 1u];
     const bool frozen = !m_bandInFlightSegments.empty();
     const auto useSegment = [&](size_t segment) {
@@ -1423,11 +1431,15 @@ void GSCpuBackend::DrawBand(uint32_t band)
         }
         while (nextClut < m_bandInFlightClutChanges.size() && m_bandInFlightClutChanges[nextClut].first == index)
             t_drawClut = m_bandInFlightClutChanges[nextClut++].second.data();
+        if (GSTexReplace::Active())
+            GSTexReplace::SetBandDraw(static_cast<uint32_t>(index));
         if (bandMayDrawPrimitive(batch))
             DrawPrimitive(batch);
         ++index;
     }
     t_drawClut = nullptr;
+    if (GSTexReplace::Active())
+        GSTexReplace::EndBand();
     if (nextFlush < m_bandInFlightTextureFlushes.size())
         cache.Invalidate(); // TEXFLUSH after the final queued primitive.
     if (frozen)
@@ -1467,6 +1479,8 @@ void GSCpuBackend::FlushBands(BandFlushReason reason) const
         return;
     const uint64_t start = m_profileBands ? bandClockNs() : 0;
     m_bandInFlight.swap(m_bandPending);
+    if (GSTexReplace::Active())
+        GSTexReplace::OnBandFlush(this);
     m_bandInFlightTextureFlushes.swap(m_bandTextureFlushes);
     m_bandPending.clear();
     m_bandTextureFlushes.clear();
@@ -1580,6 +1594,8 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
             m_bandClutChanges.clear();
         }
         m_bandPending.push_back(batch);
+        if (GSTexReplace::Active())
+            GSTexReplace::OnQueued(this);
         return;
     }
     const uint32_t fbw = ctx.frame.fbw >= 1u ? ctx.frame.fbw : 10u;
@@ -1649,6 +1665,8 @@ void GSCpuBackend::QueueBandedPrimitive(const GSPrimitiveBatch &batch)
         m_bandClutChanges.clear();
     }
     m_bandPending.push_back(batch);
+    if (GSTexReplace::Active())
+        GSTexReplace::OnQueued(this);
     m_lastBandKey = key;
     m_lastBandKeyValid = true;
     const auto recordWrite = [&](const BandWrite &range)
@@ -1842,6 +1860,11 @@ void GSCpuBackend::ResetUnlocked()
     m_texturePageCache.Invalidate();
     for (auto &cache : m_bandCaches)
         cache->Invalidate();
+    if (GSTexReplace::Active())
+    {
+        GSTexReplace::NoteVramWrite(this, 0u, UINT32_MAX);
+        GSTexReplace::NoteClutLoad(this);
+    }
     m_transfer = {};
     m_transfer.direction = 3u;
     m_uploadRangeValid = false;
@@ -1972,6 +1995,8 @@ void GSCpuBackend::SubmitUnlocked(const GSPrimitiveBatch &batch)
     }
     if (!m_vram || batch.vertexCount == 0u)
         return;
+    if (GSTexReplace::Active())
+        GSTexReplace::OnSubmit(this, batch, m_vram, m_clut.data());
     if (m_bandCount > 1u)
         QueueBandedPrimitive(batch);
     else
@@ -2077,6 +2102,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
     if (!sixteenBit && !thirtyTwoBit)
         return;
+    if (GSTexReplace::Active())
+        GSTexReplace::NoteClutLoad(this);
 
     const uint32_t entryCount = fourBit ? 16u : 256u;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
@@ -3239,6 +3266,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         if (state.prim.tme)
             setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, t_drawClut ? t_drawClut : m_clut.data(), texturePipe);
     }
+    if (texturePipe.replacement)
+        GSTexReplace::Prepare(*texturePipe.replacement, GSTexReplace::PickLevel(*texturePipe.replacement, batch), state, texturePipe.hd);
 
     if (state.prim.tme)
     {
@@ -3902,6 +3931,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
         if (textured)
             setupTexturePipe(state, m_vram, t_bandCache ? *t_bandCache : m_texturePageCache, t_drawClut ? t_drawClut : m_clut.data(), texturePipe);
     }
+    if (texturePipe.replacement)
+        GSTexReplace::Prepare(*texturePipe.replacement, GSTexReplace::PickLevel(*texturePipe.replacement, batch), state, texturePipe.hd);
     const bool gouraud = state.prim.iip;
     // ATV_GS_NO_FOG=1: skip the fog blend (pre-session-54 look).
     static const bool s_noFog = std::getenv("ATV_GS_NO_FOG") != nullptr;
@@ -4305,6 +4336,9 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
         return;
+    if (GSTexReplace::Active())
+        GSTexReplace::NoteVramWrite(this, m_uploadRangeValid ? m_uploadRange.begin : 0u,
+                                    m_uploadRangeValid ? m_uploadRange.end : UINT32_MAX);
 
     const uint32_t dbp = m_transfer.bitbltbuf.dbp;
     const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
@@ -4444,6 +4478,8 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
         m_transferState.direction = 3u;
         return;
     }
+    if (GSTexReplace::Active())
+        GSTexReplace::NoteVramWrite(this, 0u, UINT32_MAX);
 
     for (uint32_t pixel = 0; pixel < total; ++pixel)
     {
@@ -4567,6 +4603,8 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
     FlushBands(BandFlushReason::Clear);
     if (!m_vram)
         return false;
+    if (GSTexReplace::Active())
+        GSTexReplace::NoteTargets(this, context);
 
     const uint32_t x0 = context.scissor.x0;
     const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
