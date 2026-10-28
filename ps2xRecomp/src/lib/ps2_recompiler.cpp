@@ -20,6 +20,7 @@
 #include <optional>
 #include <limits>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <set>
 #include <thread>
@@ -319,13 +320,35 @@ namespace ps2recomp
         // A stub replaces only the function at its own start, but the JAL-target scan hands it all
         // the code up to the next JAL target. A function reached only by tail jumps (`j`) from other
         // code then gets no code at all (atanf behind the sin stub), so such a target starts a
-        // function of its own.
+        // function of its own. So does a function-shaped address that recompiled code builds with
+        // lui + addiu/ori (an alarm handler behind the sceMcWrite stub, a newlib _fwalk callback
+        // behind _realloc_r).
         size_t splitStubsAtExternalJumps(std::vector<Function> &functions, const std::vector<Section> &sections,
+                                         const ElfParser &parser,
                                          const std::function<bool(const Function &)> &isStub)
         {
             std::sort(functions.begin(), functions.end(),
                       [](const Function &a, const Function &b)
                       { return a.start < b.start; });
+
+            // Index of the function whose range holds `address`, or functions.size().
+            auto ownerOf = [&functions](uint32_t address)
+            {
+                auto it = std::upper_bound(functions.begin(), functions.end(), address,
+                                           [](uint32_t value, const Function &f)
+                                           { return value < f.start; });
+                if (it == functions.begin() || address >= std::prev(it)->end)
+                {
+                    return functions.size();
+                }
+                return static_cast<size_t>(std::prev(it) - functions.begin());
+            };
+            auto readCodeWord = [](const Section &section, uint32_t offset)
+            {
+                uint32_t word = 0;
+                std::memcpy(&word, section.data + offset, sizeof(word));
+                return word;
+            };
 
             std::map<size_t, std::set<uint32_t>> splitsByStub;
             for (const Section &section : sections)
@@ -336,29 +359,67 @@ namespace ps2recomp
                 }
                 for (uint32_t offset = 0; offset + 4u <= section.size; offset += 4u)
                 {
-                    uint32_t word = 0;
-                    std::memcpy(&word, section.data + offset, sizeof(word));
-                    if ((word >> 26) != OPCODE_J)
+                    const uint32_t word = readCodeWord(section, offset);
+                    const uint32_t source = section.address + offset;
+                    uint32_t target = 0u;
+                    bool addressTaken = false;
+                    if ((word >> 26) == OPCODE_J)
+                    {
+                        target = decodeAbsoluteJumpTarget(source, word & 0x03FFFFFFu);
+                    }
+                    else if ((word >> 26) == OPCODE_LUI && ((word >> 16) & 31u) != 0u)
+                    {
+                        // The register's first addiu/ori within 8 instructions, unless it is
+                        // overwritten first (anything but a store or a branch that names it).
+                        const uint32_t reg = (word >> 16) & 31u;
+                        for (uint32_t next = offset + 4u; next + 4u <= section.size && next <= offset + 32u; next += 4u)
+                        {
+                            const uint32_t pair = readCodeWord(section, next);
+                            const uint32_t op = pair >> 26;
+                            if ((op == OPCODE_ADDIU || op == OPCODE_ORI) && ((pair >> 21) & 31u) == reg)
+                            {
+                                const uint32_t high = (word & 0xFFFFu) << 16;
+                                target = op == OPCODE_ADDIU ? high + static_cast<uint32_t>(static_cast<int16_t>(pair & 0xFFFFu))
+                                                            : high | (pair & 0xFFFFu);
+                                addressTaken = true;
+                                break;
+                            }
+                            const bool storeOrBranch = (op >= 0x28u && op <= 0x2Fu) || (op >= 0x38u && op <= 0x3Fu) || op == 0x1Fu ||
+                                                       (op >= 0x01u && op <= 0x07u) || (op >= 0x14u && op <= 0x17u);
+                            const uint32_t written = op == OPCODE_SPECIAL ? (pair >> 11) & 31u : (pair >> 16) & 31u;
+                            if (written == reg && !storeOrBranch)
+                            {
+                                break;
+                            }
+                        }
+                        if (!addressTaken || (target & 3u) != 0u)
+                        {
+                            continue;
+                        }
+                    }
+                    else
                     {
                         continue;
                     }
 
-                    const uint32_t source = section.address + offset;
-                    const uint32_t target = decodeAbsoluteJumpTarget(source, word & 0x03FFFFFFu);
-                    auto it = std::upper_bound(functions.begin(), functions.end(), target,
-                                               [](uint32_t value, const Function &f)
-                                               { return value < f.start; });
-                    if (it == functions.begin())
+                    const size_t index = ownerOf(target);
+                    if (index == functions.size() || target == functions[index].start || !isStub(functions[index]) ||
+                        (source >= functions[index].start && source < functions[index].end))
                     {
                         continue;
                     }
-                    --it;
-                    if (target == it->start || target >= it->end || !isStub(*it) ||
-                        (source >= it->start && source < it->end))
+                    if (addressTaken)
                     {
-                        continue;
+                        // A stub's own code never runs, and an address in the middle of real code is
+                        // usually data or a label rather than a callback.
+                        const size_t sourceOwner = ownerOf(source);
+                        if ((sourceOwner != functions.size() && isStub(functions[sourceOwner])) ||
+                            !looksLikeFunctionStart(parser, target))
+                        {
+                            continue;
+                        }
                     }
-                    splitsByStub[static_cast<size_t>(it - functions.begin())].insert(target);
+                    splitsByStub[index].insert(target);
                 }
             }
 
@@ -917,11 +978,11 @@ namespace ps2recomp
             m_sections = m_elfParser->getSections();
             m_relocations = m_elfParser->getRelocations();
             collectCorrectnessCriticalFunctionStarts();
-            if (const size_t split = splitStubsAtExternalJumps(m_functions, m_sections,
+            if (const size_t split = splitStubsAtExternalJumps(m_functions, m_sections, *m_elfParser,
                                                                [this](const Function &function)
                                                                { return isStubFunction(function); }))
             {
-                m_reporter.progress("split " + std::to_string(split) + " tail-jump target(s) out of stub ranges");
+                m_reporter.progress("split " + std::to_string(split) + " tail-jump or address-taken target(s) out of stub ranges");
             }
 
             if (m_functions.empty())

@@ -5842,15 +5842,15 @@ namespace
             static int s_reads = 0;
             // ATV2_PAD_SCRIPT=<read>:<button>,...: test aid, presses each button for 6 port-0 reads
             // starting at that read. Buttons: X O T S U D L R ST SEL L1 R1 L2 R2.
+            static const std::pair<const char *, uint16_t> kButtons[] = {
+                {"X", 0x4000u}, {"O", 0x2000u}, {"T", 0x1000u}, {"S", 0x8000u}, {"U", 0x0010u},
+                {"D", 0x0040u}, {"L", 0x0080u}, {"R", 0x0020u}, {"ST", 0x0008u}, {"SEL", 0x0001u},
+                {"L1", 0x0400u}, {"R1", 0x0800u}, {"L2", 0x0100u}, {"R2", 0x0200u}};
             static const std::vector<std::pair<int, uint16_t>> s_script = []() {
                 std::vector<std::pair<int, uint16_t>> out;
                 const char *s = std::getenv("ATV2_PAD_SCRIPT");
                 if (s == nullptr)
                     return out;
-                static const std::pair<const char *, uint16_t> kButtons[] = {
-                    {"X", 0x4000u}, {"O", 0x2000u}, {"T", 0x1000u}, {"S", 0x8000u}, {"U", 0x0010u},
-                    {"D", 0x0040u}, {"L", 0x0080u}, {"R", 0x0020u}, {"ST", 0x0008u}, {"SEL", 0x0001u},
-                    {"L1", 0x0400u}, {"R1", 0x0800u}, {"L2", 0x0100u}, {"R2", 0x0200u}};
                 std::string all(s);
                 size_t pos = 0;
                 while (pos < all.size())
@@ -5869,7 +5869,85 @@ namespace
                 return out;
             }();
             static int s_scriptReads = 0;
-            if (!s_script.empty() && a0 == 0u)
+            // ATV2_PAD_FILE=<path>: test aid for driving the game while watching the window. Each
+            // time the file's contents change its words are queued: a button name is pressed for 6
+            // port-0 reads and released for 6, +<button> holds it, -<button> lets it go, w<n> waits
+            // n reads. Other words are ignored, so start each write with a new number.
+            struct PadFileStep
+            {
+                char op;
+                uint16_t button;
+                int reads;
+            };
+            static const char *s_padFile = std::getenv("ATV2_PAD_FILE");
+            static std::vector<PadFileStep> s_fileSteps;
+            static size_t s_fileNext = 0;
+            static int s_fileLeft = 0, s_fileReads = 0;
+            static uint16_t s_filePressed = 0, s_fileHeld = 0;
+            static std::string s_fileText;
+            if (s_padFile != nullptr && a0 == 0u)
+            {
+                if ((s_fileReads++ % 10) == 0)
+                {
+                    std::ifstream in(s_padFile, std::ios::binary);
+                    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    if (!text.empty() && text != s_fileText)
+                    {
+                        s_fileText = text;
+                        std::cerr << "[ATV2:PAD] file at read " << s_fileReads << ": " << text << std::endl;
+                        size_t pos = 0;
+                        while (pos < text.size())
+                        {
+                            size_t end = text.find_first_of(" ,\t\r\n", pos);
+                            if (end == std::string::npos)
+                                end = text.size();
+                            std::string word = text.substr(pos, end - pos);
+                            pos = end + 1;
+                            char op = 'p';
+                            if (word.size() > 1 && (word[0] == '+' || word[0] == '-'))
+                            {
+                                op = word[0];
+                                word.erase(0, 1);
+                            }
+                            else if (word.size() > 1 && word[0] == 'w')
+                            {
+                                s_fileSteps.push_back({'w', 0u, std::atoi(word.c_str() + 1)});
+                                continue;
+                            }
+                            for (const auto &b : kButtons)
+                                if (word == b.first)
+                                    s_fileSteps.push_back({op, b.second, 0});
+                        }
+                    }
+                }
+                if (s_fileLeft == 0)
+                {
+                    s_filePressed = 0;
+                    while (s_fileLeft == 0 && s_fileNext < s_fileSteps.size())
+                    {
+                        const PadFileStep &step = s_fileSteps[s_fileNext++];
+                        if (step.op == 'p')
+                        {
+                            s_filePressed = step.button;
+                            s_fileLeft = 12;
+                        }
+                        else if (step.op == '+')
+                            s_fileHeld |= step.button;
+                        else if (step.op == '-')
+                            s_fileHeld &= ~step.button;
+                        else
+                            s_fileLeft = step.reads;
+                    }
+                }
+                const uint16_t held = s_fileHeld | (s_fileLeft > 6 ? s_filePressed : 0u);
+                if (s_fileLeft > 0)
+                    --s_fileLeft;
+                if (held != 0)
+                    ps2_stubs::setPadOverrideState(0xFFFFu & ~held, 0x80u, 0x80u, 0x80u, 0x80u);
+                else
+                    ps2_stubs::clearPadOverrideState();
+            }
+            else if (!s_script.empty() && a0 == 0u)
             {
                 ++s_scriptReads;
                 uint16_t held = 0;
