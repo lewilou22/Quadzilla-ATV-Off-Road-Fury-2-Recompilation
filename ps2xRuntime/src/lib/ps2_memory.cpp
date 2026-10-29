@@ -464,6 +464,13 @@ void PS2Memory::stopGsWorker()
 }
 
 void atvStartHostProfilerForThisThread();
+extern bool g_atvTimelineOn; // gs_frontend.cpp (ATV_TIMELINE)
+void atvTimelineRecord(uint16_t kind, uint8_t phase, uint16_t arg);
+static inline void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg)
+{
+    if (g_atvTimelineOn)
+        atvTimelineRecord(kind, phase, arg);
+}
 void gsFlushWorkerGif(); // gs_frontend.cpp: queue this thread's batched GIF packets
 void gsMarkGifBatchingThread(); // gs_frontend.cpp: this thread batches its GIF packets
 
@@ -482,7 +489,9 @@ void PS2Memory::gsWorkerMain()
         if (m_gsWork.empty() && !m_gsWorkerStop)
         {
             const auto idleStart = std::chrono::steady_clock::now();
+            atvTimeline(11u, 0u, 0u);
             m_gsWorkCv.wait(lock, [this] { return m_gsWorkerStop || !m_gsWork.empty(); });
+            atvTimeline(11u, 1u, 0u);
             g_gsWorkerIdleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                  std::chrono::steady_clock::now() - idleStart)
                                                                  .count()),
@@ -496,8 +505,10 @@ void PS2Memory::gsWorkerMain()
         lock.unlock();
         m_gsWorkCv.notify_all(); // a producer may wait for queue space
         const auto t0 = std::chrono::steady_clock::now();
+        atvTimeline(10u, 0u, 0u);
         fn();
         gsFlushWorkerGif();
+        atvTimeline(10u, 1u, 0u);
         g_gsWorkerBusyNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                               std::chrono::steady_clock::now() - t0)
                                                               .count()),
@@ -520,7 +531,12 @@ void PS2Memory::enqueueGsWork(std::function<void()> fn)
     // Bounded so a fast EE cannot queue unbounded copies of DMA chains.
     constexpr size_t kMaxQueued = 4096u;
     std::unique_lock<std::mutex> lock(m_gsWorkMutex);
-    m_gsWorkCv.wait(lock, [this] { return m_gsWork.size() < kMaxQueued; });
+    if (m_gsWork.size() >= kMaxQueued)
+    {
+        atvTimeline(3u, 0u, 0u);
+        m_gsWorkCv.wait(lock, [this] { return m_gsWork.size() < kMaxQueued; });
+        atvTimeline(3u, 1u, 0u);
+    }
     m_gsWork.push_back(std::move(fn));
     ++m_gsWorkQueuedSeq;
     lock.unlock();
@@ -544,7 +560,9 @@ void PS2Memory::fenceGsWorkUpTo(uint64_t mark, int site) const
     if (m_gsWorkDoneSeq < mark)
     {
         const auto t0 = std::chrono::steady_clock::now();
+        atvTimeline(2u, 0u, static_cast<uint16_t>(site));
         m_gsIdleCv.wait(lock, [this, mark] { return m_gsWorkDoneSeq >= mark; });
+        atvTimeline(2u, 1u, static_cast<uint16_t>(site));
         g_gsFenceWaits.fetch_add(1, std::memory_order_relaxed);
         g_gsSiteWaits[(site >= 0 && site < 6) ? site : 0].fetch_add(1, std::memory_order_relaxed);
         g_gsFenceWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -572,7 +590,9 @@ void PS2Memory::fenceGsWork(int site) const
     if (!(m_gsWork.empty() && !m_gsWorkerBusy))
     {
         const auto t0 = std::chrono::steady_clock::now();
+        atvTimeline(2u, 0u, static_cast<uint16_t>(site));
         m_gsIdleCv.wait(lock, [this] { return m_gsWork.empty() && !m_gsWorkerBusy; });
+        atvTimeline(2u, 1u, static_cast<uint16_t>(site));
         g_gsFenceWaits.fetch_add(1, std::memory_order_relaxed);
         g_gsSiteWaits[(site >= 0 && site < 6) ? site : 0].fetch_add(1, std::memory_order_relaxed);
         g_gsFenceWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

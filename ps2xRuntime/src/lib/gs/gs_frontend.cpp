@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -26,6 +27,133 @@ extern uint32_t g_ps2XgkickCount;
 bool g_raceLoadStarted = false;
 void atvStartHostProfilerForThisThread();
 void gsGpuSubmitMany(GSRasterBackend *backend, const GSPrimitiveBatch *const *batches, size_t count); // gs_gpu_backend.cpp
+
+// ---- Frame timeline (ATV_TIMELINE=<start s>,<length s>[,<file>]) ----------------------------
+// Each thread records when its busy and waiting spans begin and end (kinds: see the analysis
+// script; EE 1-9, VIF1/VU1 worker 10-19, GIF thread 20-29, raster worker 30-39, window 40-49)
+// into its own preallocated buffer from <start> seconds after the first event for <length>
+// seconds; the next Flip after that writes all of them to <file> (default atv_timeline.bin).
+// Off: one test of g_atvTimelineOn per call, inlined in the files with the busiest spans
+// (the VIF1/VU1 worker's ~50K a frame cost ~1% of it as calls).
+bool g_atvTimelineOn = std::getenv("ATV_TIMELINE") != nullptr;
+namespace
+{
+    struct TimelineEvent
+    {
+        int64_t ns;
+        uint16_t kind;
+        uint16_t arg;
+        uint8_t phase; // 0 begin, 1 end, 2 instant
+        uint8_t pad[3];
+    };
+    struct TimelineThread
+    {
+        static constexpr uint32_t kMax = 1u << 21; // the VIF1/VU1 worker records ~1.5M events a second
+        std::unique_ptr<TimelineEvent[]> events{new TimelineEvent[kMax]};
+        std::atomic<uint32_t> count{0u};
+        uint32_t tid = 0u;
+        char name[32] = {};
+    };
+    struct TimelineConfig
+    {
+        bool on = false;
+        double start = 0.0, length = 0.0;
+        std::string file = "atv_timeline.bin";
+        std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
+    };
+    const TimelineConfig &timelineConfig()
+    {
+        static const TimelineConfig s_config = []
+        {
+            TimelineConfig c;
+            if (const char *env = std::getenv("ATV_TIMELINE"))
+            {
+                char file[260] = {};
+                const int n = std::sscanf(env, "%lf,%lf,%259s", &c.start, &c.length, file);
+                c.on = n >= 2 && c.length > 0.0;
+                if (n >= 3)
+                    c.file = file;
+            }
+            return c;
+        }();
+        return s_config;
+    }
+    std::mutex s_timelineMutex;
+    std::vector<TimelineThread *> s_timelineThreads;
+    std::atomic<bool> s_timelineDumped{false};
+    thread_local TimelineThread *t_timeline = nullptr;
+
+    void timelineDump(const TimelineConfig &c)
+    {
+        std::lock_guard<std::mutex> lock(s_timelineMutex);
+        FILE *f = std::fopen(c.file.c_str(), "wb");
+        if (!f)
+            return;
+        const uint32_t threads = static_cast<uint32_t>(s_timelineThreads.size());
+        std::fwrite("ATVTL1\0\0", 1u, 8u, f);
+        std::fwrite(&threads, 4u, 1u, f);
+        for (TimelineThread *t : s_timelineThreads)
+        {
+            const uint32_t count = std::min(t->count.load(std::memory_order_acquire), TimelineThread::kMax);
+            std::fwrite(&t->tid, 4u, 1u, f);
+            std::fwrite(t->name, 1u, sizeof(t->name), f);
+            std::fwrite(&count, 4u, 1u, f);
+            std::fwrite(t->events.get(), sizeof(TimelineEvent), count, f);
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "[timeline] wrote %u threads to %s\n", threads, c.file.c_str());
+    }
+}
+
+void atvTimelineRecord(uint16_t kind, uint8_t phase, uint16_t arg)
+{
+    const TimelineConfig &c = timelineConfig();
+    if (!c.on || s_timelineDumped.load(std::memory_order_relaxed))
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(now - c.origin).count();
+    if (secs < c.start)
+        return;
+    if (secs > c.start + c.length)
+    {
+        // Frame boundaries come from the EE (Flip, kind 1): it writes the file.
+        if (kind == 1u && !s_timelineDumped.exchange(true))
+            timelineDump(c);
+        return;
+    }
+    if (!t_timeline)
+    {
+        auto *t = new TimelineThread();
+        t->tid = static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFFFu);
+        std::snprintf(t->name, sizeof(t->name), "k%u", static_cast<uint32_t>(kind));
+        std::lock_guard<std::mutex> lock(s_timelineMutex);
+        s_timelineThreads.push_back(t);
+        t_timeline = t;
+    }
+    const uint32_t i = t_timeline->count.load(std::memory_order_relaxed);
+    if (i >= TimelineThread::kMax)
+        return;
+    t_timeline->events[i] = {std::chrono::duration_cast<std::chrono::nanoseconds>(now - c.origin).count(), kind, arg, phase, {}};
+    t_timeline->count.store(i + 1u, std::memory_order_release);
+}
+
+// For the files with few spans; the busy ones test g_atvTimelineOn inline first.
+void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg)
+{
+    if (g_atvTimelineOn)
+        atvTimelineRecord(kind, phase, arg);
+}
+
+namespace
+{
+    // A span of `kind` on this thread for the lifetime of the object (ATV_TIMELINE).
+    struct TimelineSpan
+    {
+        uint16_t kind, arg;
+        TimelineSpan(uint16_t k, uint16_t a = 0u) : kind(k), arg(a) { atvTimeline(kind, 0u, arg); }
+        ~TimelineSpan() { atvTimeline(kind, 1u, arg); }
+    };
+}
 
 namespace
 {
@@ -522,8 +650,11 @@ namespace
             }
             std::unique_lock<std::mutex> lock(m_mutex);
             if (m_queue.size() >= kMaxQueued)
+            {
+                TimelineSpan full(23u);
                 m_changed.wait(lock, [&]
                                { return m_queue.size() < kMaxQueued; });
+            }
             appendStagedLocked(extra);
         }
 
@@ -555,6 +686,7 @@ namespace
             if (m_queue.size() >= kMaxQueued)
             {
                 const uint64_t t1 = statNowNs();
+                TimelineSpan full(23u);
                 m_changed.wait(lock, [&]
                                { return m_queue.size() < kMaxQueued; });
                 ++m_statFull;
@@ -729,8 +861,12 @@ namespace
                     m_busy = false;
                     m_doneSeq = batchEnd;
                     m_changed.notify_all();
-                    m_wake.wait(lock, [&]
-                                { return m_stop || !m_queue.empty(); });
+                    if (m_queue.empty())
+                    {
+                        TimelineSpan idle(31u);
+                        m_wake.wait(lock, [&]
+                                    { return m_stop || !m_queue.empty(); });
+                    }
                     if (m_queue.empty())
                         return;
                     batch.swap(m_queue);
@@ -742,6 +878,7 @@ namespace
                 // Consecutive primitives go to the CPU or GPU backend under one lock.
                 // ATV_GS_NO_SUBMIT_MANY=1: one Submit (and lock) per primitive.
                 static const bool s_noSubmitMany = std::getenv("ATV_GS_NO_SUBMIT_MANY") != nullptr;
+                TimelineSpan busy(30u, static_cast<uint16_t>(std::min<size_t>(batch.size(), 0xFFFFu)));
                 for (size_t i = 0; i < batch.size();)
                 {
                     if ((m_cpu || m_gpu) && !s_noSubmitMany && std::holds_alternative<GSPrimitiveBatch>(batch[i]))
@@ -896,6 +1033,33 @@ namespace
         return env ? static_cast<uint32_t>(std::clamp<long>(std::strtol(env, nullptr, 10), 256, 1 << 20)) : 4096u;
     }();
 
+    // A local -> host copy request that travels through the GIF queue behind the TRXDIR=1 packet
+    // starting the transfer (gsQueueLocalToHostCopy): magic, byte count, out, done. 24 bytes, which
+    // no GIF packet (whole quadwords) has.
+    constexpr size_t kGifReadbackMarkerBytes = 24u;
+    constexpr uint32_t kGifReadbackMagic = 0x4D4B4252u; // "RBKM"
+
+    bool asyncGifIsReadbackMarker(const std::vector<uint8_t> &packet)
+    {
+        uint32_t magic = 0u;
+        if (packet.size() != kGifReadbackMarkerBytes)
+            return false;
+        std::memcpy(&magic, packet.data(), 4u);
+        return magic == kGifReadbackMagic;
+    }
+
+    void asyncGifRunReadbackMarker(const std::vector<uint8_t> &packet)
+    {
+        uint32_t maxBytes = 0u;
+        uint8_t *out = nullptr;
+        std::atomic<uint32_t> *done = nullptr;
+        std::memcpy(&maxBytes, packet.data() + 4u, 4u);
+        std::memcpy(&out, packet.data() + 8u, 8u);
+        std::memcpy(&done, packet.data() + 16u, 8u);
+        if (GSThreadedBackend *threaded = GSThreadedBackend::s_instance.load(std::memory_order_acquire))
+            threaded->QueueReadback(out, maxBytes, done);
+    }
+
     // Caller holds processMutex and has t_gsGifDirect set.
     void asyncGifProcessQueued(AsyncGifQueue &q)
     {
@@ -913,7 +1077,10 @@ namespace
                 q.queue.pop_front();
                 havePacket = true;
             }
-            q.gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+            if (asyncGifIsReadbackMarker(packet))
+                asyncGifRunReadbackMarker(packet);
+            else
+                q.gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
             q.pending.fetch_sub(1u, std::memory_order_release);
         }
     }
@@ -936,13 +1103,17 @@ namespace
                 _mm_pause();
             if (q->pending.load(std::memory_order_acquire) == 0u)
             {
+                TimelineSpan sleep(21u);
                 std::unique_lock<std::mutex> lock(q->queueMutex);
                 q->sleeping = true;
                 q->wake.wait(lock, [q]
                              { return !q->queue.empty(); });
                 q->sleeping = false;
             }
+            atvTimeline(22u, 0u, 0u);
             std::lock_guard<std::mutex> process(q->processMutex);
+            atvTimeline(22u, 1u, 0u);
+            TimelineSpan parse(20u);
             asyncGifProcessQueued(*q);
         }
     }
@@ -1047,6 +1218,13 @@ namespace
         if (pendingBefore == 0u)
             return;
         const auto t0 = s_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // ATV_TIMELINE: a drain on this thread, by site (1 queueFull, 2 readback, 3 present, 4 privReg).
+        const uint16_t siteCode = std::strcmp(site, "queueFull") == 0                    ? 1u
+                                  : std::strcmp(site, "readback") == 0                   ? 2u
+                                  : std::strcmp(site, "latchHostPresentationFrame") == 0 ? 3u
+                                  : std::strcmp(site, "privReg") == 0                    ? 4u
+                                                                                         : 0u;
+        TimelineSpan drain(24u, siteCode);
         std::lock_guard<std::mutex> process(q->processMutex);
         const auto t1 = s_stats ? std::chrono::steady_clock::now() : t0;
         const uint32_t pendingLocked = q->pending.load(std::memory_order_acquire);
@@ -1064,6 +1242,7 @@ namespace
         AsyncGifQueue *q = asyncGifQueueFor(gs);
         if (!q)
             return false;
+        TimelineSpan enqueue(16u); // ATV_TIMELINE: copying a packet into the GIF queue
         if (q->pending.load(std::memory_order_relaxed) >= kAsyncGifMaxPending)
             asyncGifDrain("queueFull");
 
@@ -1146,6 +1325,25 @@ bool gsQueueLocalToHostCopy(uint8_t *out, uint32_t maxBytes, std::atomic<uint32_
     GSThreadedBackend *threaded = GSThreadedBackend::s_instance.load(std::memory_order_acquire);
     if (threaded == nullptr)
         return false;
+    // The request follows this thread's queued GIF packets through the GIF queue as a marker, and
+    // whoever processes the queue issues it in order: draining the queue here made the VIF1/VU1
+    // worker wait for the GIF and raster threads at both water readbacks of every frame.
+    // ATV_GS_READBACK_DRAIN=1: drain and queue as before.
+    static const bool s_drain = std::getenv("ATV_GS_READBACK_DRAIN") != nullptr;
+    AsyncGifQueue *q = s_asyncGif.load(std::memory_order_acquire);
+    if (!s_drain && q && !t_gsGifDirect && t_gsApiDepth == 0u)
+    {
+        uint8_t marker[kGifReadbackMarkerBytes];
+        std::memcpy(marker, &kGifReadbackMagic, 4u);
+        std::memcpy(marker + 4u, &maxBytes, 4u);
+        std::memcpy(marker + 8u, &out, 8u);
+        std::memcpy(marker + 16u, &done, 8u);
+        if (asyncGifEnqueue(q->gs, marker, static_cast<uint32_t>(sizeof(marker))))
+        {
+            asyncGifFlushLocal(*q);
+            return true;
+        }
+    }
     if (t_gsApiDepth == 0u)
         asyncGifDrain("readback");
     threaded->QueueReadback(out, maxBytes, done);
@@ -1584,6 +1782,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
 
 void GS::latchHostPresentationFrame()
 {
+    TimelineSpan latch(40u);
     GSApiScope apiScope{__func__};
     GSPresentationRequest request{};
     // The display registers and the local-memory snapshot must describe the
@@ -1628,7 +1827,10 @@ void GS::latchHostPresentationFrame()
         }
     }
     if (threaded)
+    {
+        TimelineSpan wait(41u);
         threaded->WaitSnapshot(snapshotSeq);
+    }
     backendLock = {};
 
     PresentationFrame frame = gpu ? std::move(gpuFrame) : GSCpuBackend::PresentSnapshot(snapshot, request);

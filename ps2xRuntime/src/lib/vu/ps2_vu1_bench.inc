@@ -290,6 +290,8 @@
             std::vector<uint64_t> repNs;
             std::vector<uint64_t> repCycles;
             uint32_t unstable = 0;
+            const uint64_t steppedBefore = g_vu1RunsStepped, genericRunsBefore = g_vu1RunsGeneric,
+                           genericBefore = g_vu1GenericPairs, rebuildsBefore = g_vu1DecodeRebuilds;
             const double pairs = passPairs ? static_cast<double>(passPairs) : 1.0;
             for (uint32_t r = 0; r < reps; ++r)
             {
@@ -310,6 +312,13 @@
                 std::fprintf(stderr, "[vu-bench] rep %u fast ms=%.3f ns/pair=%.2f cycles/pair=%.2f\n", r + 1u,
                              total / 1e6, total / pairs, cycles / pairs);
             }
+            std::fprintf(stderr,
+                         "[vu-bench] per fast pass: runs=%zu steppedRuns=%llu genericRuns=%llu genericPairs=%llu "
+                         "codeRebuilds=%llu\n",
+                         count, static_cast<unsigned long long>((g_vu1RunsStepped - steppedBefore) / reps),
+                         static_cast<unsigned long long>((g_vu1RunsGeneric - genericRunsBefore) / reps),
+                         static_cast<unsigned long long>((g_vu1GenericPairs - genericBefore) / reps),
+                         static_cast<unsigned long long>((g_vu1DecodeRebuilds - rebuildsBefore) / reps));
             uint64_t bestSum = 0;
             uint64_t bestCycleSum = 0;
             uint64_t combined = 1469598103934665603ull;

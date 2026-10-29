@@ -8,11 +8,11 @@ noinline function per op. This script keeps all chunks in a flat store
 
   - each block is split into parts of PART_PAIRS pairs (separate noinline
     functions, so MSVC never sees one huge function);
-  - upper ops are inlined in their lean form (VU1Native::leanUpper, the flag
-    mode of every race program) next to a call of the shared general op for
-    the other modes; a part keeps vuNormalize4 of each register it reads in a
-    local (n<reg>, nacc) while the register is unchanged, so most operands
-    are not normalized again;
+  - upper ops are inlined in their lean form only (VU1Native::leanUpper, the
+    flag mode of every race program): in the other modes a block bails before
+    its first pair and the fast loop's per-pair path runs it; a part keeps
+    vuNormalize4 of each register it reads in a local (n<reg>, nacc) while the
+    register is unchanged, so most operands are not normalized again;
   - the ready-table entries a part touches live in locals, loaded once on
     entry and stored on every exit (unwritten ones store back their own value),
     and so do writesReadyAt and the pair counter;
@@ -209,7 +209,8 @@ def lean_upper(packed, upper, nomac, caches):
                 caches.valid.add(reg)
             elif reg in caches.valid:
                 body.append(f'{cache_name(reg)} = VU1Native::mergeDest<{dest}>({cache_name(reg)}, nr);')
-    out = ['if (lean)', '{'] + ['    ' + b for b in body] + ['}', 'else', f'    VU1Native::upperOpGeneral<{packed}, {upper}>(vu);']
+    # Its own scope: `nr` and the result are declared once per op.
+    out = ['{'] + ['    ' + b for b in body] + ['}']
     return out, (reg if dest != 0 else None)
 
 
@@ -292,8 +293,9 @@ def drop_dead_stores(pairs, slots):
     return out
 
 
-def emit_part(name, pairs, last):
-    """pairs: list of (comment, [stripped body lines])."""
+def emit_part(name, pairs, last, entry_pc=None):
+    """pairs: list of (comment, [stripped body lines]); entry_pc: the block's PC
+    for its first part, which bails there outside the lean flag modes."""
     # Only slots the part still checks live in locals; slots it only writes
     # (most, once stall checks are pruned) are stored straight to the table.
     slots = []
@@ -309,15 +311,16 @@ def emit_part(name, pairs, last):
             m = WRITE_RE.match(line)
             if m and (m.group(1), int(m.group(2))) in slots:
                 written.add((m.group(1), int(m.group(2))))
-    out = [f'static __declspec(noinline) uint32_t {name}(VU1Native::Ctx &c)', '{',
-           '    VU1Interpreter &vu = *c.vu;', '    VU1State &s = vu.state();', '    uint64_t cyc = *c.cycle;',
+    out = [f'static __declspec(noinline) uint32_t {name}(VU1Native::Ctx &c)', '{']
+    if entry_pc is not None:
+        # The upper ops are only in their lean form; the fast loop runs the other modes.
+        out += ['    if (!VU1Native::leanInline())', f'        return VU1Native::bail(c, 0x{entry_pc:04x}u);']
+    out += ['    VU1Interpreter &vu = *c.vu;', '    VU1State &s = vu.state();', '    uint64_t cyc = *c.cycle;',
            '    const uint64_t *const nextReady = &c.hint->nextReady;',
            '    uint8_t *const vuData = c.vuData;',
-           '    const bool lean = VU1Native::leanInline();',
            '    const bool macOnly = g_vuMacOnlyFlags;',
            '    (void)vu;',
            '    (void)vuData;',
-           '    (void)lean;',
            '    (void)macOnly;',
            f'    uint32_t rc = {"VU1Native::kNativeContinue" if last else "VU1Native::kNativePartDone"};',
            '    uint64_t wra = *c.writesReadyAt;', '    uint64_t np = 0;']
@@ -599,7 +602,7 @@ def emit_block(pc, key, words, body):
     out.append('};')
     parts = [pairs[i:i + PART_PAIRS] for i in range(0, len(pairs), PART_PAIRS)]
     for n, part in enumerate(parts):
-        out += emit_part(f'{base}_p{n}', part, n + 1 == len(parts))
+        out += emit_part(f'{base}_p{n}', part, n + 1 == len(parts), pc if n == 0 else None)
     out += [f'static uint32_t {base}(VU1Native::Ctx &c)', '{']
     for n in range(len(parts) - 1):
         out.append(f'    if (const uint32_t r = {base}_p{n}(c); r != VU1Native::kNativePartDone) return r;')

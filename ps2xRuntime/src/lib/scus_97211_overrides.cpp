@@ -46,6 +46,7 @@ extern void (*g_ps2Vif1PrecaptureHook)(PS2Memory::GifCapture &capture, std::vect
 extern bool (*g_ps2Vif1DownloadCaptureHook)(std::vector<uint8_t> &records);
 extern bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation);
 void ps2GsWorkerNoteDownload(uint32_t phys, uint32_t bytes); // RAM a download being queued writes
+void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg); // gs_frontend.cpp (ATV_TIMELINE)
 extern uint64_t (*g_ps2GsCsrReadHook)(uint32_t pc, uint64_t value); // ps2_runtime.cpp
 bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width, uint32_t height,
                               uint8_t *dst); // Kernel/Stubs/IPU.cpp
@@ -5132,6 +5133,7 @@ namespace
                 s_fpsFrames = 0u;
             }
         }
+        atvTimeline(1u, 2u, 0u); // ATV_TIMELINE frame marker (and its dump trigger)
         PS2Memory &mem = runtime->memory();
         if (!mem.gsWorkerEnabled())
         {
@@ -5148,7 +5150,9 @@ namespace
         // Flip may yield at a checkpoint and resume without this wrapper; the mark then lands a
         // little earlier, which only shortens the next wait.
         mem.fenceGsWorkUpTo(s_prevFlipMark, 4);
+        atvTimeline(5u, 0u, 0u); // the game's Flip, with its frame limiter
         g_videoCardFlipOrig(rdram, ctx, runtime);
+        atvTimeline(5u, 1u, 0u);
         s_prevFlipMark = mem.gsWorkMark();
     }
 
@@ -5621,9 +5625,13 @@ namespace
             return runtime->gs().consumeLocalToHostBytes(out, bytes);
         auto finish = [](WaterReadbackSlot &s)
         {
-            if (s.queued)
+            if (s.queued && (s.done.load(std::memory_order_acquire) & 0x80000000u) == 0u)
+            {
+                atvTimeline(13u, 0u, 0u);
                 while ((s.done.load(std::memory_order_acquire) & 0x80000000u) == 0u)
                     std::this_thread::yield();
+                atvTimeline(13u, 1u, 0u);
+            }
             s.queued = false;
         };
         WaterReadbackSlot *slot = nullptr;

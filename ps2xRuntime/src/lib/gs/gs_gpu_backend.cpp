@@ -42,6 +42,7 @@
 using Microsoft::WRL::ComPtr;
 
 extern bool g_raceLoadStarted;
+void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg); // gs_frontend.cpp (ATV_TIMELINE)
 
 namespace
 {
@@ -114,6 +115,38 @@ namespace
         const uint32_t count = std::min<uint32_t>(kPages, rows * perRow + beyond + (spill ? 1u : 0u));
         for (uint32_t i = 0; i < count; ++i)
             set.set((first + i) % kPages);
+    }
+
+    // Pages of a bw-wide surface at block bp that the rectangle [x0, x1] x [y0, y1] touches: only
+    // its page columns. With a page-unaligned base a page's blocks run into the next page when
+    // the ones used pass block 31 (the per-frame 8x2 CLUT uploads at block 0x3ffc stay in the
+    // last page; counting its successor wrapped to page 0, the display buffer's top-left page).
+    // A rectangle past the buffer width falls back to whole rows (addPages).
+    void addRectPages(PageSet &set, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+    {
+        uint32_t pw, ph;
+        pageDims(psm, pw, ph);
+        const uint32_t perRow = std::max<uint32_t>(1u, std::max<uint32_t>(bw, 1u) * 64u / pw);
+        x1 = std::max(x0, x1);
+        y1 = std::max(y0, y1);
+        if (x1 / pw >= perRow || y1 / ph - y0 / ph >= kPages)
+        {
+            addPages(set, bp, bw, psm, y0, y1, x1);
+            return;
+        }
+        for (uint32_t r = y0 / ph; r <= y1 / ph; ++r)
+            for (uint32_t c = x0 / pw; c <= x1 / pw; ++c)
+            {
+                const uint32_t page = (bp >> 5) + r * perRow + c;
+                set.set(page % kPages);
+                if ((bp & 31u) != 0u)
+                {
+                    const uint32_t localX1 = std::min(x1, c * pw + pw - 1u) - c * pw;
+                    const uint32_t localY1 = std::min(y1, r * ph + ph - 1u) - r * ph;
+                    if ((bp & 31u) + maxBlockInPage(psm, localX1, localY1) >= 32u)
+                        set.set((page + 1u) % kPages);
+                }
+            }
     }
 
     uint32_t rgba5551To8888(uint32_t c)
@@ -400,9 +433,17 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         ComPtr<ID3D11ShaderResourceView> srv; // colour targets: sampled as textures (renderTargetTextureLocked)
         ComPtr<ID3D11DepthStencilView> dsv;
         PageSet pages;
-        bool gpuNewer = false;  // GPU draws local memory lacks
-        bool vramNewer = true;  // local memory writes the GPU copy lacks
+        // Per page: GPU draws local memory lacks, and local memory writes the GPU copy lacks (never
+        // both: CPU writes download a page first). Downloads and seeds move only these pages.
+        PageSet gpuNewer;
+        PageSet vramNewer;
         char staleWhy[112] = "new target"; // the CPU-side write that last set vramNewer (stats logs)
+    };
+
+    // A page of a target in its 1x pixels: [x0, x1) x [y0, y1).
+    struct PageRect
+    {
+        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     };
 
     // One decoded image of local memory, kept by its content (see textureFor).
@@ -443,6 +484,14 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
     // also come from the EE and VIF1/VU1 threads (GSThreadedBackend::syncCall runs readbacks and
     // snapshots on the caller), whose FPU/VU emulation relies on their FTZ|DAZ: every entry point
     // gives the caller its MXCSR back.
+    // A span of `kind` on this thread for the lifetime of the object (ATV_TIMELINE, gs_frontend.cpp).
+    struct TimelineSpan
+    {
+        uint16_t kind;
+        explicit TimelineSpan(uint16_t k) : kind(k) { atvTimeline(kind, 0u, 0u); }
+        ~TimelineSpan() { atvTimeline(kind, 1u, 0u); }
+    };
+
     struct FpGuard
     {
         unsigned int csr = _mm_getcsr();
@@ -622,18 +671,18 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             if (command.direction == 1u || command.direction == 2u)
             {
                 PageSet src;
-                addPages(src, b.sbp, b.sbw, b.spsm, command.trxpos.ssay,
-                         command.trxpos.ssay + std::max<uint32_t>(1u, command.trxreg.rrh) - 1u,
-                         command.trxpos.ssax + std::max<uint32_t>(1u, command.trxreg.rrw) - 1u);
+                addRectPages(src, b.sbp, b.sbw, b.spsm, command.trxpos.ssax, command.trxpos.ssay,
+                             command.trxpos.ssax + std::max<uint32_t>(1u, command.trxreg.rrw) - 1u,
+                             command.trxpos.ssay + std::max<uint32_t>(1u, command.trxreg.rrh) - 1u);
                 if (command.direction == 1u)
                     noteReadbackLocked(src);
                 syncForCpuLocked(src, false);
             }
             if (command.direction == 0u || command.direction == 2u)
             {
-                addPages(m_transferDst, b.dbp, b.dbw, b.dpsm, command.trxpos.dsay,
-                         command.trxpos.dsay + std::max<uint32_t>(1u, command.trxreg.rrh) - 1u,
-                         command.trxpos.dsax + std::max<uint32_t>(1u, command.trxreg.rrw) - 1u);
+                addRectPages(m_transferDst, b.dbp, b.dbw, b.dpsm, command.trxpos.dsax, command.trxpos.dsay,
+                             command.trxpos.dsax + std::max<uint32_t>(1u, command.trxreg.rrw) - 1u,
+                             command.trxpos.dsay + std::max<uint32_t>(1u, command.trxreg.rrh) - 1u);
                 // Partly covered GPU targets must be complete in local memory before it changes.
                 syncForCpuLocked(m_transferDst, true);
             }
@@ -647,10 +696,9 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 ++m_capVramDumps;
                 uint8_t stale[kPages / 8u] = {};
                 for (const auto &t : m_targets)
-                    if (t->gpuNewer)
-                        for (uint32_t p = 0; p < kPages; ++p)
-                            if (t->pages.test(p))
-                                stale[p / 8u] |= static_cast<uint8_t>(1u << (p % 8u));
+                    for (uint32_t p = 0; p < kPages; ++p)
+                        if (t->gpuNewer.test(p))
+                            stale[p / 8u] |= static_cast<uint8_t>(1u << (p % 8u));
                 cpuIdleLocked();
                 captureLiveLocked(GSCaptureSnapshot, stale, sizeof(stale), m_vram, GSMem::MEMORY_SIZE);
             }
@@ -1091,7 +1139,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             if (!m_rtTextures || (tex.psm != GS_PSM_CT32 && tex.psm != GS_PSM_CT24) || (tex.tbp0 & 31u) != 0u)
                 return nullptr;
             Target *t = findTarget(false, tex.tbp0 >> 5);
-            if (!t || t == m_color || t->vramNewer || !t->srv || t->fbw != tex.tbw || w > t->w || h > t->h ||
+            if (!t || t == m_color || !t->srv || t->fbw != tex.tbw || w > t->w || h > t->h ||
                 (t->psm != GS_PSM_CT32 && tex.psm == GS_PSM_CT32))
                 return nullptr;
             return t;
@@ -1108,8 +1156,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         void dropTargetLocked(Target *target)
         {
             traceLocked(*target, "drop");
-            if (target->gpuNewer)
-                downloadLocked(*target);
+            downloadLocked(*target, target->gpuNewer);
             m_targets.erase(std::remove_if(m_targets.begin(), m_targets.end(), [&](const auto &t) { return t.get() == target; }),
                             m_targets.end());
         }
@@ -1182,7 +1229,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 m_dev->CreateRenderTargetView(fresh->tex.Get(), nullptr, &fresh->rtv);
                 m_dev->CreateShaderResourceView(fresh->tex.Get(), nullptr, &fresh->srv);
             }
-            fresh->vramNewer = true;
+            fresh->vramNewer = fresh->pages;
             traceLocked(*fresh, "create");
             ++m_statTargets;
             m_targets.push_back(std::move(fresh));
@@ -1209,6 +1256,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         {
             if (!m_cpuQueued || (pages && !(*pages & m_cpuQueuedPages).any()))
                 return;
+            TimelineSpan span(35u);
             const auto start = std::chrono::steady_clock::now();
             m_cpu->Flush();
             m_cpuQueued = false;
@@ -1220,12 +1268,14 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         {
             for (auto &t : m_targets)
             {
-                if (!(t->pages & pages).any())
+                const PageSet overlap = t->pages & pages;
+                if (!overlap.any())
                     continue;
-                if (t->gpuNewer)
+                const PageSet need = t->gpuNewer & overlap;
+                if (need.any())
                 {
-                    m_statDownloadPagesNeeded += (t->pages & pages).count();
-                    m_statDownloadPagesTotal += t->pages.count();
+                    m_statDownloadPagesNeeded += need.count();
+                    m_statDownloadPagesTotal += t->gpuNewer.count();
                     if (m_stats)
                     {
                         // Counted by target and the operation that asked (its first two words).
@@ -1236,22 +1286,22 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                                       static_cast<int>(end ? end - m_why : std::strlen(m_why)), m_why);
                         ++m_downloadWhy[key];
                     }
-                    downloadLocked(*t);
+                    downloadLocked(*t, need);
                     m_statDepthDownloads += t->depth ? 1u : 0u;
-                    t->gpuNewer = false;
                 }
                 if (writing)
-                    markStaleLocked(*t);
+                    markStaleLocked(*t, overlap);
             }
         }
 
-        // ATV_GS_GPU_TRACE=<fbp>: log what happens to the colour target at that FBP (debug).
+        // ATV_GS_GPU_TRACE=<fbp>: log what happens to the colour target at that FBP (debug);
+        // ATV_GS_GPU_TRACE_Z=1: to the Z buffer at that ZBP instead.
         void traceLocked(const Target &t, const char *what, const char *detail = "")
         {
-            if (m_traceFbp < 0 || t.depth || t.base != static_cast<uint32_t>(m_traceFbp))
+            if (m_traceFbp < 0 || t.depth != m_traceDepth || t.base != static_cast<uint32_t>(m_traceFbp))
                 return;
-            std::fprintf(stderr, "[gs-gpu-trace] prim %llu %s fbp=%u gpuNewer=%d vramNewer=%d %s\n", static_cast<unsigned long long>(m_statPrimsTotal),
-                         what, t.base, t.gpuNewer ? 1 : 0, t.vramNewer ? 1 : 0, detail);
+            std::fprintf(stderr, "[gs-gpu-trace] prim %llu %s %s=%u gpuNewer=%zu vramNewer=%zu pages %s\n", static_cast<unsigned long long>(m_statPrimsTotal),
+                         what, t.depth ? "zbp" : "fbp", t.base, t.gpuNewer.count(), t.vramNewer.count(), detail);
         }
 
         // ATV_GS_GPU_PROBE=a,b (with ATV_GS_GPU_TRACE): mean colour of the traced target after every
@@ -1280,11 +1330,14 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             traceLocked(t, "probe", detail);
         }
 
-        void markStaleLocked(Target &t)
+        // The CPU side wrote `pages` of t (syncForCpuLocked downloaded them first): the GPU copy
+        // lacks them until the next seed.
+        void markStaleLocked(Target &t, const PageSet &pages)
         {
-            if (!t.vramNewer)
+            if (!t.vramNewer.any())
                 traceLocked(t, "stale", m_why);
-            t.vramNewer = true;
+            t.vramNewer |= pages & t.pages;
+            t.gpuNewer &= ~t.vramNewer;
             if (m_stats)
                 std::snprintf(t.staleWhy, sizeof(t.staleWhy), "%s", m_why);
         }
@@ -1295,18 +1348,33 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 if (pages.test(p))
                     ++m_pageVersion[p];
             for (auto &t : m_targets)
-                if ((t->pages & pages).any())
-                    markStaleLocked(*t);
+            {
+                const PageSet overlap = t->pages & pages;
+                if (overlap.any())
+                    markStaleLocked(*t, overlap);
+            }
         }
 
         void syncAllLocked()
         {
             for (auto &t : m_targets)
-                if (t->gpuNewer)
-                {
-                    downloadLocked(*t);
-                    t->gpuNewer = false;
-                }
+                if (t->gpuNewer.any())
+                    downloadLocked(*t, t->gpuNewer);
+        }
+
+        // The 1x pixel rectangle [x0, x1) x [y0, y1) of page p of target t (row-major pages,
+        // fbw * 64 / page width of them a row); false when p is not one of its rows.
+        bool pageRect(const Target &t, uint32_t p, uint32_t &x0, uint32_t &y0, uint32_t &x1, uint32_t &y1) const
+        {
+            uint32_t pw, ph;
+            pageDims(t.psm, pw, ph);
+            const uint32_t perRow = std::max<uint32_t>(1u, t.fbw * 64u / pw);
+            const uint32_t rel = (p + kPages - t.base % kPages) % kPages;
+            x0 = (rel % perRow) * pw;
+            y0 = (rel / perRow) * ph;
+            x1 = std::min(x0 + pw, t.w);
+            y1 = std::min(y0 + ph, t.h);
+            return x0 < x1 && y0 < y1;
         }
 
         ID3D11Texture2D *stagingLocked(ComPtr<ID3D11Texture2D> &slot, uint32_t w, uint32_t h, DXGI_FORMAT format)
@@ -1333,13 +1401,45 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
 
         // GPU target -> local memory (point sample at each GS pixel's centre). The race needs depth
         // too: its per-frame side pass copies (and the game reads back) part of the main Z buffer.
-        void downloadLocked(Target &t)
+        // GPU -> local memory when the GPU holds any of `pages` newer: all the pages it holds newer,
+        // since each download waits for the GPU and taking only the asked ones made the next CPU
+        // access of the frame (the next water primitive) wait again (2,000 downloads per 5 s
+        // instead of 560). The rows they span are copied, their pixels written.
+        void downloadLocked(Target &t, const PageSet &pages)
         {
-            cpuIdleLocked(&t.pages);
+            if (!(t.gpuNewer & pages).any())
+                return;
+            const PageSet need = t.gpuNewer;
+            cpuIdleLocked(&need);
+            TimelineSpan span(32u);
             const auto start = std::chrono::steady_clock::now();
+            // The page rectangles, and the rows they span.
+            std::vector<PageRect> &rects = m_pageRects;
+            rects.clear();
+            uint32_t rowFirst = t.h, rowEnd = 0;
+            for (uint32_t p = 0; p < kPages; ++p)
+            {
+                PageRect r;
+                if (need.test(p) && pageRect(t, p, r.x0, r.y0, r.x1, r.y1))
+                {
+                    rects.push_back(r);
+                    rowFirst = std::min(rowFirst, r.y0);
+                    rowEnd = std::max(rowEnd, r.y1);
+                }
+            }
+            t.gpuNewer &= ~need;
+            if (rects.empty())
+                return;
             ID3D11Texture2D *staging = t.depth ? stagingLocked(m_stagingDepth, t.w * m_scale, t.h * m_scale, DXGI_FORMAT_R32_TYPELESS)
                                                : stagingLocked(m_stagingDownload, t.w * m_scale, t.h * m_scale, DXGI_FORMAT_R8G8B8A8_UNORM);
-            m_ctx->CopyResource(staging, t.tex.Get());
+            // Depth-stencil resources copy only as a whole (D3D11); their conversion is still per page.
+            if (t.depth || (rowFirst == 0u && rowEnd == t.h))
+                m_ctx->CopyResource(staging, t.tex.Get());
+            else
+            {
+                const D3D11_BOX box{0u, rowFirst * m_scale, 0u, t.w * m_scale, rowEnd * m_scale, 1u};
+                m_ctx->CopySubresourceRegion(staging, 0, 0, rowFirst * m_scale, 0, t.tex.Get(), 0, &box);
+            }
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map)))
                 return;
@@ -1347,29 +1447,32 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             const uint32_t half = m_scale / 2u;
             const uint32_t base = t.base << 5;
             const double toZ = 1.0 / zScale(t.psm);
-            for (uint32_t y = 0; y < t.h; ++y)
+            for (const PageRect &r : rects)
             {
-                const uint8_t *row = static_cast<const uint8_t *>(map.pData) + static_cast<size_t>(y * m_scale + half) * map.RowPitch;
-                for (uint32_t x = 0; x < t.w; ++x)
+                for (uint32_t y = r.y0; y < r.y1; ++y)
                 {
-                    uint32_t c;
-                    std::memcpy(&c, row + static_cast<size_t>(x * m_scale + half) * 4u, 4u);
-                    if (t.depth)
+                    const uint8_t *row = static_cast<const uint8_t *>(map.pData) + static_cast<size_t>(y * m_scale + half) * map.RowPitch;
+                    for (uint32_t x = r.x0; x < r.x1; ++x)
                     {
-                        float f;
-                        std::memcpy(&f, &c, 4u);
-                        const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(f) * toZ + 0.5, 4294967295.0));
-                        if (t.psm == GS_PSM_Z32)
-                            GSMem::WriteZ32(m_vram, base, t.fbw, x, y, z);
-                        else if (t.psm == GS_PSM_Z16 || t.psm == GS_PSM_Z16S)
-                            GSMem::WriteZ16(m_vram, base, t.fbw, x, y, std::min(z, 0xFFFFu));
+                        uint32_t c;
+                        std::memcpy(&c, row + static_cast<size_t>(x * m_scale + half) * 4u, 4u);
+                        if (t.depth)
+                        {
+                            float f;
+                            std::memcpy(&f, &c, 4u);
+                            const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(f) * toZ + 0.5, 4294967295.0));
+                            if (t.psm == GS_PSM_Z32)
+                                GSMem::WriteZ32(m_vram, base, t.fbw, x, y, z);
+                            else if (t.psm == GS_PSM_Z16 || t.psm == GS_PSM_Z16S)
+                                GSMem::WriteZ16(m_vram, base, t.fbw, x, y, std::min(z, 0xFFFFu));
+                            else
+                                GSMem::WriteZ24(m_vram, base, t.fbw, x, y, std::min(z, 0xFFFFFFu));
+                        }
+                        else if (t.psm == GS_PSM_CT24)
+                            GSMem::WriteCT24(m_vram, base, t.fbw, x, y, c);
                         else
-                            GSMem::WriteZ24(m_vram, base, t.fbw, x, y, std::min(z, 0xFFFFFFu));
+                            GSMem::WriteCT32(m_vram, base, t.fbw, x, y, c);
                     }
-                    else if (t.psm == GS_PSM_CT24)
-                        GSMem::WriteCT24(m_vram, base, t.fbw, x, y, c);
-                    else
-                        GSMem::WriteCT32(m_vram, base, t.fbw, x, y, c);
                 }
             }
             m_ctx->Unmap(staging, 0);
@@ -1387,22 +1490,46 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 traceLocked(t, "download", detail);
             }
             for (uint32_t p = 0; p < kPages; ++p)
-                if (t.pages.test(p))
+                if (need.test(p))
                     ++m_pageVersion[p];
             m_cpu->TextureFlush();
             ++m_statDownloads;
             m_statDownloadNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
         }
 
-        // Local memory -> GPU target (point upscale).
+        // Local memory -> GPU target (point upscale) for the pages local memory holds newer: the
+        // whole target in one draw, else one scissored draw per run of pages in a row.
         void seedLocked(Target &t)
         {
-            cpuIdleLocked(&t.pages);
+            const PageSet seed = t.vramNewer;
+            if (!seed.any())
+                return;
+            cpuIdleLocked(&seed);
+            TimelineSpan span(34u);
             const auto start = std::chrono::steady_clock::now();
             if (m_stats && !t.depth && m_colorSeedLogs < 40u)
             {
                 ++m_colorSeedLogs;
-                std::fprintf(stderr, "[gs-gpu] seed colour target fbp=%u fbw=%u %ux%u\n", t.base, t.fbw, t.w, t.h);
+                std::fprintf(stderr, "[gs-gpu] seed colour target fbp=%u fbw=%u %ux%u (%zu of %zu pages)\n", t.base, t.fbw, t.w, t.h,
+                             seed.count(), t.pages.count());
+            }
+            const bool whole = (seed & t.pages) == t.pages;
+            std::vector<PageRect> &rects = m_pageRects;
+            rects.clear();
+            if (whole)
+                rects.push_back({0u, 0u, t.w, t.h});
+            else
+            {
+                for (uint32_t p = 0; p < kPages; ++p)
+                {
+                    PageRect r;
+                    if (!seed.test(p) || !pageRect(t, p, r.x0, r.y0, r.x1, r.y1))
+                        continue;
+                    if (!rects.empty() && rects.back().y0 == r.y0 && rects.back().x1 == r.x0)
+                        rects.back().x1 = r.x1; // the next page of the same row
+                    else
+                        rects.push_back(r);
+                }
             }
             m_seedPixels.resize(static_cast<size_t>(t.w) * t.h);
             const uint32_t base = t.base << 5;
@@ -1418,25 +1545,27 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             {
                 const float scale = zScale(t.psm);
                 float *out = reinterpret_cast<float *>(m_seedPixels.data());
-                for (uint32_t y = 0; y < t.h; ++y)
-                    for (uint32_t x = 0; x < t.w; ++x)
-                    {
-                        uint32_t z;
-                        if (t.psm == GS_PSM_Z32)
-                            z = GSMem::ReadZ32(m_vram, base, t.fbw, x, y);
-                        else if (t.psm == GS_PSM_Z16 || t.psm == GS_PSM_Z16S)
-                            z = GSMem::ReadZ16(m_vram, base, t.fbw, x, y);
-                        else
-                            z = GSMem::ReadZ24(m_vram, base, t.fbw, x, y) & 0xFFFFFFu;
-                        out[y * t.w + x] = std::min(static_cast<float>(z) * scale, 1.0f);
-                    }
+                for (const PageRect &r : rects)
+                    for (uint32_t y = r.y0; y < r.y1; ++y)
+                        for (uint32_t x = r.x0; x < r.x1; ++x)
+                        {
+                            uint32_t z;
+                            if (t.psm == GS_PSM_Z32)
+                                z = GSMem::ReadZ32(m_vram, base, t.fbw, x, y);
+                            else if (t.psm == GS_PSM_Z16 || t.psm == GS_PSM_Z16S)
+                                z = GSMem::ReadZ16(m_vram, base, t.fbw, x, y);
+                            else
+                                z = GSMem::ReadZ24(m_vram, base, t.fbw, x, y) & 0xFFFFFFu;
+                            out[y * t.w + x] = std::min(static_cast<float>(z) * scale, 1.0f);
+                        }
                 td.Format = DXGI_FORMAT_R32_FLOAT;
             }
             else
             {
-                for (uint32_t y = 0; y < t.h; ++y)
-                    for (uint32_t x = 0; x < t.w; ++x)
-                        m_seedPixels[y * t.w + x] = GSMem::ReadCT32(m_vram, base, t.fbw, x, y);
+                for (const PageRect &r : rects)
+                    for (uint32_t y = r.y0; y < r.y1; ++y)
+                        for (uint32_t x = r.x0; x < r.x1; ++x)
+                            m_seedPixels[y * t.w + x] = GSMem::ReadCT32(m_vram, base, t.fbw, x, y);
                 td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
                 if (m_traceFbp >= 0)
                 {
@@ -1460,7 +1589,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             m_ctx->UpdateSubresource(m_cbSeed.Get(), 0, nullptr, seedCb, 0, 0);
             D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(t.w * m_scale), static_cast<float>(t.h * m_scale), 0.0f, 1.0f};
             m_ctx->RSSetViewports(1, &vp);
-            m_ctx->RSSetState(m_rasterNoScissor.Get());
+            m_ctx->RSSetState(whole ? m_rasterNoScissor.Get() : m_raster.Get());
             m_ctx->IASetInputLayout(nullptr);
             m_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             m_ctx->VSSetShader(m_vsFull.Get(), nullptr, 0);
@@ -1485,11 +1614,20 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 m_ctx->PSSetShader(m_psSeedColor.Get(), nullptr, 0);
                 m_ctx->PSSetShaderResources(2, 1, &srv);
             }
-            m_ctx->Draw(3, 0);
+            for (const PageRect &r : rects)
+            {
+                if (!whole)
+                {
+                    const D3D11_RECT sc{static_cast<LONG>(r.x0 * m_scale), static_cast<LONG>(r.y0 * m_scale),
+                                        static_cast<LONG>(r.x1 * m_scale), static_cast<LONG>(r.y1 * m_scale)};
+                    m_ctx->RSSetScissorRects(1, &sc);
+                }
+                m_ctx->Draw(3, 0);
+            }
             ID3D11ShaderResourceView *none = nullptr;
             m_ctx->PSSetShaderResources(t.depth ? 3 : 2, 1, &none);
             m_boundStateValid = false;
-            t.vramNewer = false;
+            t.vramNewer.reset();
             if (m_probeFrom <= m_statPrimsTotal && m_statPrimsTotal <= m_probeTo && !t.depth)
                 probeLocked(t);
             ++m_statSeeds;
@@ -1792,26 +1930,28 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 appendTriangle(batch);
         }
 
-        // Narrows [y0, y1] (the scissor) to the rows the primitive's vertices span.
-        static void primitiveRows(const GSPrimitiveBatch &batch, uint32_t &y0, uint32_t &y1)
+        // Narrows [lo, hi] (the scissor's range on one axis) to the range the primitive's vertices span.
+        static void primitiveSpan(const GSPrimitiveBatch &batch, bool yAxis, uint32_t &lo, uint32_t &hi)
         {
-            const float ofy = static_cast<float>(batch.state.context.xyoffset.ofy >> 4);
-            float lo = 1.0e9f, hi = -1.0e9f;
+            const auto &offset = batch.state.context.xyoffset;
+            const float of = static_cast<float>((yAxis ? offset.ofy : offset.ofx) >> 4);
+            float vmin = 1.0e9f, vmax = -1.0e9f;
             for (uint32_t i = 0; i < batch.vertexCount && i < batch.vertices.size(); ++i)
             {
-                lo = std::min(lo, batch.vertices[i].y - ofy);
-                hi = std::max(hi, batch.vertices[i].y - ofy);
+                const float v = (yAxis ? batch.vertices[i].y : batch.vertices[i].x) - of;
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
             }
-            if (lo > hi || !(std::fabs(lo) < 1.0e6f) || !(std::fabs(hi) < 1.0e6f))
+            if (vmin > vmax || !(std::fabs(vmin) < 1.0e6f) || !(std::fabs(vmax) < 1.0e6f))
                 return;
-            const int64_t first = static_cast<int64_t>(std::floor(lo)) - 1, last = static_cast<int64_t>(std::ceil(hi)) + 1;
-            if (last < static_cast<int64_t>(y0) || first > static_cast<int64_t>(y1))
+            const int64_t first = static_cast<int64_t>(std::floor(vmin)) - 1, last = static_cast<int64_t>(std::ceil(vmax)) + 1;
+            if (last < static_cast<int64_t>(lo) || first > static_cast<int64_t>(hi))
             {
-                y1 = y0; // draws nothing: one row keeps the page sets non-empty
+                hi = lo; // draws nothing: one pixel keeps the page sets non-empty
                 return;
             }
-            y0 = static_cast<uint32_t>(std::max<int64_t>(first, y0));
-            y1 = static_cast<uint32_t>(std::min<int64_t>(last, y1));
+            lo = static_cast<uint32_t>(std::max<int64_t>(first, lo));
+            hi = static_cast<uint32_t>(std::min<int64_t>(last, hi));
         }
 
         void cpuDrawLocked(const GSPrimitiveBatch &batch)
@@ -1834,18 +1974,20 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                               static_cast<unsigned long long>(ctx.test), static_cast<uint32_t>(ctx.zbuf.zmask), ctx.scissor.x0, ctx.scissor.y0,
                               ctx.scissor.x1, ctx.scissor.y1);
             PageSet writes, reads;
-            // The rows the primitive can reach (its vertices inside the scissor): with the scissor
+            // The pages the primitive can reach (its vertices inside the scissor): with the scissor
             // alone PSXWater's Z pass (ZBP 352, 384 rows, data in the first 188) covered the race's
-            // shadow buffer at FBP 420, and downloaded and re-seeded it a few times a frame.
-            uint32_t rowFirst = ctx.scissor.y0, rowLast = ctx.scissor.y1;
-            primitiveRows(batch, rowFirst, rowLast);
-            addPages(writes, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, rowFirst, rowLast);
+            // shadow buffer at FBP 420, and its 40x187 colour pass (FBP 280 FBW 6) whole page rows
+            // of the main Z buffer (ZBP 280 FBW 10), downloaded and re-seeded every frame.
+            uint32_t x0 = ctx.scissor.x0, x1 = ctx.scissor.x1, y0 = ctx.scissor.y0, y1 = ctx.scissor.y1;
+            primitiveSpan(batch, false, x0, x1);
+            primitiveSpan(batch, true, y0, y1);
+            addRectPages(writes, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, x0, y0, x1, y1);
             // Z pages only as the CPU GS touches them: the race's shadow pass has ZBP 0 (= the display
             // buffer) with ZMSK on, and counting it as a write re-seeded that target at 1x every frame.
             if (writesDepth(ctx))
-                addPages(writes, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, rowFirst, rowLast);
+                addRectPages(writes, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, x0, y0, x1, y1);
             else if (readsDepth(ctx))
-                addPages(reads, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, rowFirst, rowLast);
+                addRectPages(reads, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, x0, y0, x1, y1);
             if (batch.state.prim.tme)
                 addPages(reads, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u, batch.state.textureHeight - 1u,
                          batch.state.textureWidth - 1u);
@@ -1890,10 +2032,33 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 else
                     ++m_statApproxMask;
             }
-            if (m_color->vramNewer)
-                seedLocked(*m_color);
-            if (m_depth && m_depth->vramNewer)
+            seedLocked(*m_color);
+            if (m_depth)
                 seedLocked(*m_depth);
+            // The pages this batch's draws can reach: they become newer on the GPU. Batches nearly
+            // always keep the targets and the scissor, so these are computed only when they change.
+            const uint64_t drawKey[4] = {
+                static_cast<uint64_t>(ctx.frame.fbp) | (static_cast<uint64_t>(ctx.frame.fbw) << 9) | (static_cast<uint64_t>(ctx.frame.psm) << 15) |
+                    (static_cast<uint64_t>(m_depth ? ctx.zbuf.zbp + 1u : 0u) << 21) | (static_cast<uint64_t>(ctx.zbuf.psm) << 31),
+                static_cast<uint64_t>(ctx.scissor.x0) | (static_cast<uint64_t>(ctx.scissor.y0) << 16) | (static_cast<uint64_t>(ctx.scissor.x1) << 32) |
+                    (static_cast<uint64_t>(ctx.scissor.y1) << 48),
+                reinterpret_cast<uintptr_t>(m_color) ^ (reinterpret_cast<uintptr_t>(m_depth) << 1),
+                static_cast<uint64_t>(m_color->h) | (static_cast<uint64_t>(m_depth ? m_depth->h : 0u) << 32)};
+            if (std::memcmp(drawKey, m_drawPagesKey, sizeof(drawKey)) != 0)
+            {
+                std::memcpy(m_drawPagesKey, drawKey, sizeof(drawKey));
+                m_colorDrawPages.reset();
+                addRectPages(m_colorDrawPages, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, ctx.scissor.x0, ctx.scissor.y0,
+                             ctx.scissor.x1, ctx.scissor.y1);
+                m_colorDrawPages &= m_color->pages;
+                m_depthDrawPages.reset();
+                if (m_depth)
+                {
+                    addRectPages(m_depthDrawPages, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, ctx.scissor.x0, ctx.scissor.y0,
+                                 ctx.scissor.x1, ctx.scissor.y1);
+                    m_depthDrawPages &= m_depth->pages;
+                }
+            }
             m_zScale = zScale(ctx.zbuf.psm);
 
             DrawConstants &k = m_constants;
@@ -1930,6 +2095,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 }
                 else if (Target *rt = renderTargetTextureLocked(tex, state.textureWidth, state.textureHeight))
                 {
+                    seedLocked(*rt); // CPU-side writes to its pages first
                     srvs[1] = rt->srv.Get();
                     k.tex[0] = tex.psm == GS_PSM_CT24 ? 7u : 6u;
                     k.hd[0] = static_cast<float>(m_scale);
@@ -2303,9 +2469,20 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                     m_ctx->Draw(static_cast<UINT>(count), first);
                     ++m_statDraws;
                     if (pass.colorMask)
-                        m_color->gpuNewer = true;
+                        m_color->gpuNewer |= m_colorDrawPages;
                     if (pass.depthWrite && m_depth)
-                        m_depth->gpuNewer = true;
+                        m_depth->gpuNewer |= m_depthDrawPages;
+                    if (m_traceFbp >= 0)
+                    {
+                        Target *traced = m_traceDepth ? m_depth : m_color;
+                        if (traced && (m_traceDepth ? pass.depthWrite : pass.colorMask != 0))
+                        {
+                            char detail[96];
+                            std::snprintf(detail, sizeof(detail), "draw %zu vertices marking %zu pages", count,
+                                          (m_traceDepth ? m_depthDrawPages : m_colorDrawPages).count());
+                            traceLocked(*traced, "draw", detail);
+                        }
+                    }
                 }
                 m_vbOffset += chunkBytes; // stays a multiple of sizeof(Vertex): Draw addresses it in vertices
                 done += count;
@@ -2344,19 +2521,21 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             w = std::min(w, 640u);
             h = std::min(h, 512u);
             Target *t = findTarget(false, fbp);
-            if (!t || t->fbw != fbw || t->vramNewer || originX + w > t->w || originY + h > t->h)
+            if (!t || t->fbw != fbw || originX + w > t->w || originY + h > t->h)
             {
                 if (g_raceLoadStarted)
                     ++m_capFallbacks;
                 if (m_stats && m_presentFallbackLogs < 200u)
                 {
                     ++m_presentFallbackLogs;
-                    std::fprintf(stderr, "[gs-gpu] present from local memory: fbp=%u fbw=%u target=%d vramNewer=%d gpuNewer=%d origin=(%u,%u) %ux%u why: %s\n",
-                                 fbp, fbw, t ? 1 : 0, t ? (t->vramNewer ? 1 : 0) : -1, t ? (t->gpuNewer ? 1 : 0) : -1, originX, originY, w, h,
-                                 t ? t->staleWhy : "-");
+                    std::fprintf(stderr, "[gs-gpu] present from local memory: fbp=%u fbw=%u target=%d origin=(%u,%u) %ux%u\n",
+                                 fbp, fbw, t ? 1 : 0, originX, originY, w, h);
                 }
                 return false;
             }
+            // CPU-side writes to the display buffer (movie frames, uploads) reach the GPU copy first.
+            seedLocked(*t);
+            TimelineSpan span(33u);
             const auto presentStart = std::chrono::steady_clock::now();
             const uint32_t sw = w * m_scale, sh = h * m_scale;
             ID3D11Texture2D *staging = stagingLocked(m_stagingPresent, sw, sh, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -2460,6 +2639,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         bool m_noCache = false; // ATV_GS_GPU_NOCACHE=1: decode every texture and palette at every batch (debug)
         bool m_allCpu = false;  // ATV_GS_GPU_ALLCPU=1: every draw goes to the CPU GS (debug)
         int m_traceFbp = -1;    // ATV_GS_GPU_TRACE
+        bool m_traceDepth = std::getenv("ATV_GS_GPU_TRACE_Z") != nullptr;
         uint64_t m_statPrimsTotal = 0;
         unsigned long long m_probeFrom = ~0ull, m_probeTo = 0; // ATV_GS_GPU_PROBE
         std::unordered_set<uint64_t> m_cpuKeys;
@@ -2500,6 +2680,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         GSMem::TexturePageCache m_decodeCache;
         std::vector<uint32_t> m_decode;
         std::vector<uint32_t> m_seedPixels;
+        std::vector<PageRect> m_pageRects; // downloadLocked / seedLocked scratch
 
         std::array<uint16_t, 512> m_clut{};
         std::array<uint32_t, 2> m_clutCbp{};
@@ -2516,6 +2697,8 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         std::vector<Vertex> m_vertices;
         Target *m_color = nullptr;
         Target *m_depth = nullptr;
+        PageSet m_colorDrawPages, m_depthDrawPages; // the pages of m_color / m_depth the batch's scissor covers
+        uint64_t m_drawPagesKey[4] = {~0ull, ~0ull, ~0ull, ~0ull}; // targets and scissor they were computed for
         float m_zScale = 1.0f;
         DrawConstants m_constants{};
         Pass m_passes[2];

@@ -1716,6 +1716,9 @@ bool g_vu1ProgramCut = false;
 // Set by the game override once the player's racer is moving (gates VU workload capture).
 bool g_atvRaceStarted = false;
 uint64_t g_vu1DecodeRebuilds = 0;
+uint64_t g_vu1RunsStepped = 0;
+uint64_t g_vu1RunsGeneric = 0;
+uint64_t g_vu1GenericPairs = 0;
 // Fast-loop block replay: pairs replayed, schedules recorded, replays left
 // early, replays started, replays entered through a link (no signature check).
 uint64_t g_vu1ReplayPairs = 0;
@@ -2486,15 +2489,37 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
                              shadow.size == codeSize && shadow.generation == m_cachedCodeGeneration &&
                              m_cachedVuCode == vuCode && m_cachedCodeSize == codeSize;
     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxDecodedPairs);
+    // The changed pairs first, then their memo entries: each lookup is a cache miss
+    // (a race changes ~500 pairs ~30 times a frame), so the entries a few pairs ahead
+    // are fetched while one is copied.
+    static std::array<uint16_t, kMaxDecodedPairs> s_changed;
+    uint32_t changedCount = 0;
     for (uint32_t i = 0; i < pairCount; ++i)
     {
         uint8_t *bytes = shadow.bytes.data() + i * 8u;
         if (incremental && std::memcmp(bytes, vuCode + i * 8u, 8u) == 0)
             continue;
         std::memcpy(bytes, vuCode + i * 8u, 8u);
+        s_changed[changedCount++] = static_cast<uint16_t>(i);
+    }
+    const auto entryFor = [&](uint32_t i) -> DecodeMemo & {
         uint64_t words = 0;
-        std::memcpy(&words, bytes, 8u);
-        DecodeMemo &entry = memo[(words * 0x9E3779B97F4A7C15ull) >> (64u - kMemoBits)];
+        std::memcpy(&words, shadow.bytes.data() + i * 8u, 8u);
+        return memo[(words * 0x9E3779B97F4A7C15ull) >> (64u - kMemoBits)];
+    };
+    constexpr uint32_t kAhead = 8u;
+    for (uint32_t k = 0; k < changedCount; ++k)
+    {
+        if (k + kAhead < changedCount)
+        {
+            const char *ahead = reinterpret_cast<const char *>(&entryFor(s_changed[k + kAhead]));
+            _mm_prefetch(ahead, _MM_HINT_T0);
+            _mm_prefetch(ahead + sizeof(DecodeMemo) - 1u, _MM_HINT_T0);
+        }
+        const uint32_t i = s_changed[k];
+        uint64_t words = 0;
+        std::memcpy(&words, shadow.bytes.data() + i * 8u, 8u);
+        DecodeMemo &entry = entryFor(i);
         if (!entry.valid || entry.words != words)
         {
             entry.words = words;
@@ -2704,14 +2729,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // VU math rounds toward zero. x64 float math is all SSE, so only MXCSR's rounding
+    // bits are set (fegetround/fesetround also rewrite the x87 control word, ~1% of the
+    // VIF1/VU1 worker at the race's ~150K runs a second).
+    constexpr unsigned int kCsrRoundMask = 0x6000u; // RC; all set = toward zero
     // ATV_VU_APPROX: flush denormal operands and results to zero in hardware
     // (FTZ|DAZ), as the approximate FMAC path relies on.
     const bool approxCsr = g_vuApprox && !g_vuForceInterp;
     const unsigned int savedCsr = _mm_getcsr();
-    if (approxCsr)
-        _mm_setcsr(savedCsr | 0x8040u);
+    _mm_setcsr(savedCsr | kCsrRoundMask | (approxCsr ? 0x8040u : 0u));
     const uint64_t budgetEnd = m_cycle + maxCycles;
     const uint32_t censusStartPc = m_state.pc;
     bool programEnded = false;
@@ -3054,8 +3080,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_state.cycles = m_cycle;
     if (approxCsr)
         _mm_setcsr(savedCsr);
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
+    else
+        _mm_setcsr((_mm_getcsr() & ~kCsrRoundMask) | (savedCsr & kCsrRoundMask));
 }
 
 // Translated from the game's own VU1 microcode, so not in the repository:

@@ -20,6 +20,7 @@ extern uint32_t g_ps2Pc0ResumeTarget;
 extern uint32_t g_ps2IdleResumePc;
 extern uint32_t g_ps2IdleResumeA0;
 extern uint32_t g_ps2HoldEeTimeslices;
+void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg); // gs_frontend.cpp (ATV_TIMELINE)
 bool ps2InterpCanHandle(uint32_t address);
 // Opt-in diagnostic: number of upcoming guest dispatches to log (0 = off).
 uint32_t g_ps2TraceDispatchRemaining = 0;
@@ -2138,9 +2139,11 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                atvTimeline(4u, 0u, 0u); // ATV_TIMELINE: the EE waits for real time to reach a deadline
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
+                atvTimeline(4u, 1u, 0u);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
@@ -2389,9 +2392,11 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    atvTimeline(6u, 0u, 0u); // ATV_TIMELINE: no guest thread can run until the next deadline or event
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
+    atvTimeline(6u, 1u, 0u);
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

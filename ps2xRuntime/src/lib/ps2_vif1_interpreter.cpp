@@ -1,6 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // Optional game hook for VIF1 VIFcode I-bit stalls (FLUSH*/NOP only). The runtime
 // does not deliver the VIF1 INTC interrupt mid-stream, so a game override can do
@@ -9,6 +12,119 @@ void (*g_ps2Vif1IbitHook)(uint32_t vifcode) = nullptr;
 // Set by an I-bit hook when the game abandons the current VIF1 transfer at the stall
 // (e.g. a GS download that restarts VIF1 from another chain); the rest is dropped.
 bool g_ps2Vif1AbortStream = false;
+
+extern bool g_atvTimelineOn; // gs_frontend.cpp (ATV_TIMELINE)
+void atvTimelineRecord(uint16_t kind, uint8_t phase, uint16_t arg);
+namespace
+{
+    inline void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg)
+    {
+        if (g_atvTimelineOn)
+            atvTimelineRecord(kind, phase, arg);
+    }
+    // A span of `kind` on this thread for the lifetime of the object (ATV_TIMELINE).
+    struct VifTimelineSpan
+    {
+        uint16_t kind;
+        explicit VifTimelineSpan(uint16_t k) : kind(k) { atvTimeline(kind, 0u, 0u); }
+        ~VifTimelineSpan() { atvTimeline(kind, 1u, 0u); }
+    };
+
+    // Field `c` of an UNPACK source vector (VL 0-2), sign- or zero-extended.
+    template <uint32_t Vl, bool ZeroExtend>
+    inline uint32_t unpackField(const uint8_t *src, uint32_t c)
+    {
+        if constexpr (Vl == 0u)
+        {
+            uint32_t v = 0;
+            std::memcpy(&v, src + c * 4u, sizeof(v));
+            return v;
+        }
+        else if constexpr (Vl == 1u)
+        {
+            uint16_t v = 0;
+            std::memcpy(&v, src + c * 2u, sizeof(v));
+            return ZeroExtend ? v : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v)));
+        }
+        else
+        {
+            const uint8_t v = src[c];
+            return ZeroExtend ? v : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
+        }
+    }
+
+    // The common UNPACK, with no write mask, no row add (MODE 0 or 3) and STCYCL CL >= WL:
+    // each written vector takes the next source vector, which sets its first VN+1 fields
+    // (all four for S formats and V4-5) and keeps the rest, as the generic loop in
+    // processVIF1Data does field by field (~6% of the VIF1/VU1 worker in races).
+    template <uint32_t Vl, uint32_t Vn, bool ZeroExtend>
+    void unpackPlain(uint8_t *vuData, const uint8_t *src, uint32_t vuAddr, uint32_t count, uint32_t cl, uint32_t wl)
+    {
+        constexpr uint32_t components = Vn + 1u;
+        constexpr uint32_t bytesPerVector = Vl == 3u ? 2u : components * (Vl == 0u ? 4u : Vl == 1u ? 2u : 1u);
+        for (uint32_t w = 0; w < count; ++w, src += bytesPerVector)
+        {
+            const uint32_t destVec = (cl == wl ? vuAddr + w : vuAddr + (w / wl) * cl + w % wl) & 0x3FFu;
+            uint8_t *dst = vuData + destVec * 16u;
+            uint32_t lanes[4];
+            std::memcpy(lanes, dst, sizeof(lanes));
+            if constexpr (Vl == 3u)
+            {
+                // V4-5: packed color-like format in a single 16-bit value.
+                uint16_t packed = 0;
+                std::memcpy(&packed, src, sizeof(packed));
+                lanes[0] = packed & 0x1Fu;
+                lanes[1] = (packed >> 5) & 0x1Fu;
+                lanes[2] = (packed >> 10) & 0x1Fu;
+                lanes[3] = (packed >> 15) & 0x01u;
+            }
+            else if constexpr (components == 1u)
+            {
+                const uint32_t v = unpackField<Vl, ZeroExtend>(src, 0u);
+                lanes[0] = lanes[1] = lanes[2] = lanes[3] = v;
+            }
+            else
+            {
+                for (uint32_t c = 0; c < components; ++c)
+                    lanes[c] = unpackField<Vl, ZeroExtend>(src, c);
+            }
+            std::memcpy(dst, lanes, sizeof(lanes));
+        }
+    }
+
+    template <uint32_t Vl, uint32_t Vn>
+    void unpackPlain(bool zeroExtend, uint8_t *vuData, const uint8_t *src, uint32_t vuAddr, uint32_t count,
+                     uint32_t cl, uint32_t wl)
+    {
+        if (zeroExtend)
+            unpackPlain<Vl, Vn, true>(vuData, src, vuAddr, count, cl, wl);
+        else
+            unpackPlain<Vl, Vn, false>(vuData, src, vuAddr, count, cl, wl);
+    }
+
+    // unpackPlain for VL/VN; false for the format the generic loop copies raw (VL 3, VN < 3).
+    bool unpackPlain(uint32_t vl, uint32_t vn, bool zeroExtend, uint8_t *vuData, const uint8_t *src, uint32_t vuAddr,
+                     uint32_t count, uint32_t cl, uint32_t wl)
+    {
+        switch (vl * 4u + vn)
+        {
+        case 0u: unpackPlain<0u, 0u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 1u: unpackPlain<0u, 1u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 2u: unpackPlain<0u, 2u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 3u: unpackPlain<0u, 3u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 4u: unpackPlain<1u, 0u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 5u: unpackPlain<1u, 1u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 6u: unpackPlain<1u, 2u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 7u: unpackPlain<1u, 3u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 8u: unpackPlain<2u, 0u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 9u: unpackPlain<2u, 1u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 10u: unpackPlain<2u, 2u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 11u: unpackPlain<2u, 3u>(zeroExtend, vuData, src, vuAddr, count, cl, wl); return true;
+        case 15u: unpackPlain<3u, 3u>(false, vuData, src, vuAddr, count, cl, wl); return true;
+        default: return false;
+        }
+    }
+}
 
 enum VIFCmd : uint8_t
 {
@@ -510,7 +626,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
+                // Re-uploading the program already there changes nothing: keeping the code
+                // generation spares VU1 its decode and classification of the whole image.
+                if (pos + copyBytes <= sizeBytes && std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
@@ -554,6 +672,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if ((opcode & 0x60) == 0x60)
         {
+            VifTimelineSpan unpackSpan(15u); // ATV_TIMELINE
             uint8_t vn = (opcode >> 2) & 0x3;
             uint8_t vl = opcode & 0x3;
             const bool maskEnable = (opcode & 0x10u) != 0u;
@@ -608,7 +727,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            const bool inBounds = m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes;
+            const uint32_t unpackMode = vif1_regs.mode & 3u;
+            const bool plainCase = inBounds && !maskEnable && (unpackMode == 0u || unpackMode == 3u) && cl >= wl;
+            // ATV_VIF_UNPACK_CHECK=1: run the generic loop after each plain UNPACK and compare.
+            static const bool s_unpackCheck = std::getenv("ATV_VIF_UNPACK_CHECK") != nullptr;
+            static std::vector<uint8_t> s_checkBefore, s_checkPlain;
+            const bool check = plainCase && s_unpackCheck;
+            if (check)
+                s_checkBefore.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+            bool plain = plainCase && unpackPlain(vl, vn, zeroExtend, m_vu1Data, data + pos, vuAddr, writeVectorCount, cl, wl);
+            if (check && plain)
+            {
+                s_checkPlain.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                std::memcpy(m_vu1Data, s_checkBefore.data(), PS2_VU1_DATA_SIZE);
+                plain = false;
+            }
+            if (inBounds && !plain)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
@@ -804,6 +939,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
+            }
+            if (check && !s_checkPlain.empty())
+            {
+                static uint64_t s_checked = 0u, s_mismatches = 0u;
+                ++s_checked;
+                if (std::memcmp(s_checkPlain.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0 && ++s_mismatches <= 20u)
+                    std::fprintf(stderr, "[vif-unpack-check] MISMATCH vl=%u vn=%u num=%u cl=%u wl=%u mode=%u usn=%d addr=0x%x\n",
+                                 vl, vn, writeVectorCount, cl, wl, unpackMode, zeroExtend ? 1 : 0, vuAddr);
+                if ((s_checked & 0xFFFFu) == 0u)
+                    std::fprintf(stderr, "[vif-unpack-check] checked=%llu mismatches=%llu\n",
+                                 static_cast<unsigned long long>(s_checked), static_cast<unsigned long long>(s_mismatches));
+                s_checkPlain.clear();
             }
             pos += totalBytes;
 

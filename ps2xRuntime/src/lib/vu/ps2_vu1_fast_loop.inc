@@ -228,6 +228,10 @@
             };
             constexpr uint32_t kMemoBits = 12u;
             static ClassMemo s_classMemo[1u << kMemoBits];
+            // The changed pairs first, then their memo entries, fetched a few pairs ahead
+            // (as rebuildDecodedCodeCache: each lookup is a cache miss).
+            static std::array<uint16_t, kMaxDecodedPairs> s_changed;
+            uint32_t changedCount = 0;
             for (uint32_t i = 0; i < pairs; ++i)
             {
                 uint8_t *shadow = s_fastOps.shadow.data() + i * 8u;
@@ -235,36 +239,55 @@
                 if (changed)
                 {
                     std::memcpy(shadow, vuCode + i * 8u, 8u);
-                    const DecodedInstructionPair &decoded = m_decodedCodeCache[i];
-                    const uint64_t words = uint64_t{decoded.upper} << 32 | decoded.lower;
-                    ClassMemo &memo = s_classMemo[(words * 0x9E3779B97F4A7C15ull) >> (64u - kMemoBits)];
-                    if (!memo.valid || memo.words != words)
-                    {
-                        memo.words = words;
-                        memo.valid = true;
-                        memo.op = classifyUpper(decoded.upper);
-                        memo.op.lowerKind = classifyLower(decoded);
-                        memo.reads = classifyReads(decoded);
-                        memo.writes = classifyWrites(decoded);
-                        memo.readsFlags = lowerReadsFlags(decoded);
-                    }
-                    s_fastOps.ops[i] = memo.op;
-                    if (s_cachedReads)
-                        s_fastOps.reads[i] = memo.reads;
-                    const FastWrites &w = s_fastOps.writes[i] = memo.writes;
-                    s_fastOps.pairReadsFlags[i] = memo.readsFlags;
-                    uint32_t &maxLatency = s_fastOps.maxWriteLatency;
-                    maxLatency = std::max<uint32_t>(maxLatency, kAccForwardLatency);
-                    if (w.upperLanes != 0u)
-                        maxLatency = std::max(maxLatency, w.upperLat);
-                    if (w.lowerLanes != 0u)
-                        maxLatency = std::max(maxLatency, w.lowerLat);
-                    if (w.viReg != 0u)
-                        maxLatency = std::max(maxLatency, w.viLat);
+                    s_changed[changedCount++] = static_cast<uint16_t>(i);
                 }
-                s_fastOps.readsFlags |= s_fastOps.pairReadsFlags[i];
                 dirtyBefore[i + 1u] = dirtyBefore[i] + (changed ? 1u : 0u);
             }
+            // The memo key: the pair's words, upper << 32 | lower (its shadow bytes).
+            const auto memoFor = [&](uint32_t i) -> ClassMemo & {
+                uint64_t words = 0;
+                std::memcpy(&words, s_fastOps.shadow.data() + i * 8u, 8u);
+                return s_classMemo[(words * 0x9E3779B97F4A7C15ull) >> (64u - kMemoBits)];
+            };
+            constexpr uint32_t kAhead = 8u;
+            for (uint32_t k = 0; k < changedCount; ++k)
+            {
+                if (k + kAhead < changedCount)
+                {
+                    const char *ahead = reinterpret_cast<const char *>(&memoFor(s_changed[k + kAhead]));
+                    _mm_prefetch(ahead, _MM_HINT_T0);
+                    _mm_prefetch(ahead + sizeof(ClassMemo) - 1u, _MM_HINT_T0);
+                }
+                const uint32_t i = s_changed[k];
+                const DecodedInstructionPair &decoded = m_decodedCodeCache[i];
+                const uint64_t words = uint64_t{decoded.upper} << 32 | decoded.lower;
+                ClassMemo &memo = memoFor(i);
+                if (!memo.valid || memo.words != words)
+                {
+                    memo.words = words;
+                    memo.valid = true;
+                    memo.op = classifyUpper(decoded.upper);
+                    memo.op.lowerKind = classifyLower(decoded);
+                    memo.reads = classifyReads(decoded);
+                    memo.writes = classifyWrites(decoded);
+                    memo.readsFlags = lowerReadsFlags(decoded);
+                }
+                s_fastOps.ops[i] = memo.op;
+                if (s_cachedReads)
+                    s_fastOps.reads[i] = memo.reads;
+                const FastWrites &w = s_fastOps.writes[i] = memo.writes;
+                s_fastOps.pairReadsFlags[i] = memo.readsFlags;
+                uint32_t &maxLatency = s_fastOps.maxWriteLatency;
+                maxLatency = std::max<uint32_t>(maxLatency, kAccForwardLatency);
+                if (w.upperLanes != 0u)
+                    maxLatency = std::max(maxLatency, w.upperLat);
+                if (w.lowerLanes != 0u)
+                    maxLatency = std::max(maxLatency, w.lowerLat);
+                if (w.viReg != 0u)
+                    maxLatency = std::max(maxLatency, w.viLat);
+            }
+            for (uint32_t i = 0; i < pairs; ++i)
+                s_fastOps.readsFlags |= s_fastOps.pairReadsFlags[i];
             for (uint32_t i = 0; i < pairs; ++i)
             {
                 std::unique_ptr<BlockInfo> &block = s_fastOps.blocks[i];
@@ -1208,16 +1231,19 @@
         BlockInfo *chainBlock = nullptr;
         uint32_t chainSchedule = 0;
         // Natively compiled blocks (ps2_vu1_native.inc). They need the exact
-        // per-pair semantics, so not while per-pair traces are recorded, and
-        // their loads and stores assume VU1's 16 KB of data memory.
-        const bool nativeOn = VU1Native::s_enabled && codeSize == 0x4000u && dataSize == 0x4000u && vuData &&
-                              vuData == m_activeVuData && !g_vuVerifyTrace;
+        // per-pair semantics, so not while per-pair traces are recorded, their
+        // loads and stores assume VU1's 16 KB of data memory, and their upper ops
+        // are only in the lean flag modes' form.
+        const bool nativeOn = VU1Native::s_enabled && VU1Native::leanInline() && codeSize == 0x4000u &&
+                              dataSize == 0x4000u && vuData && vuData == m_activeVuData && !g_vuVerifyTrace;
         VU1Native::Ctx nativeCtx;
         VU1Native::initCtx(nativeCtx, *this, vuData, dataSize, gs, memory, budgetEnd, &writesReadyAt, hint);
         // ATV_VU_NATIVE_GEN: blocks are generated where the previous pair
         // ended one (a branch delay slot or E-bit pair), and at run entry.
         bool nativeBoundary = true;
         bool nativeTail = false;
+        bool stepped = false; // a pair ran outside the native blocks (diagnostic)
+        const uint64_t genericBefore = g_vu1GenericPairs;
         while (m_cycle < budgetEnd && !m_stopRequested)
         {
             if (m_cycle >= hint.nextReady)
@@ -1251,6 +1277,7 @@
                 if (!fn && VU1Native::s_genPath && nativeBoundary)
                     VU1Native::generate(*this, pairIndex, codePairs);
             }
+            stepped = true;
             BlockInfo *const fromBlock = chainBlock;
             const uint32_t fromSchedule = chainSchedule;
             chainBlock = nullptr;
@@ -1444,6 +1471,8 @@
                 break;
         }
         s_rec.block = nullptr;
+        g_vu1RunsStepped += stepped ? 1u : 0u;
+        g_vu1RunsGeneric += g_vu1GenericPairs != genericBefore ? 1u : 0u;
         // The interpreter loop continues after fastLeft and needs MAC values that
         // are not visible yet in the flag pipeline; otherwise run() flushes every
         // pipeline on exit and the latest MAC wins.

@@ -10,6 +10,12 @@
 extern uint64_t g_vu1PairTotal;
 // Pairs executed by natively compiled blocks (subset of g_vu1PairTotal).
 inline uint64_t g_vu1NativePairs = 0;
+// Temporary diagnostic ([VU1:STATS], VU1 bench; ps2_vu1_core.cpp): fast-loop runs that
+// stepped a pair outside the native blocks, runs whose blocks ran a generic pair, and
+// generic pairs run.
+extern uint64_t g_vu1RunsStepped;
+extern uint64_t g_vu1RunsGeneric;
+extern uint64_t g_vu1GenericPairs;
 
 struct VU1Native
 {
@@ -1106,10 +1112,10 @@ struct VU1Native
     static inline const bool s_regen = s_genPath != nullptr && std::getenv("ATV_VU_NATIVE_REGEN") != nullptr;
     // Same knob and test as fastAdvanceTo in the fast loop.
     static inline const bool s_idleSkip = std::getenv("ATV_VU_NO_IDLE_SKIP") == nullptr;
-    // ATV_VU_NO_INLINE_UPPER=1: merged blocks call the shared upper ops (upperOpGeneral)
-    // instead of their inlined lean forms.
+    // ATV_VU_NO_INLINE_UPPER=1: merged blocks stay out (their upper ops are only in the
+    // inlined lean form), so every pair runs on the fast loop's per-pair path.
     static inline const bool s_inlineUpper = std::getenv("ATV_VU_NO_INLINE_UPPER") == nullptr;
-    // Whether a merged block part takes its inlined lean upper ops.
+    // Whether merged blocks run: otherwise each bails before its first pair.
     static __forceinline bool leanInline() { return g_vuFmacLean && s_inlineUpper; }
 
     static void initCtx(Ctx &c, Interp &vu, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
@@ -1340,8 +1346,9 @@ struct VU1Native
     // besides its result, only the normal/exact-zero proof of its dest lanes, so
     // merged blocks inline that form. They keep vuNormalize4 of the registers they
     // read in locals while a register is unchanged (operands arrive normalized),
-    // and with a constant DEST the dest-lane store is a blend. Every other flag
-    // mode calls upperOpGeneral, as before. Each form has fastUpper's effects.
+    // and with a constant DEST the dest-lane store is a blend. In every other flag
+    // mode a merged block bails before its first pair (the fast loop's per-pair path
+    // runs it). Each form has fastUpper's effects.
 
     // DEST as movemask/blend lane bits (x = bit 0).
     static constexpr int laneBits(uint32_t dest)
@@ -1704,6 +1711,7 @@ struct VU1Native
     static __declspec(noinline) void execPairGeneric(Ctx &c, uint32_t pairIndex)
     {
         Interp &vu = *c.vu;
+        ++g_vu1GenericPairs;
         VU1State &m_state = vu.m_state;
         const DecodedInstructionPair &decoded = vu.m_decodedCodeCache[pairIndex];
         if (s_counts)

@@ -26,6 +26,11 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace ps2_stubs
 {
@@ -63,32 +68,62 @@ extern std::function<void(const uint8_t *, uint32_t)> g_ps2GifDirectProcess;
 bool ps2InterpCanHandle(uint32_t address);
 void ps2InterpretGuest(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx);
 
+extern bool g_atvTimelineOn; // gs/gs_frontend.cpp (ATV_TIMELINE)
+void atvTimelineRecord(uint16_t kind, uint8_t phase, uint16_t arg);
+static inline void atvTimeline(uint16_t kind, uint8_t phase, uint16_t arg)
+{
+    if (g_atvTimelineOn)
+        atvTimelineRecord(kind, phase, arg);
+}
+
+// vu/ps2_vu1_core.cpp: rebuilds of VU1's decoded-code cache (one per changed code image).
+extern uint64_t g_vu1DecodeRebuilds;
+// vu/ps2_vu1_native.inc (in ps2_vu1_core.cpp): fast-loop runs that stepped a pair outside
+// the native blocks, and runs whose blocks ran a generic pair.
+extern uint64_t g_vu1RunsStepped;
+extern uint64_t g_vu1RunsGeneric;
+
 // Temporary race diagnostic: VU1 run counts, guest cycles and host time per 2 s window.
-static void noteVu1Run(uint32_t startPc, uint64_t cyclesBefore, uint64_t cyclesAfter,
-                       std::chrono::steady_clock::time_point hostStart)
+// Runs are timed in TSC ticks, scaled by the window's ticks per nanosecond: two clock reads
+// a run (~150K runs a second) were ~0.7% of the VIF1/VU1 worker.
+static void noteVu1Run(uint32_t startPc, uint64_t cyclesBefore, uint64_t cyclesAfter, uint64_t tscStart)
 {
     static std::chrono::steady_clock::time_point s_windowStart = std::chrono::steady_clock::now();
-    static uint64_t s_runs = 0, s_cycles = 0, s_budgetHits = 0, s_hostNs = 0;
+    static uint64_t s_windowTsc = __rdtsc();
+    static uint64_t s_runs = 0, s_cycles = 0, s_budgetHits = 0, s_hostTicks = 0;
+    static uint64_t s_rebuildsBefore = 0, s_steppedBefore = 0, s_genericBefore = 0;
     static uint32_t s_maxPc = 0;
     static uint64_t s_maxCycles = 0;
-    const auto now = std::chrono::steady_clock::now();
+    const uint64_t tsc = __rdtsc();
     const uint64_t used = cyclesAfter - cyclesBefore;
     ++s_runs;
     s_cycles += used;
     s_budgetHits += used >= 65536u ? 1u : 0u;
-    s_hostNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - hostStart).count());
+    s_hostTicks += tsc - tscStart;
     if (used > s_maxCycles)
     {
         s_maxCycles = used;
         s_maxPc = startPc;
     }
+    if ((s_runs & 255u) != 0u)
+        return;
+    const auto now = std::chrono::steady_clock::now();
     if (now - s_windowStart >= std::chrono::seconds(2))
     {
+        const double windowNs = std::chrono::duration<double, std::nano>(now - s_windowStart).count();
+        const double nsPerTick = tsc > s_windowTsc ? windowNs / static_cast<double>(tsc - s_windowTsc) : 0.0;
+        const uint64_t rebuilds = g_vu1DecodeRebuilds, stepped = g_vu1RunsStepped, generic = g_vu1RunsGeneric;
         std::cerr << "[VU1:STATS] runs=" << s_runs << " cycles=" << s_cycles << " budgetHits=" << s_budgetHits
-                  << " hostMs=" << (s_hostNs / 1000000u) << " maxCycles=" << s_maxCycles << " maxStart=0x"
-                  << std::hex << s_maxPc << std::dec << std::endl;
+                  << " hostMs=" << static_cast<uint64_t>(static_cast<double>(s_hostTicks) * nsPerTick / 1e6)
+                  << " codeRebuilds=" << (rebuilds - s_rebuildsBefore) << " steppedRuns=" << (stepped - s_steppedBefore)
+                  << " genericRuns=" << (generic - s_genericBefore) << " maxCycles=" << s_maxCycles
+                  << " maxStart=0x" << std::hex << s_maxPc << std::dec << std::endl;
         s_windowStart = now;
-        s_runs = s_cycles = s_budgetHits = s_hostNs = s_maxCycles = 0;
+        s_windowTsc = tsc;
+        s_rebuildsBefore = rebuilds;
+        s_steppedBefore = stepped;
+        s_genericBefore = generic;
+        s_runs = s_cycles = s_budgetHits = s_hostTicks = s_maxCycles = 0;
         s_maxPc = 0;
     }
 }
@@ -748,8 +783,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = onWorker ? PS2Memory::gsWorkerVu0Fbrst() : cpuContext->vu0_fbrst;
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
-                                     const auto vuHostStart = std::chrono::steady_clock::now();
+                                     const uint64_t vuHostStart = __rdtsc();
                                      const uint64_t vuCyclesBefore = m_vu1.state().cycles;
+                                     atvTimeline(14u, 0u, 0u); // ATV_TIMELINE: a VU1 run
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
@@ -757,6 +793,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                          { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                                         m_memory.getVU1Data(), PS2_VU1_DATA_SIZE, m_gs, &m_memory,
                                                                         m_vu1.state().top, m_vu1.state().itop, 65536); });
+                                     atvTimeline(14u, 1u, 0u);
                                      noteVu1Run(startPC, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      if (onWorker)
                                          return;
@@ -776,8 +813,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                      const uint32_t fbrst = onWorker ? PS2Memory::gsWorkerVu0Fbrst() : cpuContext->vu0_fbrst;
                                      m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
-                                     const auto vuHostStart = std::chrono::steady_clock::now();
+                                     const uint64_t vuHostStart = __rdtsc();
                                      const uint64_t vuCyclesBefore = m_vu1.state().cycles;
+                                     atvTimeline(14u, 0u, 1u); // ATV_TIMELINE: a VU1 run (MSCNT)
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
@@ -785,6 +823,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                          { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                                         m_memory.getVU1Data(), PS2_VU1_DATA_SIZE, m_gs, &m_memory,
                                                                         m_vu1.state().top, m_vu1.state().itop, 65536); });
+                                     atvTimeline(14u, 1u, 1u);
                                      noteVu1Run(0xFFFFu, vuCyclesBefore, m_vu1.state().cycles, vuHostStart);
                                      if (onWorker)
                                          return;
