@@ -15,6 +15,9 @@
 #include <algorithm>
 #include <cstdlib>
 
+// ps2_vu1_core.cpp: ATV_VU_NATIVE_BUILD (tools/vu1gen/make_vu1_blocks.py).
+int ps2Vu1BuildNativeBlocks(const char *wordsPath);
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
@@ -199,6 +202,10 @@ int main(int argc, char *argv[])
     redirectStdioToLogcat();
 #endif
     setupTerminateLogger();
+
+    // Offline step of tools/vu1gen/make_vu1_blocks.py: write the VU1 native block chunks and exit.
+    if (const char *wordsPath = std::getenv("ATV_VU_NATIVE_BUILD"))
+        return ps2Vu1BuildNativeBlocks(wordsPath);
 
     try
     {

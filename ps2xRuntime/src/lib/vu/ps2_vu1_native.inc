@@ -1881,7 +1881,9 @@ struct VU1Native
     // (tools/vu1gen/merge_blocks.py turns the chunks into
     // ps2_vu1_native_blocks.inc). Uses the decoded code cache and the fast
     // loop's own classification, so the folded code matches it pair by pair.
-    static void generate(Interp &vu, uint32_t first, uint32_t codePairs)
+    // `maxPairs` ends the block early (buildFromWords, whose code memory holds
+    // only the block).
+    static void generate(Interp &vu, uint32_t first, uint32_t codePairs, uint32_t maxPairs = ~0u)
     {
         static constexpr uint32_t kMaxPairs = 256;
         static FILE *s_file = nullptr;
@@ -1898,7 +1900,7 @@ struct VU1Native
             const DecodedInstructionPair &d = vu.m_decodedCodeCache[i];
             const bool branch = !d.iBit && d.lowerUsage.pipeline == Interp::PipelineBranch;
             if (d.upperUsage.reserved || d.lowerUsage.reserved || d.dBit || d.tBit ||
-                (tail && (branch || d.eBit)) || (!tail && pairs.size() >= kMaxPairs))
+                (tail && (branch || d.eBit)) || (!tail && pairs.size() >= kMaxPairs) || pairs.size() >= maxPairs)
                 break;
             pairs.push_back(i);
             if (tail)
@@ -2077,5 +2079,57 @@ struct VU1Native
         line("// ATV-VU1-END");
         std::fwrite(out.data(), 1, out.size(), s_file);
         std::fflush(s_file);
+    }
+
+    // ATV_VU_NATIVE_BUILD=file with ATV_VU_NATIVE_GEN: generate the block of each
+    // "<pc hex> <pairs> <word hex>..." entry (tools/vu1gen/make_vu1_blocks.py
+    // reads the words from the game's ELF), with its code alone in an empty code
+    // memory. A pair's decode depends only on its own words and the pair count
+    // bounds the block, so the chunks match the ones the game's runs produce.
+    static int buildFromWords(const char *wordsPath)
+    {
+        if (!s_genPath)
+        {
+            std::fprintf(stderr, "[vu-native] ATV_VU_NATIVE_BUILD needs ATV_VU_NATIVE_GEN=<output file>\n");
+            return 1;
+        }
+        FILE *in = std::fopen(wordsPath, "r");
+        if (!in)
+        {
+            std::fprintf(stderr, "[vu-native] cannot open %s\n", wordsPath);
+            return 1;
+        }
+        auto vu = std::make_unique<Interp>(Interp::Unit::VU1);
+        std::vector<uint8_t> code(Interp::kMaxDecodedPairs * 8u);
+        uint64_t generation = 0;
+        size_t blocks = 0;
+        unsigned pc = 0, pairs = 0;
+        while (std::fscanf(in, "%x %u", &pc, &pairs) == 2)
+        {
+            if ((pc & 7u) != 0u || pairs == 0u || pc + pairs * 8ull > code.size())
+            {
+                std::fprintf(stderr, "[vu-native] bad block pc=0x%04x pairs=%u in %s\n", pc, pairs, wordsPath);
+                std::fclose(in);
+                return 1;
+            }
+            std::fill(code.begin(), code.end(), uint8_t{0});
+            for (unsigned n = 0; n < pairs * 2u; ++n)
+            {
+                unsigned word = 0;
+                if (std::fscanf(in, "%x", &word) != 1)
+                {
+                    std::fprintf(stderr, "[vu-native] short block pc=0x%04x in %s\n", pc, wordsPath);
+                    std::fclose(in);
+                    return 1;
+                }
+                std::memcpy(code.data() + pc + n * 4u, &word, 4u);
+            }
+            vu->rebuildDecodedCodeCache(code.data(), static_cast<uint32_t>(code.size()), nullptr, ++generation);
+            generate(*vu, pc >> 3, Interp::kMaxDecodedPairs, pairs);
+            ++blocks;
+        }
+        std::fclose(in);
+        std::fprintf(stderr, "[vu-native] generated %zu block(s) into %s\n", blocks, s_genPath);
+        return 0;
     }
 };

@@ -3058,4 +3058,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         std::fesetround(previousRoundingMode);
 }
 
+// Translated from the game's own VU1 microcode, so not in the repository:
+// tools/vu1gen/make_vu1_blocks.py builds it from your SCUS_972.11. Without it
+// every VU1 program runs on the fast loop (slower races).
+#if __has_include("ps2_vu1_native_blocks.inc")
 #include "ps2_vu1_native_blocks.inc"
+#else
+const VU1Native::BlockEntry *VU1Native::registry(size_t &count)
+{
+    static const BlockEntry kEntries[] = {{0xFFFFFFFFu, 0u, nullptr, nullptr}};
+    std::fprintf(stderr, "[vu-native] ps2_vu1_native_blocks.inc missing: run tools/vu1gen/make_vu1_blocks.py "
+                         "and rebuild for full race speed\n");
+    count = 0;
+    return kEntries;
+}
+#endif
+
+int ps2Vu1BuildNativeBlocks(const char *wordsPath)
+{
+    return VU1Native::buildFromWords(wordsPath);
+}

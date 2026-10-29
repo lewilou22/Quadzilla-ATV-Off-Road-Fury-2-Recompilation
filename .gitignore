@@ -25,3 +25,7 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+
+# Translated from the game's VU1 microcode: tools/vu1gen/make_vu1_blocks.py builds them from your SCUS_972.11
+ps2xRuntime/src/lib/vu/ps2_vu1_native_blocks.inc
+tools/vu1gen/vu1_blocks_flat.txt
