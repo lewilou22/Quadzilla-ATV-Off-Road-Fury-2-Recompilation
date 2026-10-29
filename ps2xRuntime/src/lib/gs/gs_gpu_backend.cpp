@@ -6,6 +6,8 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "gs_texture_replace.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h" // xxHash 0.8.3 (BSD 2-Clause), as gs_texture_replace.cpp
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -94,7 +96,8 @@ namespace
     }
 
     // Pages a bw-wide surface at block bp covers on rows [y0, y1], columns [0, x1] (conservative:
-    // whole page rows).
+    // whole page rows). Columns past the buffer width (a 1024-wide texture of a 640-wide frame)
+    // address the pages after each row's, so the last row reaches that much further.
     void addPages(PageSet &set, uint32_t bp, uint32_t bw, uint8_t psm, uint32_t y0, uint32_t y1, uint32_t x1 = UINT32_MAX)
     {
         uint32_t pw, ph;
@@ -103,11 +106,12 @@ namespace
         const uint32_t perRow = std::max<uint32_t>(1u, std::max<uint32_t>(bw, 1u) * 64u / pw);
         const uint32_t first = (bp >> 5) + (y0 / ph) * perRow;
         const uint32_t rows = y1 / ph - y0 / ph + 1u;
+        const uint32_t beyond = x1 != UINT32_MAX && x1 / pw + 1u > perRow ? x1 / pw + 1u - perRow : 0u;
         // A base inside a page spills into the next page when the blocks used run past it.
         bool spill = (bp & 31u) != 0u;
         if (spill && rows == 1u && x1 < pw)
             spill = (bp & 31u) + maxBlockInPage(psm, x1, y1 % ph) >= 32u;
-        const uint32_t count = std::min<uint32_t>(kPages, rows * perRow + (spill ? 1u : 0u));
+        const uint32_t count = std::min<uint32_t>(kPages, rows * perRow + beyond + (spill ? 1u : 0u));
         for (uint32_t i = 0; i < count; ++i)
             set.set((first + i) % kPages);
     }
@@ -150,12 +154,13 @@ namespace
 cbuffer Draw : register(b0)
 {
     float4 g_ndc;   // x: 2/W, y: 2/H of the 1x target
-    uint4  g_tex;   // x: kind (0 none, 1 CT32, 2 CT24, 3 CT16, 4 palette, 5 HD image), y: width, z: height, w: bilinear
+    uint4  g_tex;   // x: kind (0 none, 1 CT32, 2 CT24, 3 CT16, 4 palette, 5 HD image, 6 / 7 a GPU render
+                    // target as CT32 / CT24), y: width, z: height, w: bilinear
     uint4  g_wrap;  // x: wrap U, y: wrap V, z: MINU | MAXU << 16, w: MINV | MAXV << 16
     uint4  g_texa;  // x: TA0, y: TA1, z: AEM, w: TFX | TCC << 4
     uint4  g_test;  // x: ATST (8 = off), y: AREF, z: 0 every fragment / 1 passing / 2 failing, w: FBA
     uint4  g_blend; // x: 1 = blend computed here (no Cd), y: A | B << 2 | C << 4 | D << 6, z: FIX
-    float4 g_hd;    // base texel -> HD texture uv: xy scale, zw offset
+    float4 g_hd;    // base texel -> HD texture uv: xy scale, zw offset; kinds 6 / 7: x scale, y half of it
     uint4  g_fog;   // xyz: FOGCOL, w: fog on (triangles only, like the CPU GS)
 };
 cbuffer Palette : register(b1)
@@ -163,7 +168,7 @@ cbuffer Palette : register(b1)
     uint4 g_pal[64];
 };
 Texture2D<uint> g_raw : register(t0);
-Texture2D<float4> g_hdTex : register(t1);
+Texture2D<float4> g_hdTex : register(t1); // the HD image, or the render target of kinds 6 / 7
 SamplerState g_hdSampler : register(s0);
 
 struct VSIn
@@ -213,7 +218,16 @@ uint4 texel(int2 c)
 {
     int x = wrapCoord(c.x, (int)g_tex.y, g_wrap.x, g_wrap.z & 0xFFFF, g_wrap.z >> 16);
     int y = wrapCoord(c.y, (int)g_tex.z, g_wrap.y, g_wrap.w & 0xFFFF, g_wrap.w >> 16);
-    uint raw = g_raw.Load(int3(x, y, 0));
+    uint raw;
+    if (g_tex.x >= 6)
+    {
+        // The GS pixel's centre sample, as a download writes it to local memory.
+        int s = (int)g_hd.x, h = (int)g_hd.y;
+        uint4 b = (uint4)(g_hdTex.Load(int3(x * s + h, y * s + h, 0)) * 255.0 + 0.5);
+        raw = b.r | (b.g << 8) | (b.b << 16) | (b.a << 24);
+    }
+    else
+        raw = g_raw.Load(int3(x, y, 0));
     if (g_tex.x == 4)
     {
         uint i = raw & 255;
@@ -228,7 +242,7 @@ uint4 texel(int2 c)
         return t;
     }
     t = unpackRgba(raw);
-    if (g_tex.x == 2)
+    if (g_tex.x == 2 || g_tex.x == 7)
         t.a = (g_texa.z != 0 && t.r == 0 && t.g == 0 && t.b == 0) ? 0 : g_texa.x;
     return t;
 }
@@ -383,6 +397,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         uint32_t w = 0, h = 0; // 1x pixels
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11RenderTargetView> rtv;
+        ComPtr<ID3D11ShaderResourceView> srv; // colour targets: sampled as textures (renderTargetTextureLocked)
         ComPtr<ID3D11DepthStencilView> dsv;
         PageSet pages;
         bool gpuNewer = false;  // GPU draws local memory lacks
@@ -390,13 +405,22 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         char staleWhy[112] = "new target"; // the CPU-side write that last set vramNewer (stats logs)
     };
 
+    // One decoded image of local memory, kept by its content (see textureFor).
     struct TexEntry
     {
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11ShaderResourceView> srv;
+        uint32_t w = 0, h = 0;
+        uint64_t lastUse = 0;
+        std::vector<uint32_t> texels; // ATV_GS_GPU_TEXCHECK only
+    };
+
+    // A TEX0 (TBP0/TBW/PSM/TW/TH): its pages and the image they held at its last use.
+    struct TexSlot
+    {
         PageSet pages;
         uint64_t versionSum = 0;
-        uint64_t lastUse = 0;
+        uint64_t content = 0; // m_textures key of that image; 0 = none yet
     };
 
     struct HdEntry
@@ -439,14 +463,23 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
     public:
         explicit GSGpuBackend(uint32_t scale) : m_scale(scale)
         {
-            // The keeper draws only what the GPU does not own: inline, no band threads.
-            char *old = nullptr;
-            size_t oldLen = 0;
-            _dupenv_s(&old, &oldLen, "ATV_GS_BANDS");
-            _putenv_s("ATV_GS_BANDS", "1");
-            m_cpu = std::make_unique<GSCpuBackend>();
-            _putenv_s("ATV_GS_BANDS", old ? old : "");
-            std::free(old);
+            // The keeper draws only what the GPU does not own (PSXWater's VIF stream, the race's
+            // 128x128 shadow passes: a third of this thread's time when drawn inline), on the CPU
+            // GS's band threads; this backend finishes its queued draws (cpuIdleLocked) before it
+            // reads or writes local memory itself. ATV_GS_GPU_KEEPER_BANDS=n sets their count
+            // (1 = inline, the old behaviour), else ATV_GS_BANDS / the CPU GS default.
+            if (const char *keeperBands = std::getenv("ATV_GS_GPU_KEEPER_BANDS"))
+            {
+                char *old = nullptr;
+                size_t oldLen = 0;
+                _dupenv_s(&old, &oldLen, "ATV_GS_BANDS");
+                _putenv_s("ATV_GS_BANDS", keeperBands);
+                m_cpu = std::make_unique<GSCpuBackend>();
+                _putenv_s("ATV_GS_BANDS", old ? old : "");
+                std::free(old);
+            }
+            else
+                m_cpu = std::make_unique<GSCpuBackend>();
             // ATV_GS_GPU_STATS=1: every 5 s; a value with a decimal point is the interval in seconds.
             if (const char *stats = std::getenv("ATV_GS_GPU_STATS"))
             {
@@ -506,6 +539,23 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             submitLocked(batch);
         }
 
+        // Consecutive primitives from the GS worker under one lock (gsGpuSubmitMany).
+        void SubmitMany(const GSPrimitiveBatch *const *batches, size_t count)
+        {
+            FpGuard fpGuard;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (m_capEnabled)
+                {
+                    if (g_raceLoadStarted && !m_capFile && !m_capDone)
+                        ++m_capRacePrims;
+                    captureWriteLocked(GSCaptureSubmit, batches[i], sizeof(GSPrimitiveBatch));
+                }
+                submitLocked(*batches[i]);
+            }
+        }
+
         void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
         {
             FpGuard fpGuard;
@@ -537,8 +587,11 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             }
             PageSet src;
             addPages(src, tex0.cbp, std::max<uint32_t>(1u, texclut.cbw), tex0.cpsm, 0u, 15u, tex0.csm ? UINT32_MAX : 15u);
+            if (m_stats)
+                std::snprintf(m_why, sizeof(m_why), "clut cbp=0x%x cpsm=0x%x", tex0.cbp, tex0.cpsm);
             syncForCpuLocked(src, false);
             m_cpu->LoadClut(tex0, texclut);
+            cpuIdleLocked(&src);
             const std::array<uint16_t, 512> before = m_clut;
             loadClutLocked(tex0, texclut);
             ++m_statClutLoads;
@@ -572,6 +625,8 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 addPages(src, b.sbp, b.sbw, b.spsm, command.trxpos.ssay,
                          command.trxpos.ssay + std::max<uint32_t>(1u, command.trxreg.rrh) - 1u,
                          command.trxpos.ssax + std::max<uint32_t>(1u, command.trxreg.rrw) - 1u);
+                if (command.direction == 1u)
+                    noteReadbackLocked(src);
                 syncForCpuLocked(src, false);
             }
             if (command.direction == 0u || command.direction == 2u)
@@ -596,6 +651,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                         for (uint32_t p = 0; p < kPages; ++p)
                             if (t->pages.test(p))
                                 stale[p / 8u] |= static_cast<uint8_t>(1u << (p % 8u));
+                cpuIdleLocked();
                 captureLiveLocked(GSCaptureSnapshot, stale, sizeof(stale), m_vram, GSMem::MEMORY_SIZE);
             }
         }
@@ -648,6 +704,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             std::lock_guard<std::mutex> lock(m_mutex);
             flushBatchLocked();
             captureWriteLocked(GSCaptureSnapshot, nullptr, 0u);
+            ++m_presents;
             PresentationFrame frame;
             if (presentFromGpuLocked(request, frame))
                 return frame;
@@ -778,6 +835,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 return;
             }
             syncAllLocked();
+            cpuIdleLocked();
             const char magic[8] = {'G', 'S', 'C', 'A', 'P', '1', 0, 0};
             const uint32_t sizes[4] = {static_cast<uint32_t>(GSMem::MEMORY_SIZE), static_cast<uint32_t>(sizeof(GSPrimitiveBatch)),
                                        static_cast<uint32_t>(sizeof(GSContext)), 1u};
@@ -968,9 +1026,11 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         // local memory. Bigger ones (the boot clear of all 4 MB as one 1024x1024 target) are drawn by
         // the CPU GS: a GPU target that wraps around would claim, and on download overwrite, the
         // texture and CLUT pages.
-        static bool gpuOwnsFrame(const GSContext &ctx)
+        bool gpuOwnsFrameLocked(const GSContext &ctx)
         {
-            if ((ctx.frame.psm != GS_PSM_CT32 && ctx.frame.psm != GS_PSM_CT24) || ctx.frame.fbw < 8u || ctx.scissor.y1 >= 512u)
+            if ((ctx.frame.psm != GS_PSM_CT32 && ctx.frame.psm != GS_PSM_CT24) || ctx.frame.fbw == 0u || ctx.scissor.y1 >= 512u)
+                return false;
+            if (ctx.frame.fbw < 8u && !smallTargetOnGpuLocked(ctx))
                 return false;
             const uint32_t rows = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
             if (ctx.frame.fbp + (rows + 31u) / 32u * ctx.frame.fbw > kPages)
@@ -982,6 +1042,59 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                     return false;
             }
             return true;
+        }
+
+        // Buffers narrower than 512 pixels (FBW < 8) are drawn on the GPU only once they have been
+        // drawn for kSmallProbation presents without the host reading back their pages or those
+        // of a Z buffer drawn with them: PSXWater draws the VIF stream it reads back as the Z of
+        // FBP 280 FBW 6 (ZBP 352), and that has to stay exact; the race's 128x128 shadow pair
+        // (FBP 420/428) is only sampled as a texture. ATV_GS_GPU_SMALL=0: never.
+        bool smallTargetOnGpuLocked(const GSContext &ctx)
+        {
+            if (!m_smallTargets)
+                return false;
+            const uint32_t key = ctx.frame.fbp | (ctx.frame.fbw << 9) | (static_cast<uint32_t>(ctx.frame.psm) << 15);
+            const auto [it, fresh] = m_small.try_emplace(key);
+            SmallTarget &s = it->second;
+            bool grew = false;
+            if (fresh)
+            {
+                s.since = m_presents;
+                addPages(s.pages, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, 0u, ctx.scissor.y1);
+                grew = true;
+            }
+            if (usesDepth(ctx) && s.zbpSeen != ctx.zbuf.zbp + 1u)
+            {
+                s.zbpSeen = ctx.zbuf.zbp + 1u;
+                addPages(s.pages, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, 0u, ctx.scissor.y1);
+                grew = true;
+            }
+            if (grew)
+                s.readBack = s.readBack || (s.pages & m_readbackPages).any();
+            return !s.readBack && m_presents - s.since >= kSmallProbation;
+        }
+
+        // A local -> host transfer reads these pages: small buffers there stay on the CPU.
+        void noteReadbackLocked(const PageSet &pages)
+        {
+            m_readbackPages |= pages;
+            for (auto &[key, s] : m_small)
+                if ((s.pages & pages).any())
+                    s.readBack = true;
+        }
+
+        // A CT32 / CT24 texture that is the top-left part of a colour target the GPU holds current
+        // is sampled from that target, without a download and decode (the shader reads each GS
+        // pixel's centre, as a download does). ATV_GS_GPU_RT_TEX=0: always through local memory.
+        Target *renderTargetTextureLocked(const GSTex0Reg &tex, uint32_t w, uint32_t h)
+        {
+            if (!m_rtTextures || (tex.psm != GS_PSM_CT32 && tex.psm != GS_PSM_CT24) || (tex.tbp0 & 31u) != 0u)
+                return nullptr;
+            Target *t = findTarget(false, tex.tbp0 >> 5);
+            if (!t || t == m_color || t->vramNewer || !t->srv || t->fbw != tex.tbw || w > t->w || h > t->h ||
+                (t->psm != GS_PSM_CT32 && tex.psm == GS_PSM_CT32))
+                return nullptr;
+            return t;
         }
 
         Target *findTarget(bool depth, uint32_t base)
@@ -1005,7 +1118,21 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         {
             uint32_t pw, ph;
             pageDims(psm, pw, ph);
-            const uint32_t h = std::min<uint32_t>(2048u, (rows + ph - 1u) / ph * ph);
+            uint32_t h = std::min<uint32_t>(2048u, (rows + ph - 1u) / ph * ph);
+            // A scissor a few rows past a page row (the race's 128x128 shadow pass at FBP 420 has
+            // 129 rows) would make this target own the first pages of the buffer after it (FBP 428),
+            // and the two would drop each other every frame: stop at the page row before it.
+            if (rows % ph != 0u && h > ph)
+            {
+                PageSet tail;
+                addPages(tail, base << 5, fbw, psm, h - ph, h - 1u);
+                for (const auto &other : m_targets)
+                    if (other->base != base && (other->pages & tail).any())
+                    {
+                        h -= ph;
+                        break;
+                    }
+            }
             Target *t = findTarget(depth, base);
             if (t && t->fbw == fbw && t->h >= h && (depth || t->psm == psm))
             {
@@ -1050,9 +1177,10 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             else
             {
                 td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                td.BindFlags = D3D11_BIND_RENDER_TARGET;
+                td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
                 m_dev->CreateTexture2D(&td, nullptr, &fresh->tex);
                 m_dev->CreateRenderTargetView(fresh->tex.Get(), nullptr, &fresh->rtv);
+                m_dev->CreateShaderResourceView(fresh->tex.Get(), nullptr, &fresh->srv);
             }
             fresh->vramNewer = true;
             traceLocked(*fresh, "create");
@@ -1064,12 +1192,30 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         void dropAllLocked()
         {
             m_targets.clear();
+            m_texSlots.clear();
             m_textures.clear();
+            m_texBytes = 0;
+            m_small.clear();
+            m_readbackPages.reset();
             m_hd.clear();
             m_pageVersion.fill(0u);
         }
 
         // Before the CPU side reads (or partly overwrites) these pages: GPU draws go to local memory.
+        // The keeper's band threads may still draw queued primitives: finish them before this
+        // backend reads or writes local memory those primitives touch (all of it without `pages`).
+        // The keeper's own entry points wait for its bands where they need to.
+        void cpuIdleLocked(const PageSet *pages = nullptr)
+        {
+            if (!m_cpuQueued || (pages && !(*pages & m_cpuQueuedPages).any()))
+                return;
+            const auto start = std::chrono::steady_clock::now();
+            m_cpu->Flush();
+            m_cpuQueued = false;
+            m_cpuQueuedPages.reset();
+            m_statCpuWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        }
+
         void syncForCpuLocked(const PageSet &pages, bool writing)
         {
             for (auto &t : m_targets)
@@ -1078,6 +1224,18 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                     continue;
                 if (t->gpuNewer)
                 {
+                    m_statDownloadPagesNeeded += (t->pages & pages).count();
+                    m_statDownloadPagesTotal += t->pages.count();
+                    if (m_stats)
+                    {
+                        // Counted by target and the operation that asked (its first two words).
+                        const char *end = std::strchr(m_why, ' ');
+                        end = end ? std::strchr(end + 1, ' ') : nullptr;
+                        char key[96];
+                        std::snprintf(key, sizeof(key), "%s %u <- %.*s", t->depth ? "Z" : "C", t->base,
+                                      static_cast<int>(end ? end - m_why : std::strlen(m_why)), m_why);
+                        ++m_downloadWhy[key];
+                    }
                     downloadLocked(*t);
                     m_statDepthDownloads += t->depth ? 1u : 0u;
                     t->gpuNewer = false;
@@ -1177,6 +1335,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         // too: its per-frame side pass copies (and the game reads back) part of the main Z buffer.
         void downloadLocked(Target &t)
         {
+            cpuIdleLocked(&t.pages);
             const auto start = std::chrono::steady_clock::now();
             ID3D11Texture2D *staging = t.depth ? stagingLocked(m_stagingDepth, t.w * m_scale, t.h * m_scale, DXGI_FORMAT_R32_TYPELESS)
                                                : stagingLocked(m_stagingDownload, t.w * m_scale, t.h * m_scale, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1184,6 +1343,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map)))
                 return;
+            m_statDownloadWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
             const uint32_t half = m_scale / 2u;
             const uint32_t base = t.base << 5;
             const double toZ = 1.0 / zScale(t.psm);
@@ -1237,6 +1397,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         // Local memory -> GPU target (point upscale).
         void seedLocked(Target &t)
         {
+            cpuIdleLocked(&t.pages);
             const auto start = std::chrono::steady_clock::now();
             if (m_stats && !t.depth && m_colorSeedLogs < 40u)
             {
@@ -1336,6 +1497,9 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         }
 
         // -------------------------------------------------------------- textures
+        // The race re-uploads its textures into a small pool of local memory every frame, so a TEX0
+        // whose pages were written since its last use is hashed (pages, seeded with the TEX0) and
+        // decoded only when those bytes were not decoded before.
         void textureFor(const GSDrawState &state, TexEntry *&out)
         {
             const GSTex0Reg &tex = state.context.tex0;
@@ -1343,26 +1507,57 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             const uint64_t key = static_cast<uint64_t>(tex.tbp0 & 0x3FFFu) | (static_cast<uint64_t>(tex.tbw & 0x3Fu) << 14) |
                                  (static_cast<uint64_t>(tex.psm & 0x3Fu) << 20) | (static_cast<uint64_t>(tex.tw & 0xFu) << 26) |
                                  (static_cast<uint64_t>(tex.th & 0xFu) << 30);
-            TexEntry &e = m_textures[key];
-            if (!e.tex)
-                addPages(e.pages, tex.tbp0, tex.tbw, tex.psm, 0u, h - 1u, w - 1u);
+            TexSlot &slot = m_texSlots[key];
+            if (slot.content == 0u)
+                addPages(slot.pages, tex.tbp0, tex.tbw, tex.psm, 0u, h - 1u, w - 1u);
+            if (m_stats)
+                std::snprintf(m_why, sizeof(m_why), "texture tbp0=0x%x tbw=%u psm=0x%x %ux%u", tex.tbp0, tex.tbw, tex.psm, w, h);
             // Render-to-texture: GPU draws into these pages go to local memory first.
-            syncForCpuLocked(e.pages, false);
+            syncForCpuLocked(slot.pages, false);
             uint64_t sum = 0;
             for (uint32_t p = 0; p < kPages; ++p)
-                if (e.pages.test(p))
+                if (slot.pages.test(p))
                     sum += m_pageVersion[p];
+            if (slot.content != 0u && slot.versionSum == sum && !m_noCache)
+            {
+                const auto it = m_textures.find(slot.content);
+                if (it != m_textures.end())
+                {
+                    it->second.lastUse = ++m_useClock;
+                    out = &it->second;
+                    if (m_texCheck)
+                        checkTextureLocked(it->second, tex, w, h, slot.pages);
+                    return;
+                }
+            }
+            cpuIdleLocked(&slot.pages);
+            const auto hashStart = std::chrono::steady_clock::now();
+            uint64_t content = key;
+            for (uint32_t p = 0; p < kPages; ++p)
+                if (slot.pages.test(p))
+                    content = XXH3_64bits_withSeed(m_vram + static_cast<size_t>(p) * kPageBytes, kPageBytes, content);
+            content += content == 0u ? 1u : 0u;
+            slot.versionSum = sum;
+            slot.content = content;
+            TexEntry &e = m_textures[content];
             e.lastUse = ++m_useClock;
             out = &e;
-            if (e.tex && e.versionSum == sum && !m_noCache)
-                return;
             const auto start = std::chrono::steady_clock::now();
-            e.versionSum = sum;
+            m_statHashNs += std::chrono::duration_cast<std::chrono::nanoseconds>(start - hashStart).count();
+            if (e.tex && !m_noCache)
+            {
+                ++m_statTexHits;
+                if (m_texCheck)
+                    checkTextureLocked(e, tex, w, h, slot.pages);
+                return;
+            }
             m_decode.resize(static_cast<size_t>(w) * h);
             for (uint32_t y = 0; y < h; ++y)
                 for (uint32_t x = 0; x < w; ++x)
                     m_decode[y * w + x] = GSMem::ReadTexture(m_decodeCache, m_vram, tex.psm, tex.tbp0, tex.tbw, x, y);
             m_decodeCache.Invalidate();
+            if (m_texCheck)
+                e.texels = m_decode;
             if (!e.tex)
             {
                 D3D11_TEXTURE2D_DESC td{};
@@ -1377,23 +1572,64 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 D3D11_SUBRESOURCE_DATA init{m_decode.data(), w * 4u, 0};
                 m_dev->CreateTexture2D(&td, &init, &e.tex);
                 m_dev->CreateShaderResourceView(e.tex.Get(), nullptr, &e.srv);
+                e.w = w;
+                e.h = h;
+                m_texBytes += static_cast<uint64_t>(w) * h * 4u;
             }
             else
                 m_ctx->UpdateSubresource(e.tex.Get(), 0, nullptr, m_decode.data(), w * 4u, 0);
             ++m_statDecodes;
             m_statDecodeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-            if (m_textures.size() > 2048u)
+            if (m_texBytes > kTextureCacheBytes)
                 evictTexturesLocked();
         }
 
+        // ATV_GS_GPU_TEXCHECK=1 (debug): a texture found by its content is decoded again and compared.
+        void checkTextureLocked(const TexEntry &e, const GSTex0Reg &tex, uint32_t w, uint32_t h, const PageSet &pages)
+        {
+            std::vector<uint32_t> now(static_cast<size_t>(w) * h);
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    now[y * w + x] = GSMem::ReadTexture(m_decodeCache, m_vram, tex.psm, tex.tbp0, tex.tbw, x, y);
+            m_decodeCache.Invalidate();
+            ++m_statTexChecks;
+            if (e.texels.size() != now.size() || e.texels == now)
+                return;
+            uint32_t count = 0, x0 = w, y0 = h, x1 = 0, y1 = 0, fx = 0, fy = 0;
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    if (e.texels[y * w + x] != now[y * w + x])
+                    {
+                        if (count++ == 0u)
+                            fx = x, fy = y;
+                        x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+                    }
+            ++m_statTexMismatches;
+            static uint32_t s_logs = 0;
+            if (s_logs++ >= 60u)
+                return;
+            const GSMem::PixelAddressFunc address = GSMem::GetPixelAddressFunc(tex.psm);
+            const int page = address ? static_cast<int>(address(tex.tbp0, tex.tbw, fx, fy) / kPageBytes) : -1;
+            std::fprintf(stderr, "[gs-gpu] texcheck MISMATCH tbp0=0x%x tbw=%u psm=0x%x %ux%u: %u texels in (%u,%u)-(%u,%u), first (%u,%u) "
+                                 "page %d %s the %zu hashed pages\n",
+                         tex.tbp0, tex.tbw, tex.psm, w, h, count, x0, y0, x1, y1, fx, fy, page,
+                         page >= 0 && pages.test(static_cast<size_t>(page) % kPages) ? "in" : "NOT in", pages.count());
+        }
+
+        // Drops the least recently used decoded textures down to half the budget (the one just
+        // used is the newest, so it stays).
         void evictTexturesLocked()
         {
             std::vector<std::pair<uint64_t, uint64_t>> uses;
             for (auto &[k, e] : m_textures)
                 uses.push_back({e.lastUse, k});
             std::sort(uses.begin(), uses.end());
-            for (size_t i = 0; i < uses.size() / 2; ++i)
-                m_textures.erase(uses[i].second);
+            for (size_t i = 0; i < uses.size() && m_texBytes > kTextureCacheBytes / 2u; ++i)
+            {
+                const auto it = m_textures.find(uses[i].second);
+                m_texBytes -= static_cast<uint64_t>(it->second.w) * it->second.h * 4u;
+                m_textures.erase(it);
+            }
         }
 
         ID3D11ShaderResourceView *hdTextureLocked(const GSTexReplace::Image &img)
@@ -1532,7 +1768,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             const GSDrawState &state = batch.state;
             ++m_statPrims;
             ++m_statPrimsTotal;
-            if (m_allCpu || !gpuOwnsFrame(state.context) || state.prim.type == GS_PRIM_LINE || state.prim.type == GS_PRIM_LINESTRIP ||
+            if (m_allCpu || !gpuOwnsFrameLocked(state.context) || state.prim.type == GS_PRIM_LINE || state.prim.type == GS_PRIM_LINESTRIP ||
                 state.prim.type == GS_PRIM_POINT)
             {
                 cpuDrawLocked(batch);
@@ -1541,6 +1777,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             const GSTexReplace::Image *hd = nullptr;
             if (GSTexReplace::Active())
             {
+                cpuIdleLocked();
                 GSTexReplace::OnSubmit(m_cpu.get(), batch, m_vram, m_clut.data());
                 hd = state.prim.tme ? GSTexReplace::Current() : nullptr;
             }
@@ -1553,6 +1790,28 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                 appendSprite(batch);
             else
                 appendTriangle(batch);
+        }
+
+        // Narrows [y0, y1] (the scissor) to the rows the primitive's vertices span.
+        static void primitiveRows(const GSPrimitiveBatch &batch, uint32_t &y0, uint32_t &y1)
+        {
+            const float ofy = static_cast<float>(batch.state.context.xyoffset.ofy >> 4);
+            float lo = 1.0e9f, hi = -1.0e9f;
+            for (uint32_t i = 0; i < batch.vertexCount && i < batch.vertices.size(); ++i)
+            {
+                lo = std::min(lo, batch.vertices[i].y - ofy);
+                hi = std::max(hi, batch.vertices[i].y - ofy);
+            }
+            if (lo > hi || !(std::fabs(lo) < 1.0e6f) || !(std::fabs(hi) < 1.0e6f))
+                return;
+            const int64_t first = static_cast<int64_t>(std::floor(lo)) - 1, last = static_cast<int64_t>(std::ceil(hi)) + 1;
+            if (last < static_cast<int64_t>(y0) || first > static_cast<int64_t>(y1))
+            {
+                y1 = y0; // draws nothing: one row keeps the page sets non-empty
+                return;
+            }
+            y0 = static_cast<uint32_t>(std::max<int64_t>(first, y0));
+            y1 = static_cast<uint32_t>(std::min<int64_t>(last, y1));
         }
 
         void cpuDrawLocked(const GSPrimitiveBatch &batch)
@@ -1575,19 +1834,36 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                               static_cast<unsigned long long>(ctx.test), static_cast<uint32_t>(ctx.zbuf.zmask), ctx.scissor.x0, ctx.scissor.y0,
                               ctx.scissor.x1, ctx.scissor.y1);
             PageSet writes, reads;
-            addPages(writes, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, ctx.scissor.y0, ctx.scissor.y1);
+            // The rows the primitive can reach (its vertices inside the scissor): with the scissor
+            // alone PSXWater's Z pass (ZBP 352, 384 rows, data in the first 188) covered the race's
+            // shadow buffer at FBP 420, and downloaded and re-seeded it a few times a frame.
+            uint32_t rowFirst = ctx.scissor.y0, rowLast = ctx.scissor.y1;
+            primitiveRows(batch, rowFirst, rowLast);
+            addPages(writes, ctx.frame.fbp << 5, ctx.frame.fbw, ctx.frame.psm, rowFirst, rowLast);
             // Z pages only as the CPU GS touches them: the race's shadow pass has ZBP 0 (= the display
             // buffer) with ZMSK on, and counting it as a write re-seeded that target at 1x every frame.
             if (writesDepth(ctx))
-                addPages(writes, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, ctx.scissor.y0, ctx.scissor.y1);
+                addPages(writes, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, rowFirst, rowLast);
             else if (readsDepth(ctx))
-                addPages(reads, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, ctx.scissor.y0, ctx.scissor.y1);
+                addPages(reads, ctx.zbuf.zbp << 5, ctx.frame.fbw, ctx.zbuf.psm, rowFirst, rowLast);
             if (batch.state.prim.tme)
                 addPages(reads, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u, batch.state.textureHeight - 1u,
                          batch.state.textureWidth - 1u);
             syncForCpuLocked(reads, false);
             syncForCpuLocked(writes, true);
+            const auto drawStart = m_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             m_cpu->Submit(batch);
+            m_cpuQueued = true;
+            m_cpuQueuedPages |= writes;
+            m_cpuQueuedPages |= reads;
+            if (m_stats)
+            {
+                // Per kind of CPU draw (prim type, FBP, FBW): primitives and time in the CPU GS.
+                const uint64_t kind = (static_cast<uint64_t>(batch.state.prim.type) << 32) | (static_cast<uint64_t>(ctx.frame.fbp) << 8) | ctx.frame.fbw;
+                auto &[prims, ns] = m_cpuKindStats[kind];
+                ++prims;
+                ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drawStart).count();
+            }
             noteCpuWriteLocked(writes);
             ++m_statCpuPrims;
         }
@@ -1651,6 +1927,14 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
                     k.hd[3] = s.v.offset / static_cast<float>(hd->levels[0].h);
                     hdSampler = (s.u.repeat ? 0u : 1u) | (s.v.repeat ? 0u : 2u);
                     srvs[1] = hdTextureLocked(*hd);
+                }
+                else if (Target *rt = renderTargetTextureLocked(tex, state.textureWidth, state.textureHeight))
+                {
+                    srvs[1] = rt->srv.Get();
+                    k.tex[0] = tex.psm == GS_PSM_CT24 ? 7u : 6u;
+                    k.hd[0] = static_cast<float>(m_scale);
+                    k.hd[1] = static_cast<float>(m_scale / 2u);
+                    ++m_statRtTextures;
                 }
                 else
                 {
@@ -2081,6 +2365,7 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             D3D11_MAPPED_SUBRESOURCE map{};
             if (FAILED(m_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map)))
                 return false;
+            m_statPresentWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - presentStart).count();
             const uint32_t stride = std::max(kHostFrameWidth, sw);
             frame.pixels.resize(static_cast<size_t>(stride) * sh * 4u);
             for (uint32_t y = 0; y < sh; ++y)
@@ -2112,22 +2397,56 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
             std::fprintf(stderr,
                          "[gs-gpu] %.1fs presents=%llu prims=%llu cpuPrims=%llu batches=%llu draws=%llu vertexMB=%.1f palettes=%llu "
                          "decodes=%llu (%.1f ms) seeds=%llu (%.1f ms) downloads=%llu (%.1f ms) depthDownloads=%llu targets=%llu "
-                         "textures=%zu hdUploads=%llu approxBlend=%llu approxMask=%llu open=%.1f ms flush=%.1f ms present=%.1f ms clutLoads=%llu clutChanges=%llu uploads=%llu uploadKB=%llu\n",
+                         "textures=%zu texMB=%.0f texHits=%llu hash=%.1f ms hdUploads=%llu approxBlend=%llu approxMask=%llu open=%.1f ms flush=%.1f ms present=%.1f ms clutLoads=%llu clutChanges=%llu uploads=%llu uploadKB=%llu\n",
                          secs, (unsigned long long)m_statPresents, (unsigned long long)m_statPrims, (unsigned long long)m_statCpuPrims,
                          (unsigned long long)m_statBatches, (unsigned long long)m_statDraws, m_statVertexBytes / 1048576.0,
                          (unsigned long long)m_statPalettes, (unsigned long long)m_statDecodes, m_statDecodeNs / 1e6,
                          (unsigned long long)m_statSeeds, m_statSeedNs / 1e6, (unsigned long long)m_statDownloads, m_statDownloadNs / 1e6,
                          (unsigned long long)m_statDepthDownloads, (unsigned long long)m_statTargets, m_textures.size(),
-                         (unsigned long long)m_statHdUploads, (unsigned long long)m_statApproxBlend, (unsigned long long)m_statApproxMask,
+                         m_texBytes / 1048576.0, (unsigned long long)m_statTexHits, m_statHashNs / 1e6, (unsigned long long)m_statHdUploads, (unsigned long long)m_statApproxBlend, (unsigned long long)m_statApproxMask,
                          m_statOpenNs / 1e6, m_statFlushNs / 1e6, m_statPresentNs / 1e6, (unsigned long long)m_statClutLoads,
                          (unsigned long long)m_statClutChanges, (unsigned long long)m_statUploads,
                          (unsigned long long)(m_statUploadBytes / 1024u));
+            uint32_t smallOnGpu = 0;
+            for (const auto &[key, s] : m_small)
+                smallOnGpu += !s.readBack && m_presents - s.since >= kSmallProbation ? 1u : 0u;
+            std::fprintf(stderr, "[gs-gpu] waits: download %.1f ms (pages needed %.0f%%) present %.1f ms keeper %.1f ms; rtTextures=%llu "
+                                 "small=%u/%zu on GPU; cpu draws (type fbp/fbw: prims ms):",
+                         m_statDownloadWaitNs / 1e6,
+                         m_statDownloadPagesTotal ? 100.0 * m_statDownloadPagesNeeded / m_statDownloadPagesTotal : 0.0,
+                         m_statPresentWaitNs / 1e6, m_statCpuWaitNs / 1e6, (unsigned long long)m_statRtTextures, smallOnGpu, m_small.size());
+            std::vector<std::pair<uint64_t, uint64_t>> kinds; // ns, kind
+            for (const auto &[kind, v] : m_cpuKindStats)
+                kinds.push_back({v.second, kind});
+            std::sort(kinds.rbegin(), kinds.rend());
+            for (size_t i = 0; i < kinds.size() && i < 8u; ++i)
+            {
+                const auto &v = m_cpuKindStats[kinds[i].second];
+                std::fprintf(stderr, " %u %u/%u: %llu %.1f;", static_cast<uint32_t>(kinds[i].second >> 32),
+                             static_cast<uint32_t>((kinds[i].second >> 8) & 0xFFFFFFu), static_cast<uint32_t>(kinds[i].second & 0xFFu),
+                             (unsigned long long)v.first, v.second / 1e6);
+            }
+            if (m_texCheck)
+                std::fprintf(stderr, " texcheck %llu/%llu mismatched", (unsigned long long)m_statTexMismatches, (unsigned long long)m_statTexChecks);
+            std::vector<std::pair<uint32_t, std::string>> why;
+            for (const auto &[key, count] : m_downloadWhy)
+                why.push_back({count, key});
+            std::sort(why.rbegin(), why.rend());
+            std::fprintf(stderr, " downloads by cause:");
+            for (size_t i = 0; i < why.size() && i < 6u; ++i)
+                std::fprintf(stderr, " %u x %s;", why[i].first, why[i].second.c_str());
+            m_downloadWhy.clear();
+            std::fprintf(stderr, "\n");
+            m_cpuKindStats.clear();
+            m_statDownloadWaitNs = m_statDownloadPagesNeeded = m_statDownloadPagesTotal = m_statPresentWaitNs = m_statCpuWaitNs = 0;
+            m_statRtTextures = 0;
             m_statStart = now;
             m_statPresents = m_statPrims = m_statCpuPrims = m_statBatches = m_statDraws = m_statVertexBytes = m_statPalettes = 0;
             m_statDecodes = m_statDecodeNs = m_statSeeds = m_statSeedNs = m_statDownloads = m_statDownloadNs = m_statDepthDownloads = 0;
             m_statTargets = m_statHdUploads = m_statApproxBlend = m_statApproxMask = 0;
             m_statOpenNs = m_statFlushNs = m_statPresentNs = 0;
             m_statClutLoads = m_statClutChanges = m_statUploads = m_statUploadBytes = 0;
+            m_statTexHits = m_statHashNs = 0;
         }
 
         static constexpr UINT kVertexBufferBytes = 16u << 20;
@@ -2171,7 +2490,10 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
 
         std::vector<std::unique_ptr<Target>> m_targets;
         std::array<uint32_t, kPages> m_pageVersion{};
-        std::unordered_map<uint64_t, TexEntry> m_textures;
+        static constexpr uint64_t kTextureCacheBytes = 256ull << 20; // decoded textures (4 bytes a texel)
+        std::unordered_map<uint64_t, TexSlot> m_texSlots;  // by TEX0
+        std::unordered_map<uint64_t, TexEntry> m_textures; // by content (TexSlot::content)
+        uint64_t m_texBytes = 0;
         std::unordered_map<const void *, HdEntry> m_hd;
         uint64_t m_hdBytes = 0;
         uint64_t m_useClock = 0;
@@ -2210,6 +2532,28 @@ float PSSeedDepth(float4 pos : SV_Position) : SV_Depth
         uint64_t m_statDownloads = 0, m_statDownloadNs = 0, m_statDepthDownloads = 0, m_statTargets = 0, m_statHdUploads = 0;
         uint64_t m_statApproxBlend = 0, m_statApproxMask = 0, m_statOpenNs = 0, m_statFlushNs = 0, m_statPresentNs = 0;
         uint64_t m_statClutLoads = 0, m_statClutChanges = 0, m_statUploads = 0, m_statUploadBytes = 0;
+        uint64_t m_statTexHits = 0, m_statHashNs = 0;
+        uint64_t m_statDownloadWaitNs = 0, m_statDownloadPagesNeeded = 0, m_statDownloadPagesTotal = 0, m_statPresentWaitNs = 0;
+        uint64_t m_statCpuWaitNs = 0, m_statTexChecks = 0, m_statTexMismatches = 0, m_statRtTextures = 0;
+        // Small buffers (smallTargetOnGpuLocked).
+        struct SmallTarget
+        {
+            PageSet pages;      // its frame and the Z buffers drawn with it
+            uint32_t zbpSeen = 0; // last of those ZBPs + 1
+            uint64_t since = 0;   // m_presents when first drawn
+            bool readBack = false;
+        };
+        static constexpr uint64_t kSmallProbation = 60u;
+        std::unordered_map<uint32_t, SmallTarget> m_small; // by FBP | FBW << 9 | PSM << 15
+        PageSet m_readbackPages;                           // ever read by a local -> host transfer
+        uint64_t m_presents = 0;
+        bool m_smallTargets = [] { const char *e = std::getenv("ATV_GS_GPU_SMALL"); return !e || e[0] != '0'; }();
+        bool m_rtTextures = [] { const char *e = std::getenv("ATV_GS_GPU_RT_TEX"); return !e || e[0] != '0'; }();
+        bool m_texCheck = std::getenv("ATV_GS_GPU_TEXCHECK") != nullptr;
+        std::unordered_map<std::string, uint32_t> m_downloadWhy; // ATV_GS_GPU_STATS: downloads by target and cause
+        bool m_cpuQueued = false; // the keeper got primitives since its last Flush (cpuIdleLocked)
+        PageSet m_cpuQueuedPages; // the pages those primitives read or write
+        std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> m_cpuKindStats; // see cpuDrawLocked
     };
 }
 
@@ -2239,10 +2583,17 @@ void gsGpuRestoreClutState(GSRasterBackend *backend, const std::array<uint16_t, 
         gpu->RestoreClutState(clut, cbp);
 }
 
+// For GSThreadedBackend's worker (declared in gs_frontend.cpp): `backend` is a GPU backend.
+void gsGpuSubmitMany(GSRasterBackend *backend, const GSPrimitiveBatch *const *batches, size_t count)
+{
+    static_cast<GSGpuBackend *>(backend)->SubmitMany(batches, count);
+}
+
 #else
 
 std::unique_ptr<GSRasterBackend> gsCreateGpuBackend(uint32_t) { return nullptr; }
 bool gsIsGpuBackend(const GSRasterBackend *) { return false; }
 void gsGpuRestoreClutState(GSRasterBackend *, const std::array<uint16_t, 512> &, const std::array<uint32_t, 2> &) {}
+void gsGpuSubmitMany(GSRasterBackend *, const GSPrimitiveBatch *const *, size_t) {}
 
 #endif

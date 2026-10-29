@@ -25,6 +25,7 @@
 extern uint32_t g_ps2XgkickCount;
 bool g_raceLoadStarted = false;
 void atvStartHostProfilerForThisThread();
+void gsGpuSubmitMany(GSRasterBackend *backend, const GSPrimitiveBatch *const *batches, size_t count); // gs_gpu_backend.cpp
 
 namespace
 {
@@ -738,12 +739,12 @@ namespace
                 }
                 m_changed.notify_all();
                 const uint64_t busyStart = s_queueStats ? statNowNs() : 0u;
-                // Consecutive primitives go to the CPU backend under one lock.
+                // Consecutive primitives go to the CPU or GPU backend under one lock.
                 // ATV_GS_NO_SUBMIT_MANY=1: one Submit (and lock) per primitive.
                 static const bool s_noSubmitMany = std::getenv("ATV_GS_NO_SUBMIT_MANY") != nullptr;
                 for (size_t i = 0; i < batch.size();)
                 {
-                    if (m_cpu && !s_noSubmitMany && std::holds_alternative<GSPrimitiveBatch>(batch[i]))
+                    if ((m_cpu || m_gpu) && !s_noSubmitMany && std::holds_alternative<GSPrimitiveBatch>(batch[i]))
                     {
                         primitives.clear();
                         for (; i < batch.size(); ++i)
@@ -753,7 +754,10 @@ namespace
                                 break;
                             primitives.push_back(primitive);
                         }
-                        m_cpu->SubmitMany(primitives.data(), primitives.size());
+                        if (m_cpu)
+                            m_cpu->SubmitMany(primitives.data(), primitives.size());
+                        else
+                            gsGpuSubmitMany(m_inner.get(), primitives.data(), primitives.size());
                         continue;
                     }
                     execute(batch[i]);
