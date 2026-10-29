@@ -15,3 +15,4 @@ You need your own copy of the game (`SCUS_972.11` from the disc). The recompiled
 
 
 
+https://www.youtube.com/watch?v=Tpdy3xvcvYQ&lc=Ugy6IkaXspRC5gbXddV4AaABAg
