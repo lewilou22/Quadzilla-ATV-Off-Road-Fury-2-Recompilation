@@ -45,6 +45,7 @@ extern void (*g_ps2Vif1IbitHook)(uint32_t vifcode); // ps2_vif1_interpreter.cpp
 extern void (*g_ps2Vif1PrecaptureHook)(PS2Memory::GifCapture &capture, std::vector<std::vector<uint8_t>> &tail);
 extern bool (*g_ps2Vif1DownloadCaptureHook)(std::vector<uint8_t> &records);
 extern bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation);
+void ps2GsWorkerNoteDownload(uint32_t phys, uint32_t bytes); // RAM a download being queued writes
 extern uint64_t (*g_ps2GsCsrReadHook)(uint32_t pc, uint64_t value); // ps2_runtime.cpp
 bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width, uint32_t height,
                               uint8_t *dst); // Kernel/Stubs/IPU.cpp
@@ -5512,6 +5513,9 @@ namespace
             uint32_t dst = 0u, bytes = 0u;
             entryDst(list + static_cast<uint32_t>(i) * 0x20u, dst, bytes);
             dstRanges.emplace_back(dst, dst + bytes);
+            // Later VIF1 DMAs (PSXWater's send of the downloaded VIF stream to VU1) read this RAM
+            // on the worker, after the download.
+            ps2GsWorkerNoteDownload(dst, bytes);
         }
         auto put32 = [](std::vector<uint8_t> &v, uint32_t x) { v.insert(v.end(), reinterpret_cast<uint8_t *>(&x), reinterpret_cast<uint8_t *>(&x) + 4); };
         for (int16_t i = idx; i < count; ++i)

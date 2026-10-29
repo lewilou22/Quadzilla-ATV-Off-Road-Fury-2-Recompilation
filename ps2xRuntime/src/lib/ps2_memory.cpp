@@ -265,6 +265,93 @@ bool (*g_ps2Vif1DownloadCaptureHook)(std::vector<uint8_t> &records) = nullptr;
 bool (*g_ps2Vif1WorkerDownloadHook)(const uint8_t *record, uint32_t size, std::vector<uint8_t> &continuation) = nullptr;
 extern bool g_ps2Vif1AbortStream; // ps2_vif1_interpreter.cpp
 
+namespace
+{
+    // RAM that queued GS downloads write on the worker (ATV2 PSXWater draws a VIF1 stream into the
+    // GS, reads it back and DMAs it to VU1). Real VIF1 reads such a DMA's payload after the download;
+    // the worker does the download later, so copying that RAM when the EE queued the chain gave VU1
+    // an older stream, half of two frames' streams or, at race start, the buffer's old contents:
+    // misaligned VIFcodes that wrote garbage into VU1 memory for the rest of the race (XGKICK
+    // tag-too-big, VU1 reserved ops). Those payload bytes are copied on the worker, right before the
+    // chain runs. Noted by the game's download capture hook (mark 0 until the chain is queued),
+    // dropped once the worker has run the chain. EE thread only.
+    struct WorkerRamWrite
+    {
+        uint32_t lo = 0u, hi = 0u;
+        uint64_t mark = 0u;
+    };
+    std::vector<WorkerRamWrite> g_workerRamWrites;
+    struct DeferredRamRead
+    {
+        uint32_t offset, phys, bytes;
+    };
+    // Queued VIF1 chain buffers (a moved vector keeps its buffer) with bytes to copy on the worker.
+    // EE thread only; emptied with the pending VIF1 transfers.
+    std::vector<std::pair<const uint8_t *, std::vector<DeferredRamRead>>> g_deferredVif1Reads;
+
+    void dropDoneWorkerRamWrites(uint64_t doneSeq)
+    {
+        g_workerRamWrites.erase(std::remove_if(g_workerRamWrites.begin(), g_workerRamWrites.end(),
+                                               [doneSeq](const WorkerRamWrite &w) { return w.mark != 0u && w.mark <= doneSeq; }),
+                                g_workerRamWrites.end());
+    }
+
+    // Appends RAM [phys, phys + bytes) to `out`, leaving zeros for bytes a queued download writes and
+    // listing them in `deferred`.
+    void appendRamAfterWorkerWrites(std::vector<uint8_t> &out, const uint8_t *rdram, uint32_t phys, uint32_t bytes,
+                                    std::vector<DeferredRamRead> &deferred)
+    {
+        const uint32_t end = phys + bytes;
+        while (phys < end)
+        {
+            uint32_t lo = end, hi = end;
+            for (const WorkerRamWrite &w : g_workerRamWrites)
+            {
+                if (w.lo < end && phys < w.hi && std::max(w.lo, phys) < lo)
+                {
+                    lo = std::max(w.lo, phys);
+                    hi = std::min(w.hi, end);
+                }
+            }
+            out.insert(out.end(), rdram + phys, rdram + lo);
+            if (lo < end)
+            {
+                deferred.push_back({static_cast<uint32_t>(out.size()), lo, hi - lo});
+                out.resize(out.size() + (hi - lo));
+            }
+            phys = hi;
+        }
+    }
+
+    std::vector<DeferredRamRead> takeDeferredVif1Reads(const std::vector<uint8_t> &chain)
+    {
+        for (auto it = g_deferredVif1Reads.begin(); it != g_deferredVif1Reads.end(); ++it)
+        {
+            if (it->first == chain.data())
+            {
+                std::vector<DeferredRamRead> reads = std::move(it->second);
+                g_deferredVif1Reads.erase(it);
+                return reads;
+            }
+        }
+        return {};
+    }
+
+    void applyDeferredRamReads(std::vector<uint8_t> &chain, const uint8_t *rdram, const std::vector<DeferredRamRead> &reads)
+    {
+        for (const DeferredRamRead &r : reads)
+            std::memcpy(chain.data() + r.offset, rdram + r.phys, r.bytes);
+    }
+}
+
+// Called by a game's download capture hook for each GS download it queues: the RAM it writes.
+void ps2GsWorkerNoteDownload(uint32_t phys, uint32_t bytes)
+{
+    phys &= PS2_RAM_MASK;
+    if (bytes != 0u && phys < PS2_RAM_SIZE)
+        g_workerRamWrites.push_back({phys, static_cast<uint32_t>(std::min<uint64_t>(uint64_t{phys} + bytes, PS2_RAM_SIZE)), 0u});
+}
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
@@ -1698,6 +1785,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tteEnabled = (chcr & (1u << 6)) != 0u;
                     const int kMaxChainTags = 4096;
                     std::vector<uint8_t> chainBuf;
+                    // A VIF1 chain for the GS worker reads RAM that a queued download still has to
+                    // write on the worker (see g_workerRamWrites).
+                    std::vector<DeferredRamRead> deferredReads;
+                    bool deferWorkerWrites = false;
+                    if (channelBase == 0x10009000u && m_gsWorkerEnabled && !gsDirectHere() && !g_workerRamWrites.empty())
+                    {
+                        uint64_t doneSeq = 0u;
+                        {
+                            std::lock_guard<std::mutex> lock(m_gsWorkMutex);
+                            doneSeq = m_gsWorkDoneSeq;
+                        }
+                        dropDoneWorkerRamWrites(doneSeq);
+                        deferWorkerWrites = !g_workerRamWrites.empty();
+                    }
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1728,7 +1829,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            if (deferWorkerWrites && !scratch)
+                                appendRamAfterWorkerWrites(chainBuf, base2, src, chunk, deferredReads);
+                            else
+                                chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
                         }
@@ -1893,6 +1997,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                         else if (channelBase == 0x10009000u)
                         {
+                            if (!deferredReads.empty())
+                            {
+                                static uint32_t s_deferLogs = 0u;
+                                if (s_deferLogs < 4u)
+                                {
+                                    ++s_deferLogs;
+                                    std::fprintf(stderr, "[gs-worker] VIF1 DMA reads %u bytes at 0x%x that a queued GS download writes: copied on the worker\n",
+                                                 deferredReads.front().bytes, deferredReads.front().phys);
+                                }
+                                g_deferredVif1Reads.emplace_back(pt.chainData.data(), std::move(deferredReads));
+                            }
                             m_pendingVif1Transfers.push_back(std::move(pt));
                         }
                         else if (channelBase == 0x10008000u)
@@ -2125,13 +2240,24 @@ void PS2Memory::processPendingTransfers()
         // writes VIF1_MARK=1 itself): it runs here on the EE once the worker is idle, and the
         // continuation chain its I-bit hook kicks is appended and handled by this loop.
         const uint32_t fbrst = m_vu0FbrstProvider ? m_vu0FbrstProvider() : 0u;
+        if (!g_workerRamWrites.empty())
+        {
+            uint64_t doneSeq = 0u;
+            {
+                std::lock_guard<std::mutex> lock(m_gsWorkMutex);
+                doneSeq = m_gsWorkDoneSeq;
+            }
+            dropDoneWorkerRamWrites(doneSeq);
+        }
         for (size_t vifIdx = 0; vifIdx < m_pendingVif1Transfers.size(); ++vifIdx)
         {
             PendingTransfer p = std::move(m_pendingVif1Transfers[vifIdx]);
             std::vector<uint8_t> data;
+            std::vector<DeferredRamRead> deferred; // bytes a queued download writes: read on the worker
             if (!p.chainData.empty())
             {
                 data = std::move(p.chainData);
+                deferred = takeDeferredVif1Reads(data);
             }
             else if (p.qwc > 0)
             {
@@ -2153,7 +2279,10 @@ void PS2Memory::processPendingTransfers()
                     if (srcPhys >= span)
                         srcPhys = 0;
                     const uint32_t chunk = std::min(bytesLeft, span - srcPhys);
-                    data.insert(data.end(), base + srcPhys, base + srcPhys + chunk);
+                    if (!p.fromScratchpad && !g_workerRamWrites.empty())
+                        appendRamAfterWorkerWrites(data, base, srcPhys, chunk, deferred);
+                    else
+                        data.insert(data.end(), base + srcPhys, base + srcPhys + chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -2168,6 +2297,7 @@ void PS2Memory::processPendingTransfers()
             {
                 g_gsEeChains.fetch_add(1, std::memory_order_relaxed);
                 fenceGsWork(0);
+                applyDeferredRamReads(data, m_rdram, deferred); // the worker is idle: downloads done
                 struct DirectOnEe
                 {
                     DirectOnEe() { t_gsDirectOnEe = true; }
@@ -2183,8 +2313,10 @@ void PS2Memory::processPendingTransfers()
             auto tail = std::make_shared<std::vector<std::vector<uint8_t>>>();
             if (g_ps2Vif1PrecaptureHook)
                 g_ps2Vif1PrecaptureHook(*capture, *tail);
-            enqueueGsWork([this, data = std::move(data), capture, tail, downloads, fbrst]
+            enqueueGsWork([this, data = std::move(data), deferred = std::move(deferred), capture, tail, downloads, fbrst]() mutable
                           {
+                              // The downloads queued before this chain have written their RAM by now.
+                              applyDeferredRamReads(data, m_rdram, deferred);
                               t_gsWorkerFbrst = fbrst;
                               std::vector<std::vector<uint8_t>> continuations;
                               IbitReplay replay{capture.get(), 0u, tail.get(), downloads.get(), 0u, &continuations};
@@ -2204,8 +2336,20 @@ void PS2Memory::processPendingTransfers()
                               if (m_gifArbiter)
                                   m_gifArbiter->drain();
                           });
+            // The RAM this chain's downloads write is read on the worker until it has run the chain.
+            bool unqueued = false;
+            for (const WorkerRamWrite &w : g_workerRamWrites)
+                unqueued |= w.mark == 0u;
+            if (unqueued)
+            {
+                const uint64_t mark = gsWorkMark();
+                for (WorkerRamWrite &w : g_workerRamWrites)
+                    if (w.mark == 0u)
+                        w.mark = mark;
+            }
         }
         m_pendingVif1Transfers.clear();
+        g_deferredVif1Reads.clear();
     }
     // Index loop over a moved-out copy: an I-bit hook may kick a new VIF1 chain
     // (appending here) while this one is processed; it runs after this one.
@@ -2214,6 +2358,7 @@ void PS2Memory::processPendingTransfers()
         PendingTransfer p = std::move(m_pendingVif1Transfers[vifIdx]);
         if (!p.chainData.empty())
         {
+            applyDeferredRamReads(p.chainData, m_rdram, takeDeferredVif1Reads(p.chainData));
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
         }
         else if (p.qwc > 0)
@@ -2266,7 +2411,10 @@ void PS2Memory::processPendingTransfers()
         }
     }
     if (hadVif1)
+    {
         m_pendingVif1Transfers.clear();
+        g_deferredVif1Reads.clear();
+    }
 
     // With the GS worker the arbiter is only touched on the worker (queued
     // items drain it themselves) or by the EE while it runs a chain itself.
