@@ -504,7 +504,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -540,13 +540,25 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    // The GPU GS (ATV_GS_BACKEND=gpu) presents Nx frames: grow the texture to fit, filtered when
+    // the window scales it down.
+    if (width > static_cast<uint32_t>(tex.width) || height > static_cast<uint32_t>(tex.height))
+    {
+        UnloadTexture(tex);
+        Image blank = GenImageColor(static_cast<int>(std::max<uint32_t>(width, FB_WIDTH)),
+                                    static_cast<int>(std::max<uint32_t>(height, FB_HEIGHT)), BLANK);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+        s_uploadBuffer.assign(static_cast<size_t>(tex.width) * static_cast<size_t>(tex.height) * 4u, 0u);
+    }
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, static_cast<uint32_t>(tex.width));
+        const uint32_t copyHeight = std::min<uint32_t>(height, static_cast<uint32_t>(tex.height));
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(tex.width) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -818,6 +830,22 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // ATV_GS_BACKEND=gpu renders at ATV_GS_SCALE (default 2): open the window that much
+        // bigger, within 90% of the monitor.
+        if (const char *gsBackend = std::getenv("ATV_GS_BACKEND"); gsBackend && std::strcmp(gsBackend, "gpu") == 0)
+        {
+            const char *scaleEnv = std::getenv("ATV_GS_SCALE");
+            const int monitor = GetCurrentMonitor();
+            const float fit = std::min({static_cast<float>(std::clamp(scaleEnv ? std::atoi(scaleEnv) : 2, 1, 8)),
+                                        0.9f * GetMonitorWidth(monitor) / HOST_WINDOW_WIDTH,
+                                        0.9f * GetMonitorHeight(monitor) / HOST_WINDOW_HEIGHT});
+            if (fit > 1.0f)
+            {
+                const int w = static_cast<int>(HOST_WINDOW_WIDTH * fit), h = static_cast<int>(HOST_WINDOW_HEIGHT * fit);
+                SetWindowSize(w, h);
+                SetWindowPosition((GetMonitorWidth(monitor) - w) / 2, (GetMonitorHeight(monitor) - h) / 2);
+            }
+        }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif

@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "gs_gpu_backend.h"
 #include "ps2_log.h"
 #include "ThreadNaming.h"
 #include "runtime/ps2_memory.h"
@@ -258,7 +259,7 @@ namespace
     {
     public:
         explicit GSThreadedBackend(std::unique_ptr<GSRasterBackend> inner)
-            : m_inner(std::move(inner)), m_cpu(dynamic_cast<GSCpuBackend *>(m_inner.get()))
+            : m_inner(std::move(inner)), m_cpu(dynamic_cast<GSCpuBackend *>(m_inner.get())), m_gpu(gsIsGpuBackend(m_inner.get()))
         {
             m_worker = std::thread([this]
                                    { workerLoop(); });
@@ -455,9 +456,15 @@ namespace
         {
             std::vector<uint8_t> *out;
         };
+        // The GPU backend's display frame at this point of the command stream (see QueuePresent).
+        struct PresentCommand
+        {
+            GSPresentationRequest request;
+            PresentationFrame *out;
+        };
         using Command = std::variant<GSPrimitiveBatch, ClutCommand, GSTransferCommand, UploadCommand,
                                      FlushCommand, TextureFlushCommand, WriteVramCommand, SnapshotCommand,
-                                     ReadbackCommand>;
+                                     ReadbackCommand, PresentCommand>;
 
         // ATV_GS_QUEUE_MAX: commands the GIF thread may queue ahead of the raster worker.
         inline static const size_t kMaxQueued = []
@@ -640,6 +647,18 @@ namespace
                            { return m_doneSeq >= target; });
         }
 
+        // GPU backend: its Present (Nx frame read straight from the render target) instead of a
+        // local-memory snapshot. `out` must stay alive until WaitSnapshot returns.
+        bool InnerIsGpu() const { return m_gpu; }
+        uint64_t QueuePresent(const GSPresentationRequest &request, PresentationFrame &out)
+        {
+            Command command{PresentCommand{request, &out}};
+            std::lock_guard<std::mutex> stageLock(m_stageMutex);
+            flushStagedLocked(&command);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            return m_pushedSeq;
+        }
+
     private:
         void refreshTransfer() const
         {
@@ -672,6 +691,8 @@ namespace
                 m_inner->WriteVram(write->psm, write->base, write->bw, write->x, write->y, write->value);
             else if (auto *snap = std::get_if<SnapshotCommand>(&command))
                 m_inner->SnapshotVram(*snap->out);
+            else if (auto *present = std::get_if<PresentCommand>(&command))
+                *present->out = m_inner->Present(present->request);
             else if (auto *readback = std::get_if<ReadbackCommand>(&command))
             {
                 const uint32_t copied = m_inner->ConsumeLocalToHostBytes(readback->out, readback->maxBytes);
@@ -762,6 +783,7 @@ namespace
 
         std::unique_ptr<GSRasterBackend> m_inner;
         GSCpuBackend *m_cpu = nullptr; // m_inner when it is the CPU backend
+        bool m_gpu = false;            // m_inner is the GPU backend (gs_gpu_backend.h)
         // Lock order: m_stageMutex before m_mutex. The worker never takes it.
         mutable std::mutex m_stageMutex;
         mutable std::vector<Command> m_staged;
@@ -787,7 +809,16 @@ namespace
             const char *env = std::getenv("ATV_GS_THREAD");
             return env == nullptr || env[0] != '0';
         }();
-        auto backend = std::make_unique<GSCpuBackend>();
+        // ATV_GS_BACKEND=gpu: the D3D11 hardware GS at ATV_GS_SCALE (gs_gpu_backend.h), else the CPU GS.
+        std::unique_ptr<GSRasterBackend> backend;
+        if (const char *which = std::getenv("ATV_GS_BACKEND"); which && std::strcmp(which, "gpu") == 0)
+        {
+            backend = gsCreateGpuBackend();
+            if (!backend)
+                std::fprintf(stderr, "[gs] GPU backend unavailable, using the CPU GS\n");
+        }
+        if (!backend)
+            backend = std::make_unique<GSCpuBackend>();
         if (!s_threaded)
             return backend;
         std::fprintf(stderr, "[gs] threaded raster backend enabled\n");
@@ -1561,6 +1592,9 @@ void GS::latchHostPresentationFrame()
     // snapshot and the display conversion run without it.
     thread_local std::vector<uint8_t> snapshot;
     snapshot.clear();
+    // GPU backend: the backend's own Nx frame instead of a local-memory snapshot.
+    PresentationFrame gpuFrame;
+    bool gpu = false;
     std::unique_lock<std::mutex> backendLock;
     GSThreadedBackend *threaded = nullptr;
     uint64_t snapshotSeq = 0;
@@ -1577,8 +1611,11 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
         backendLock = std::unique_lock<std::mutex>(m_backendLifetimeMutex);
         threaded = dynamic_cast<GSThreadedBackend *>(m_backend.get());
+        gpu = threaded ? threaded->InnerIsGpu() : gsIsGpuBackend(m_backend.get());
         if (threaded)
-            snapshotSeq = threaded->QueueSnapshot(snapshot);
+            snapshotSeq = gpu ? threaded->QueuePresent(request, gpuFrame) : threaded->QueueSnapshot(snapshot);
+        else if (gpu)
+            gpuFrame = m_backend->Present(request);
         else if (m_backend)
         {
             m_backend->Flush();
@@ -1590,7 +1627,7 @@ void GS::latchHostPresentationFrame()
         threaded->WaitSnapshot(snapshotSeq);
     backendLock = {};
 
-    PresentationFrame frame = GSCpuBackend::PresentSnapshot(snapshot, request);
+    PresentationFrame frame = gpu ? std::move(gpuFrame) : GSCpuBackend::PresentSnapshot(snapshot, request);
 
     const bool hasFrame = static_cast<bool>(frame);
     const uint32_t displayFbp = frame.displayFbp;
@@ -1651,7 +1688,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // Rows are kHostFrameWidth apart, or the frame's width when wider (GPU backend at Nx).
+        const size_t sourceRowBytes = static_cast<size_t>(std::max(kHostFrameWidth, outWidth)) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
