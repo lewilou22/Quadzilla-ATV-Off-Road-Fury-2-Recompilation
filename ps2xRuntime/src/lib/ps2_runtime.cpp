@@ -57,6 +57,9 @@ uint32_t g_ps2IdleResumeA0 = 0;
 uint32_t g_ps2HoldEeTimeslices = 0;
 // Gates the VU1 race-only diagnostics (ATV_VU_FAST_VERIFY, ATV_TRACE_VU_GEOMETRY).
 bool g_raceLoadStarted = false;
+// The aspect the window shows the frame at, set by game overrides (ATV2's widescreen: 16/9);
+// 0 keeps the frame's own width/height.
+std::atomic<float> g_ps2DisplayAspect{0.0f};
 // FPU_C_* macros (ps2_runtime_macros.h): EE ordering by default, host IEEE
 // compares with ATV_FPU_IEEE_COMPARE=1.
 bool g_ps2FpuIeeeCompare = std::getenv("ATV_FPU_IEEE_COMPARE") != nullptr;
@@ -884,6 +887,21 @@ bool PS2Runtime::initialize(const char *title)
                 SetWindowSize(w, h);
                 SetWindowPosition((GetMonitorWidth(monitor) - w) / 2, (GetMonitorHeight(monitor) - h) / 2);
             }
+        }
+        // ATV2_WIDESCREEN=1 (scus_97211_overrides.cpp) shows the frame at 16:9: open the window that
+        // wide, within 90% of the monitor.
+        if (const char *wide = std::getenv("ATV2_WIDESCREEN"); wide && wide[0] == '1')
+        {
+            const int monitor = GetCurrentMonitor();
+            int h = GetScreenHeight();
+            int w = h * 16 / 9;
+            if (w > GetMonitorWidth(monitor) * 9 / 10)
+            {
+                w = GetMonitorWidth(monitor) * 9 / 10;
+                h = w * 9 / 16;
+            }
+            SetWindowSize(w, h);
+            SetWindowPosition((GetMonitorWidth(monitor) - w) / 2, (GetMonitorHeight(monitor) - h) / 2);
         }
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -2719,8 +2737,13 @@ void PS2Runtime::run()
                                                << std::endl);
             }
         });
-        if ((hostFrames % 120u) == 0u)
+        // ATV_GS_DIAG_LOG=1: the [recomp:gs] line every 120 host frames. Off by default: its GS state
+        // lock competes with the GIF thread taking it per packet, and the game waits on this thread,
+        // so races froze for 0.1-1 s every ~2 s with the GPU renderer.
+        static const bool s_gsDiagLog = std::getenv("ATV_GS_DIAG_LOG") != nullptr;
+        if (s_gsDiagLog && (hostFrames % 120u) == 0u)
         {
+            atvTimeline(42u, 0u, 0u); // ATV_TIMELINE: the window thread's [recomp:gs] diagnostics
             const GSDebugSnapshot gsDiag = m_gs.getDebugSnapshot();
             const std::vector<GSDebugHistoryEntry> gsHistory = m_gs.getDebugHistory();
             uint64_t gifTagEvents = 0u;
@@ -2831,20 +2854,36 @@ void PS2Runtime::run()
                       << ":cbp" << latestDraw.tex0.cbp
                       << ":cpsm" << static_cast<unsigned int>(latestDraw.tex0.cpsm)
                       << std::endl;
+            atvTimeline(42u, 1u, 0u);
         }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        atvTimeline(43u, 0u, 0u); // ATV_TIMELINE: latch, copy and upload of the frame
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+        atvTimeline(43u, 1u, 0u);
 
+        atvTimeline(44u, 0u, 0u); // ATV_TIMELINE: draw and swap (vsync)
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // The frame's own shape, or the aspect a game override asks for (widescreen: the 640x448
+        // frame stretched to 16:9, as a 16:9 TV showed it).
+        const float displayAspect = g_ps2DisplayAspect.load(std::memory_order_relaxed);
+        const float aspect = displayAspect > 0.0f ? displayAspect : srcWidth / srcHeight;
+        if (displayAspect > 0.0f)
+        {
+            static bool s_filtered = false;
+            if (!s_filtered)
+            {
+                SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR); // stretched, not pixel-doubled
+                s_filtered = true;
+            }
+        }
+        const float dstWidth = std::min(screenWidth, screenHeight * aspect);
+        const float dstHeight = dstWidth / aspect;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2857,7 +2896,14 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        atvTimeline(44u, 1u, 0u);
 
+        // ATV_PERIODIC_SCREENSHOT=1: save the window to recomp_screen.png every 300 vsync ticks (a
+        // bring-up aid). Off by default: the read-back and PNG encode on this thread stalled the
+        // game ~60 ms each time with the CPU renderer, 100-200 ms with the GPU renderer's 2x
+        // window, and up to a second with a big window.
+        static const bool s_periodicShot = std::getenv("ATV_PERIODIC_SCREENSHOT") != nullptr;
+        if (s_periodicShot)
         {
             static uint64_t s_lastShotTick = 0;
             const uint64_t vTick = m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0;

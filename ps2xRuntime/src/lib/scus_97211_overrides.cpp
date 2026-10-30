@@ -53,6 +53,7 @@ bool ps2IpuDecodeTextureRgb16(const uint8_t *src, size_t srcSize, uint32_t width
 extern bool g_raceLoadStarted; // gates the race-only diagnostics (ATV_VU_FAST_VERIFY, GS traces)
 extern bool g_vu1DropCutPrograms; // ps2_runtime.cpp: the loading screen drops budget-cut VU1 programs
 extern bool g_atvRaceStarted;     // vu/ps2_vu1_core.cpp: the race is running (gates ATV_VU_BENCH_CAPTURE)
+extern std::atomic<float> g_ps2DisplayAspect; // ps2_runtime.cpp: the window's display aspect (0 = the frame's)
 extern uint32_t g_ps2TraceDispatchRemaining;
 extern uint32_t g_ps2TraceRange0Lo, g_ps2TraceRange0Hi, g_ps2TraceRange1Lo, g_ps2TraceRange1Hi;
 
@@ -5134,6 +5135,23 @@ namespace
             }
         }
         atvTimeline(1u, 2u, 0u); // ATV_TIMELINE frame marker (and its dump trigger)
+        // Widescreen is the game's own (the WIDESCRN cheat toggles it): settings+0x61C picks the
+        // cameras' aspect, 16:9 (0x3FE38E39) instead of 4:3 (0x3FAAAAAB), in the same 640x448
+        // frame, which a 16:9 TV stretched. ATV2_WIDESCREEN=1 keeps it on (=0 off); while it is
+        // on, the window shows the frame at 16:9 (g_ps2DisplayAspect).
+        {
+            static const char *const s_wideEnv = std::getenv("ATV2_WIDESCREEN");
+            const auto guestPtr = [](uint32_t p) { return p >= 0x00100000u && p < 0x02000000u && (p & 3u) == 0u; };
+            const uint32_t game = READ32(0x00404818u);
+            const uint32_t settings = guestPtr(game) ? READ32(game + 0x298u) : 0u;
+            if (guestPtr(settings))
+            {
+                if (s_wideEnv && (s_wideEnv[0] == '0' || s_wideEnv[0] == '1'))
+                    WRITE32(settings + 0x61Cu, s_wideEnv[0] == '1' ? 1u : 0u);
+                g_ps2DisplayAspect.store(READ32(settings + 0x61Cu) != 0u ? 16.0f / 9.0f : 0.0f,
+                                         std::memory_order_relaxed);
+            }
+        }
         PS2Memory &mem = runtime->memory();
         if (!mem.gsWorkerEnabled())
         {
