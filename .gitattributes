@@ -1,0 +1,4 @@
+# cmd.exe can miss goto labels in batch files with LF line endings: check them out
+# (and put them in GitHub ZIP downloads) with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
